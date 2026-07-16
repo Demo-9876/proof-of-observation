@@ -243,6 +243,25 @@ describe('verifyTeeExchange aliyun-vtpm profile (experimental local quote mode)'
     expect(r.attestation.platformTrust?.status).toBe('platform_trust_missing');
   });
 
+  it('accepts QuoteReport.quoted_b64 encoded as TPM2B_ATTEST with a size prefix', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    const evidence = proof.evidence as any;
+    const quoteMsg = Buffer.from(evidence.quote_report.quoted_b64, 'base64');
+    evidence.quote_report.quoted_b64 = tpm2b(quoteMsg).toString('base64');
+    proof.attestation = Buffer.from(JSON.stringify(evidence), 'utf8').toString('base64');
+
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: aliyunTrust(expectedPcrs),
+    });
+
+    expect(r.ok, JSON.stringify(r.checks)).toBe(true);
+    expect(r.checks.find((c) => c.name === 'QuoteReport 字段')?.detail).toContain('TPM2B_ATTEST');
+    expect(r.checks.find((c) => c.name === 'quote 结构')?.ok).toBe(true);
+    expect(r.checks.find((c) => c.name === 'quote 签名')?.ok).toBe(true);
+  });
+
   it('fails closed when platform trust is required but no QuoteReport.Cert chain is present', () => {
     const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
     const r = verifyTeeExchange({

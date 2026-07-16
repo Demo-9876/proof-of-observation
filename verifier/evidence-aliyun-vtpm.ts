@@ -126,14 +126,17 @@ export const aliyunVtpmEvidenceVerifier: EvidenceProfileVerifier = {
     let signature: Buffer | undefined;
     let certInfo: CertInfo | undefined;
     try {
-      quote = decodeBase64(required(evidence.quote_report?.quoted_b64, 'quote_report.quoted_b64'), 'quote_report.quoted_b64');
+      const quoteRaw = decodeBase64(required(evidence.quote_report?.quoted_b64, 'quote_report.quoted_b64'), 'quote_report.quoted_b64');
+      quote = normalizeQuotedAttest(quoteRaw);
       signature = decodeBase64(required(evidence.quote_report?.signature_b64, 'quote_report.signature_b64'), 'quote_report.signature_b64');
       const certDer = decodeBase64(required(evidence.quote_report?.cert_b64, 'quote_report.cert_b64'), 'quote_report.cert_b64');
       certInfo = parseQuoteReportCert(certDer, !!trust.allowSyntheticQuoteReportCertForTest);
       checks.push({
         name: 'QuoteReport 字段',
         ok: true,
-        detail: certInfo.isX509 ? 'quoted/signature/Cert DER 已解码，Cert 可解析为 X.509' : 'quoted/signature 已解码；测试 fixture 使用 SPKI public key 代替 X.509 Cert',
+        detail: certInfo.isX509
+          ? `quoted/signature/Cert DER 已解码，Cert 可解析为 X.509${quoteRaw.length === quote.length ? '' : '；quoted 为 TPM2B_ATTEST，已剥离 size 前缀'}`
+          : `quoted/signature 已解码；测试 fixture 使用 SPKI public key 代替 X.509 Cert${quoteRaw.length === quote.length ? '' : '；quoted 为 TPM2B_ATTEST，已剥离 size 前缀'}`,
       });
     } catch (err) {
       checks.push({ name: 'QuoteReport 字段', ok: false, detail: (err as Error).message });
@@ -431,6 +434,15 @@ function parsePcrInfo(evidence: AliyunVtpmEvidence): {
       selections: [],
     };
   }
+}
+
+function normalizeQuotedAttest(buf: Buffer): Buffer {
+  if (buf.length >= 4 && buf.readUInt32BE(0) === TPM_GENERATED_VALUE) return buf;
+  if (buf.length >= 6) {
+    const size = buf.readUInt16BE(0);
+    if (size === buf.length - 2 && buf.readUInt32BE(2) === TPM_GENERATED_VALUE) return buf.subarray(2);
+  }
+  return buf;
 }
 
 function parseTpmsAttestQuote(buf: Buffer): ParsedQuote {

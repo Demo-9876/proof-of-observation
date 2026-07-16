@@ -72,7 +72,7 @@ Alibaba Cloud proofs set:
       "quote_handle": "SigningEKRSAHandle"
     },
     "quote_report": {
-      "quoted_b64": "<base64 TPMS_ATTEST>",
+      "quoted_b64": "<base64 TPMS_ATTEST or TPM2B_ATTEST>",
       "signature_b64": "<base64 TPMT_SIGNATURE>",
       "pcr_info": {
         "pcr_values_b64": "<base64 TPML_DIGEST>",
@@ -238,7 +238,12 @@ Rules:
   string.
 
 `QuoteReport.quoted` must contain a TPM quote whose `extraData` /
-`QualifyingData` equals `qualifying_data`.
+`QualifyingData` equals `qualifying_data`. Real Alibaba Cloud SDK fixtures may
+encode this field as `TPM2B_ATTEST`, where the first two bytes are the
+big-endian size and the inner bytes are `TPMS_ATTEST` starting with TPM magic
+`0xff544347`. The verifier accepts both bare `TPMS_ATTEST` and `TPM2B_ATTEST`;
+TPM quote signature verification is performed over the inner `TPMS_ATTEST`
+bytes.
 
 ## Verifier Checks
 
@@ -247,19 +252,23 @@ The verifier must perform these checks:
 1. Parse the `aliyun-vtpm` evidence envelope.
 2. Decode `QuoteReport.quoted`, `QuoteReport.signature`,
    `QuoteReport.pcrInfo`, and `QuoteReport.cert`.
-3. Rebuild the expected canonical challenge payload from the signed proof fields.
-4. Verify `base64decode(challenge.payload_b64)` equals the rebuilt canonical
+3. If `QuoteReport.quoted` is `TPM2B_ATTEST`, strip the two-byte size prefix to
+   obtain the inner `TPMS_ATTEST`.
+4. Rebuild the expected canonical challenge payload from the signed proof fields.
+5. Verify `base64decode(challenge.payload_b64)` equals the rebuilt canonical
    challenge payload bytes.
-5. Verify `challenge.qualifying_data_hex == sha256(rebuilt challenge payload)`.
-6. Parse `QuoteReport.Cert` and extract its public key.
-7. If `requirePlatformTrust=true`, verify `QuoteReport.Cert` chains to the
+6. Verify `challenge.qualifying_data_hex == sha256(rebuilt challenge payload)`.
+7. Parse `QuoteReport.Cert` and extract its public key.
+8. Verify `QuoteReport.signature` over the inner `TPMS_ATTEST` with the public
+   key from `QuoteReport.Cert`.
+9. If `requirePlatformTrust=true`, verify `QuoteReport.Cert` chains to the
    configured Alibaba Cloud TPM root/intermediate certificates.
-8. Verify certificate validity, configured root/intermediate fingerprints,
+10. Verify certificate validity, configured root/intermediate fingerprints,
    Enclave EK subject CN pattern, and revocation status according to verifier
    trust configuration.
-9. If the chain is missing, report `platform_trust_missing`; if the chain is
+11. If the chain is missing, report `platform_trust_missing`; if the chain is
    configured but fails, report `platform_trust_invalid`.
-10. `platform_trust_missing` may pass only in experimental mode when
+12. `platform_trust_missing` may pass only in experimental mode when
     `requirePlatformTrust=false`; `platform_trust_invalid` should fail closed by
     default even in experimental mode.
 11. Verify the TPM quote signature with the EK certificate public key.
