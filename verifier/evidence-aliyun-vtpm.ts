@@ -296,7 +296,7 @@ function evaluateCertChainTrust(trust: EvidenceTrust, certInfo: CertInfo | undef
       if (!issuedAndVerified(leaf, intermediate)) continue;
 
       const cn = subjectComponent(leaf.subject, 'CN');
-      const cnPattern = platformTrust.enclaveSubjectCnPattern ?? '^i-[A-Za-z0-9][A-Za-z0-9-]*-[0-9]{2}$';
+      const cnPattern = platformTrust.enclaveSubjectCnPattern ?? '^i-[A-Za-z0-9][A-Za-z0-9-]*-enclave-[0-9]+$';
       if (!cn || !new RegExp(cnPattern).test(cn)) {
         return invalid(`QuoteReport.Cert subject CN does not match Alibaba Enclave EK pattern: ${cn ?? '<missing>'}`);
       }
@@ -376,7 +376,16 @@ function fingerprint(cert: X509Certificate): string {
 }
 
 function certValidAt(cert: X509Certificate, at: Date): boolean {
-  return cert.validFromDate.getTime() <= at.getTime() && at.getTime() <= cert.validToDate.getTime();
+  const validFrom = x509Date(cert, 'validFromDate', cert.validFrom);
+  const validTo = x509Date(cert, 'validToDate', cert.validTo);
+  if (!validFrom || !validTo) return false;
+  return validFrom.getTime() <= at.getTime() && at.getTime() <= validTo.getTime();
+}
+
+function x509Date(cert: X509Certificate, dateProperty: 'validFromDate' | 'validToDate', fallback: string): Date | undefined {
+  const value = (cert as X509Certificate & Partial<Record<typeof dateProperty, Date>>)[dateProperty];
+  const parsed = value instanceof Date ? value : new Date(fallback);
+  return Number.isFinite(parsed.getTime()) ? parsed : undefined;
 }
 
 function issuedAndVerified(child: X509Certificate, issuer: X509Certificate): boolean {

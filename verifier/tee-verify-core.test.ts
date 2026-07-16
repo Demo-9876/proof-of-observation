@@ -285,7 +285,7 @@ describe('verifyTeeExchange aliyun-vtpm profile (experimental local quote mode)'
   });
 
   it('verifies QuoteReport.Cert against configured Aliyun TPM root/intermediate and Enclave CN', () => {
-    const { proof, responseBody, expectedPcrs, chain } = makeAliyunSignedWithX509Chain('i-testabcdef-01');
+    const { proof, responseBody, expectedPcrs, chain } = makeAliyunSignedWithX509Chain('i-testabcdef-enclave-1');
     const r = verifyTeeExchange({
       responseBody,
       proof,

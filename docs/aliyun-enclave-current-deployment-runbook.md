@@ -16,16 +16,61 @@
 - 已购买支持 Enclave 的阿里云 ECS 实例。
 - 已安装并可运行 `enclave-cli`。
 - 已安装 Docker。
-- 当前仓库代码已同步到父 VM。
+- 已安装 `git`，并已拉取当前分支代码到父 VM。
 - 父 VM 上有一个可用的 `socat-vsock` 可执行文件，用于 Enclave 将 fixture tar 包发回父 VM。
 - 父 VM 上有 `jq`、`openssl`、`tar`、`base64`。
 - verifier 机器上有 Node.js，并可安装/运行 `verifier` 目录依赖。
 
-检查：
+如果阿里云父 VM 没有 `git`，先安装：
+
+```bash
+command -v git || sudo yum install -y git
+git --version
+```
+
+如果当前镜像的包管理器不是 `yum`，按系统实际情况改用对应命令，例如 `dnf install -y git` 或 `apt-get install -y git`。
+
+拉取当前分支代码。首次部署时执行：
+
+```bash
+cd ~
+
+git clone git@github.com:Demo-9876/proof-of-observation.git
+cd proof-of-observation
+git fetch origin feature/aliyun-vtpm-evidence-profile
+git checkout feature/aliyun-vtpm-evidence-profile
+git pull --ff-only origin feature/aliyun-vtpm-evidence-profile
+```
+
+如果父 VM 无法使用 GitHub SSH key，也可以临时改用 HTTPS：
+
+```bash
+git clone https://github.com/Demo-9876/proof-of-observation.git
+```
+
+如果仓库目录已经存在，更新到当前分支：
+
+```bash
+cd ~/proof-of-observation
+
+git fetch origin feature/aliyun-vtpm-evidence-profile
+git checkout feature/aliyun-vtpm-evidence-profile
+git pull --ff-only origin feature/aliyun-vtpm-evidence-profile
+```
+
+确认代码版本。本文档对应的本地提交为 `0aea403`，阿里云父 VM 上至少需要包含该提交：
+
+```bash
+git log --oneline -5
+git rev-parse --short HEAD
+```
+
+基础环境检查：
 
 ```bash
 sudo enclave-cli describe-enclaves
 docker version
+git --version
 jq --version
 openssl version
 ```
@@ -67,7 +112,9 @@ ls -lh bin/aliyun-proof
 file bin/aliyun-proof
 ```
 
-如果父 VM 没有 Go，可以用能访问的 Go builder 镜像构建。注意不同环境的 Docker registry 可能不同，按实际网络改 `FROM` 镜像：
+如果父 VM 没有 Go，可以用能访问的 Go builder 镜像构建。注意不同环境的 Docker registry 可能不同，按实际网络改 `FROM` 镜像。
+
+不要执行 `docker pull "golang:1.24-bookworm AS builder"`；`AS builder` 只属于 Dockerfile 的 `FROM` 语法，不是镜像 tag。若要提前拉镜像，应执行 `sudo docker pull golang:1.24-bookworm`。
 
 ```bash
 cd ~/proof-of-observation/aliyun-enclave
@@ -75,12 +122,20 @@ cd ~/proof-of-observation/aliyun-enclave
 cat > Dockerfile.build <<'EOF'
 FROM golang:1.24-bookworm AS builder
 WORKDIR /src
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=$GOPROXY
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -tags aliyun_enclave -o /out/aliyun-proof ./cmd/aliyun-proof
 EOF
+```
+
+创建好 `Dockerfile.build` 后，继续执行下面的构建和拷贝步骤，把 builder 镜像里的静态二进制取回到父 VM：
+
+```bash
+cd ~/proof-of-observation/aliyun-enclave
 
 sudo docker build --network host -f Dockerfile.build -t aliyun-proof-builder .
 cid=$(sudo docker create aliyun-proof-builder)
@@ -88,8 +143,60 @@ mkdir -p bin
 sudo docker cp "$cid:/out/aliyun-proof" bin/aliyun-proof
 sudo docker rm "$cid"
 sudo chown "$(id -u):$(id -g)" bin/aliyun-proof
+chmod +x bin/aliyun-proof
 
 ls -lh bin/aliyun-proof
+file bin/aliyun-proof
+./bin/aliyun-proof --help
+```
+
+如果 `go mod download` 因网络失败，可以换国内 Go proxy，例如：
+
+```bash
+sudo docker build --network host \
+  --build-arg GOPROXY=https://goproxy.cn,direct \
+  -f Dockerfile.build \
+  -t aliyun-proof-builder .
+```
+
+如果父 VM 拉取 `golang:1.24-bookworm` 超时，例如看到 `Get "https://registry-1.docker.io/v2/": net/http: request canceled while waiting for connection`，说明 Docker Hub 访问不通。优先改用下面的方式在父 VM 直接安装 Go，再回到本节开头的“父 VM 已安装 Go”路径构建：
+
+```bash
+cd /tmp
+
+curl -L \
+  https://mirrors.aliyun.com/golang/go1.24.3.linux-amd64.tar.gz \
+  -o go1.24.3.linux-amd64.tar.gz
+
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go1.24.3.linux-amd64.tar.gz
+
+export PATH=/usr/local/go/bin:$PATH
+go version
+```
+
+然后重新构建：
+
+```bash
+cd ~/proof-of-observation/aliyun-enclave
+
+go env -w GOPROXY=https://goproxy.cn,direct
+go test ./...
+go test -tags aliyun_enclave ./...
+
+mkdir -p bin
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -tags aliyun_enclave -o bin/aliyun-proof ./cmd/aliyun-proof
+
+ls -lh bin/aliyun-proof
+file bin/aliyun-proof
+./bin/aliyun-proof --help
+```
+
+如果公司内有可访问的 ACR / 私有镜像仓库，也可以把 `golang:1.24-bookworm` 预先同步进去，然后把 `Dockerfile.build` 第一行改成内部镜像地址，例如：
+
+```Dockerfile
+FROM <your-acr-registry>/golang:1.24-bookworm AS builder
 ```
 
 ## 4. 准备最小 fixture Enclave 镜像上下文
@@ -350,9 +457,18 @@ openssl x509 -in out/QuoteReport.Cert.pem -noout -text \
   | sed -n '/Subject:/,/Subject Public Key Info:/p'
 ```
 
+你这次真实样本输出为：
+
+```text
+subject= /C=CN/O=Aliyun/OU=TPM Endorsement Key Certificate/CN=i-bp124j9zt94mo16k7bu2-enclave-1
+issuer= /C=CN/O=Aliyun/OU=Aliyun TPM Endorsement Key Manufacture CA/CN=Aliyun TPM EKMF CA
+serial=0656B93ED9C6B7C962B6D0BB682AE880DC7F44
+SHA256 Fingerprint=0D:05:89:D7:5A:CC:6C:86:2C:D5:59:03:E0:EB:D4:01:00:E7:0C:5D:68:11:97:E4:08:86:A6:15:12:C6:5B:C6
+```
+
 需要确认：
 
-- `Subject CN` 是否符合 Enclave vTPM 格式，例如 `i-xxxxxxx-01`。
+- `Subject CN` 是否符合 Enclave vTPM 格式，例如 `i-xxxxxxx-enclave-1`。
 - `Issuer` 是否指向阿里云 TPM EKMF intermediate。
 - 证书能否被 Node verifier 解析。
 - 如果 CN 格式与当前默认 pattern 不一致，需要更新 trust bundle 的 `enclaveSubjectCnPattern`。
@@ -420,7 +536,7 @@ cat > trust/aliyun-vtpm-trust.json <<EOF
     "intermediateFingerprintsSha256": [
       "141805f04cd9b89bfbcd30cb792d5ca3a0a2382db6ee35720e6e27e4189e43a0"
     ],
-    "enclaveSubjectCnPattern": "^i-[A-Za-z0-9][A-Za-z0-9-]*-[0-9]{2}$",
+    "enclaveSubjectCnPattern": "^i-[A-Za-z0-9][A-Za-z0-9-]*-enclave-[0-9]+$",
     "revocation": {
       "required": false,
       "method": "crl"
@@ -479,7 +595,62 @@ REQ_B64=$(base64 out/request.bin | tr -d '\n')
 RESP_B64=$(base64 out/response.bin | tr -d '\n')
 ```
 
-运行 verifier：
+运行 verifier 前需要 Node.js / npm。注意：`npm` 只用于用户侧 verifier 校验；前面生成 Enclave fixture、提取 `QuoteReport.Cert` 不依赖 npm。
+
+Alibaba Cloud Linux 2 / CentOS 7 系父 VM 通常是 glibc 2.17，官方 Node 20/22 Linux x64 预编译包可能无法运行。如果看到下面错误，不要升级系统 glibc：
+
+```text
+node: /lib64/libstdc++.so.6: version `GLIBCXX_3.4.21' not found
+node: /lib64/libm.so.6: version `GLIBC_2.27' not found
+node: /lib64/libc.so.6: version `GLIBC_2.28' not found
+```
+
+这种情况下推荐把 fixture 产物拷回本地有 Node.js/npm 的机器验证，而不是在父 VM 上安装 Node：
+
+```bash
+# 在父 VM 上打包 verifier 输入
+cd ~/proof-of-observation/deploy/aliyun-vtpm-fixture
+tar czf aliyun-vtpm-verifier-inputs.tgz out trust build-measurements.log
+
+# 在本地机器拉回。按实际跳板机/SSH 方式调整 scp 命令。
+scp <user>@<aliyun-parent-vm>:~/proof-of-observation/deploy/aliyun-vtpm-fixture/aliyun-vtpm-verifier-inputs.tgz .
+```
+
+本地解包后，在本地仓库执行第 10 步的 verifier 命令，路径按实际解包目录调整。
+
+如果必须在父 VM 上运行 verifier，不要使用官方 Node 22 包。先检查 glibc：
+
+```bash
+ldd --version | head -1
+```
+
+glibc 2.17 环境需要使用兼容 glibc-217 的 Node 构建，例如 unofficial build。该方式只用于验证工具链，不进入 Enclave 镜像、不作为 TCB：
+
+```bash
+command -v node || true
+command -v npm || true
+
+cd /tmp
+
+curl -L \
+  https://unofficial-builds.nodejs.org/download/release/v20.19.0/node-v20.19.0-linux-x64-glibc-217.tar.xz \
+  -o node-v20.19.0-linux-x64-glibc-217.tar.xz
+
+command -v xz || sudo yum install -y xz
+sudo tar -C /opt -xJf node-v20.19.0-linux-x64-glibc-217.tar.xz
+
+export PATH=/opt/node-v20.19.0-linux-x64-glibc-217/bin:$PATH
+node -v
+npm -v
+```
+
+如果需要后续 shell 也能直接使用 `node` / `npm`，把 PATH 写入当前用户 shell 配置：
+
+```bash
+echo 'export PATH=/opt/node-v20.19.0-linux-x64-glibc-217/bin:$PATH' >> ~/.bashrc
+```
+
+确认 `npm` 可用后运行 verifier：
 
 ```bash
 cd ~/proof-of-observation/verifier

@@ -74,7 +74,7 @@ npx tsx tee-verify-stream.ts captured-response --trust aliyun-vtpm-trust.json --
     "intermediateFingerprintsSha256": [
       "141805f04cd9b89bfbcd30cb792d5ca3a0a2382db6ee35720e6e27e4189e43a0"
     ],
-    "enclaveSubjectCnPattern": "^i-[A-Za-z0-9][A-Za-z0-9-]*-[0-9]{2}$",
+    "enclaveSubjectCnPattern": "^i-[A-Za-z0-9][A-Za-z0-9-]*-enclave-[0-9]+$",
     "revocation": { "required": false, "method": "crl" }
   }
 }

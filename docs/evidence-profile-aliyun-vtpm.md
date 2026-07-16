@@ -143,11 +143,17 @@ downloaded text; the Node verifier extracts the PEM block.
 
 The EK certificate CN distinguishes ordinary vTPM and Enclave vTPM. Alibaba
 Cloud guidance says ordinary vTPM CN is the ECS instance id such as `i-xxxxx`,
-while Enclave EK CN has an Enclave suffix, for example `i-xxxxxxx-01`. The
-default verifier CN pattern is:
+while Enclave EK CN has an Enclave suffix. A real Alibaba Cloud Enclave sample
+observed during integration used:
 
 ```text
-^i-[A-Za-z0-9][A-Za-z0-9-]*-[0-9]{2}$
+i-bp124j9zt94mo16k7bu2-enclave-1
+```
+
+The default verifier CN pattern is:
+
+```text
+^i-[A-Za-z0-9][A-Za-z0-9-]*-enclave-[0-9]+$
 ```
 
 Override `platformTrust.enclaveSubjectCnPattern` if a real certificate sample
@@ -355,7 +361,7 @@ Production configuration:
     "intermediateFingerprintsSha256": [
       "141805f04cd9b89bfbcd30cb792d5ca3a0a2382db6ee35720e6e27e4189e43a0"
     ],
-    "enclaveSubjectCnPattern": "^i-[A-Za-z0-9][A-Za-z0-9-]*-[0-9]{2}$",
+    "enclaveSubjectCnPattern": "^i-[A-Za-z0-9][A-Za-z0-9-]*-enclave-[0-9]+$",
     "revocation": {
       "required": false,
       "method": "crl",
