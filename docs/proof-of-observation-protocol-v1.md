@@ -309,6 +309,15 @@ The verification procedure (§8) is otherwise unchanged across profiles: only th
 Statement check (§8.1), the content bindings (§8.2), and the key/nonce bindings
 are profile-independent.
 
+> *Non-normative implementation note — experimental `aliyun-vtpm` profile.* This
+> repository contains an experimental Alibaba Cloud Enclave vTPM verifier profile
+> used for integration work. It verifies a `QuoteReport` TPM quote signature,
+> verifier-built challenge payload, PCR digest, PCR allowlist values, and a
+> locally configured `QuoteReport.Cert` root/intermediate certificate chain with
+> an Enclave EK CN pattern. It is not production complete until CRL checking and
+> real Alibaba Cloud `QuoteReport` fixtures are wired into release validation. See
+> `docs/evidence-profile-aliyun-vtpm.md`.
+
 > *Non-normative sketch — a future `tdx` / EAT profile.* An Intel TDX or AMD
 > SEV-SNP deployment would carry Evidence as an EAT (RFC 9711) or vendor quote: the
 > manufacturer root becomes the Intel/AMD attestation root (verified via that
@@ -326,6 +335,7 @@ response stream) as a JSON object:
 ```json
 {
   "v": 2,
+  "profile": "nitro",
   "alg": "ed25519",
   "public_key": "<base64 SPKI of the Ed25519 signing key>",
   "nonce": "<base64>",
@@ -338,12 +348,17 @@ response stream) as a JSON object:
   "response_body_sha256": "<lowercase hex>",
   "signature": "<base64 Ed25519 signature over the §5 Statement>",
   "attestation": "<base64 COSE_Sign1 Evidence, §6>",
+  "evidence": "<optional profile-specific structured Evidence>",
   "pcr0": "<lowercase hex; advisory copy, see §8.4>"
 }
 ```
 
 - `v` MUST be `2` for this version. A Verifier MUST reject envelopes whose `v` it
   does not implement.
+- `profile` is OPTIONAL for legacy Nitro proofs and defaults to `nitro`. A
+  Verifier MUST reject a non-default profile it does not implement. Profile-
+  specific extensions MAY use `evidence` while preserving the signed Statement
+  fields in §5.
 - The fields `nonce`, `upstream_host`, `upstream_path`, `http_method`,
   `http_status`, `resp_content_type`, `request_body_sha256`,
   `response_body_sha256` are the **reconstruction inputs** for the §5 Statement,

@@ -17,13 +17,15 @@
 // 两档:full(给了 requestBody)= 多一项请求绑定(答的就是你这条请求);response-only = 只验响应未篡改 + 读 host。
 
 import { createPublicKey, verify as edVerify } from 'node:crypto';
+import { aliyunVtpmEvidenceVerifier } from './evidence-aliyun-vtpm.ts';
+import { createNitroEvidenceVerifier, nitroEvidenceVerifier } from './evidence-nitro.ts';
+import type { EvidenceProfileVerifier, EvidenceTrust } from './evidence-profile.ts';
 import { buildV2Statement, sha256 } from './signing.ts';
-// @ts-expect-error 纯 JS 零依赖模块
-import { verifyAttestationDoc as realVerifyAttestationDoc } from './verify-attestation-cose.mjs';
 
 // v2 proof 线格式(docs/tee-signing-v2-design.md §5)。前 9 字段(nonce…response_body_sha256)即签名载荷。
 export interface TeeProofWire {
   v?: number; // 2
+  profile?: string; // 缺省 nitro；aliyun-vtpm 等新 profile 走 evidence layer
   alg?: string;
   public_key: string; // base64 SPKI
   nonce: string; // base64
@@ -36,6 +38,7 @@ export interface TeeProofWire {
   response_body_sha256: string; // hex
   signature: string; // base64 Ed25519(覆盖重建声明)
   attestation: string; // base64 COSE_Sign1 文档
+  evidence?: unknown; // profile-specific structured evidence；Nitro 旧 proof 可为空
   pcr0?: string;
 }
 
@@ -58,13 +61,16 @@ export interface AttestationVerdict {
 export type AttestationVerifier = (doc: Buffer, opts?: { now?: number }) => AttestationVerdict;
 
 export interface TeeVerifyInput {
-  expectedPcr0: string; // hex,审计公布、可由 reproducible-build 复算
+  expectedPcr0?: string; // legacy Nitro path: hex,审计公布、可由 reproducible-build 复算
+  trust?: EvidenceTrust; // 新 profile 化 trust bundle；缺省从 expectedPcr0 推导 Nitro
   responseBody: Buffer; // 你实际收到的完整响应体(已剥掉 tee.proof 流末事件)
   proof: TeeProofWire;
   // 可选(full 档):你**自己发的请求体**,用来核对请求绑定(⑥)。
   requestBody?: Buffer;
   // 可选:核对签名覆盖的 upstream_host;不给则只展示由你判断(④)。
   expectedHost?: string;
+  // 可选:由 verifier/requester 预先生成的 nonce。给了就强制 proof.nonce 完全一致,防重放。
+  expectedNonceB64?: string;
   now?: number; // 证书有效期判定基准(测试可注)
 }
 
@@ -79,10 +85,18 @@ export interface TeeVerifyResult {
   mode: 'full' | 'response-only';
   checks: TeeCheck[];
   attestation: {
+    profile?: string;
     moduleId?: string;
     pcr0?: string | null;
+    measurements?: Record<string, string>;
     publicKey?: string | null;
     nonce?: string | null;
+    platformTrust?: {
+      ok: boolean;
+      mode: string;
+      issuer?: string;
+      detail: string;
+    };
   };
   // 签名覆盖的来源事实,供展示(验签过即可信)。
   provenance: {
@@ -102,34 +116,36 @@ const b64 = (s: string): Buffer => Buffer.from(s, 'base64');
  */
 export function verifyTeeExchange(
   input: TeeVerifyInput,
-  deps: { verifyAttestationDoc?: AttestationVerifier } = {},
+  deps: { verifyAttestationDoc?: AttestationVerifier; evidenceVerifiers?: Record<string, EvidenceProfileVerifier> } = {},
 ): TeeVerifyResult {
-  const verifyAttestationDoc = deps.verifyAttestationDoc ?? (realVerifyAttestationDoc as AttestationVerifier);
   const t = input.proof;
   const full = input.requestBody !== undefined;
   const mode: TeeVerifyResult['mode'] = full ? 'full' : 'response-only';
   const checks: TeeCheck[] = [];
+  const profile = configuredProfile(input.trust, t);
+  const trust: EvidenceTrust = {
+    ...(input.trust ?? {}),
+    profile,
+    expectedPcr0: input.trust?.expectedPcr0 ?? input.expectedPcr0,
+  };
 
-  // ① attestation:COSE/P-384 链到 AWS 根 + 有效期 + PCR0 == 审计值。异常不抛 —— 收成失败检查项。
-  let att: AttestationVerdict | undefined;
-  try {
-    att = verifyAttestationDoc(b64(t.attestation), { now: input.now });
-  } catch (err) {
-    att = undefined;
-    checks.push({ name: '远程证明', ok: false, detail: `attestation 解析/验证异常:${(err as Error).message}` });
-  }
-  if (att) {
-    const chainOk = att.sigOk && att.chainOk && att.rootSelf && att.rootPinned;
-    checks.push({ name: '远程证明', ok: chainOk, detail: chainOk ? `COSE/P-384 链到 AWS 根(指纹 ${att.rootFingerprint?.slice(0, 11)}…)` : 'attestation 链校验失败' });
-    checks.push({ name: '证书有效期', ok: !!att.timeValid, detail: att.timeValid ? `链上证书均在有效期内(叶 notAfter ${att.leafNotAfter})` : `证书过期/未生效(叶 notAfter ${att.leafNotAfter})——无法确认新鲜` });
-    const pcr0Ok = att.pcr0 === input.expectedPcr0;
-    checks.push({ name: 'PCR0 比对', ok: pcr0Ok, detail: pcr0Ok ? 'PCR0 == 审计值(跑的是审计镜像)' : `PCR0 不符: ${String(att.pcr0).slice(0, 12)}… ≠ ${input.expectedPcr0.slice(0, 12)}…` });
-    // ② 签名公钥被 attestation 背书
-    const bound = !!att.publicKey && att.publicKey === t.public_key;
-    checks.push({ name: '公钥绑定', ok: bound, detail: bound ? '签名公钥 == attestation 背书的公钥' : '签名公钥与 attestation 不符(换了把没被认证的钥匙)' });
-    // ③ nonce 绑定:att 内嵌 nonce == proof 顶层 nonce(均被签名覆盖)。relay 端 nonce,一致性核对。
-    const nonceOk = att.nonce === t.nonce;
-    checks.push({ name: 'nonce 绑定', ok: nonceOk, detail: nonceOk ? 'att 内嵌 nonce == proof 顶层 nonce(均被签名覆盖)' : `nonce 不符:proof=${String(t.nonce).slice(0, 10)}… att=${String(att.nonce).slice(0, 10)}…(拼接/伪造)` });
+  checks.push(verifyWireEnvelope(t));
+
+  const profileCheck = verifyConfiguredProfile(profile, t, !!input.trust?.profile);
+  checks.push(profileCheck);
+
+  const evidenceVerifier = profileCheck.ok ? resolveEvidenceVerifier(profile, deps) : undefined;
+  const evidence = evidenceVerifier?.verifyEvidence({ proof: t, trust, now: input.now });
+  if (evidence) checks.push(...evidence.checks);
+  else if (profileCheck.ok) checks.push({ name: '远程证明', ok: false, detail: `未知 Evidence profile: ${profile}` });
+
+  if (input.expectedNonceB64) {
+    const nonceOk = t.nonce === input.expectedNonceB64;
+    checks.push({
+      name: 'nonce 新鲜性',
+      ok: nonceOk,
+      detail: nonceOk ? 'proof.nonce == verifier/requester expectedNonce' : 'proof.nonce 与 verifier/requester expectedNonce 不一致',
+    });
   }
 
   // ④ 上游 host:签名覆盖、直接读。给了 expectedHost 则比对,否则展示由你判断。
@@ -154,7 +170,15 @@ export function verifyTeeExchange(
     ok,
     mode,
     checks,
-    attestation: { moduleId: att?.moduleId, pcr0: att?.pcr0, publicKey: att?.publicKey, nonce: att?.nonce },
+    attestation: {
+      profile,
+      moduleId: evidence?.moduleId,
+      pcr0: evidence?.pcr0,
+      measurements: evidence?.measurements,
+      publicKey: evidence?.publicKey,
+      nonce: evidence?.nonce,
+      platformTrust: evidence?.platformTrust,
+    },
     provenance: {
       upstreamHost: t.upstream_host,
       upstreamPath: t.upstream_path,
@@ -163,6 +187,73 @@ export function verifyTeeExchange(
       respContentType: t.resp_content_type,
     },
   };
+}
+
+function configuredProfile(trust: EvidenceTrust | undefined, proof: TeeProofWire): string {
+  if (trust?.profile) return trust.profile;
+  if (!proof.profile || proof.profile === 'nitro') return 'nitro';
+  return proof.profile;
+}
+
+function verifyWireEnvelope(proof: TeeProofWire): TeeCheck {
+  if (proof.v !== 2) {
+    return {
+      name: 'proof wire',
+      ok: false,
+      detail: `unsupported proof.v: ${String(proof.v)}; expected 2`,
+    };
+  }
+  if (proof.alg !== 'ed25519') {
+    return {
+      name: 'proof wire',
+      ok: false,
+      detail: `unsupported proof.alg: ${String(proof.alg)}; expected ed25519`,
+    };
+  }
+  return {
+    name: 'proof wire',
+    ok: true,
+    detail: 'proof.v == 2 且 proof.alg == ed25519',
+  };
+}
+
+function verifyConfiguredProfile(profile: string, proof: TeeProofWire, hasConfiguredProfile: boolean): TeeCheck {
+  if (profile !== 'nitro' && !hasConfiguredProfile) {
+    return {
+      name: 'Evidence profile',
+      ok: false,
+      detail: `非 Nitro profile=${profile} 必须由本地 trust.profile 显式选择`,
+    };
+  }
+  if (proof.profile && proof.profile !== profile) {
+    return {
+      name: 'Evidence profile',
+      ok: false,
+      detail: `proof.profile=${proof.profile} 与 trust.profile=${profile} 不一致`,
+    };
+  }
+  if (profile !== 'nitro' && !proof.profile) {
+    return {
+      name: 'Evidence profile',
+      ok: false,
+      detail: `trust.profile=${profile} 但 proof 未声明同一 profile`,
+    };
+  }
+  return {
+    name: 'Evidence profile',
+    ok: true,
+    detail: proof.profile ? `profile=${profile}` : 'legacy Nitro proof defaults to profile=nitro',
+  };
+}
+
+function resolveEvidenceVerifier(
+  profile: string,
+  deps: { verifyAttestationDoc?: AttestationVerifier; evidenceVerifiers?: Record<string, EvidenceProfileVerifier> },
+): EvidenceProfileVerifier | undefined {
+  if (deps.evidenceVerifiers?.[profile]) return deps.evidenceVerifiers[profile];
+  if (profile === 'nitro') return deps.verifyAttestationDoc ? createNitroEvidenceVerifier(deps.verifyAttestationDoc) : nitroEvidenceVerifier;
+  if (profile === 'aliyun-vtpm') return aliyunVtpmEvidenceVerifier;
+  return undefined;
 }
 
 // 重建 v2 声明(用 proof 自报的字段值)→ 用绑定公钥验签;再核对收到的字节哈希 == 签名覆盖的响应体哈希。

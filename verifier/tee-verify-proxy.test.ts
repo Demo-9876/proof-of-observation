@@ -1,7 +1,7 @@
 // 本地校验代理的端到端单测:假上游 + 经代理打真请求。
 //
 // attestation 半边用**注入桩**(无法伪造真 Nitro 文档);签名半边用真 Ed25519 + 真 signing.ts。
-// 假上游(模拟 relay)**自生成 nonce** 并对它签名;代理不注入头,从 proof 读 nonce 验一致性 —— 覆盖 生成→绑定→验签 闭环。
+// 假上游(模拟 relay)**自生成 nonce** 或使用代理注入的 nonce 并对它签名;覆盖 生成→绑定→验签 闭环。
 
 import { afterEach, describe, expect, it } from 'vitest';
 import http from 'node:http';
@@ -24,10 +24,10 @@ function track<T extends http.Server>(s: T): T { servers.push(s); return s; }
 function listen(s: http.Server): Promise<number> {
   return new Promise((resolve) => s.listen(0, '127.0.0.1', () => resolve((s.address() as any).port)));
 }
-function postThrough(port: number, path: string, body: string): Promise<{ status: number; body: string }> {
+function postThrough(port: number, path: string, body: string, headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json' } },
+      { host: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json', ...headers } },
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c) => chunks.push(c as Buffer));
@@ -327,7 +327,7 @@ describe('createVerifyingProxy (--enforce / fail-closed)', () => {
     expect(res.body).not.toContain('tee.proof');
   });
 
-  it('passes non-attested responses through under enforce (does not block what it cannot attest)', async () => {
+  it('blocks non-attested responses under enforce', async () => {
     const upstream = track(http.createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{"ok":true}');
@@ -343,7 +343,65 @@ describe('createVerifyingProxy (--enforce / fail-closed)', () => {
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
+    expect(res.status).toBe(502);
+    expect(res.body).toContain('tee_proof_missing');
+    expect(res.body).not.toContain('ok');
+  });
+
+  it('injects nonceHeader and requires proof.nonce to match it', async () => {
+    const { privateKey, pubB64 } = newKey();
+    const upstreamBody = Buffer.from('event: message_stop\ndata: {"ok":1}\n\n', 'utf8');
+    let injectedNonce = '';
+    const upstream = track(http.createServer((req, res) => {
+      injectedNonce = String(req.headers['x-tee-nonce'] || '');
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(upstreamBody);
+      res.write(signProof({ nonce: injectedNonce, body: upstreamBody, privateKey, pubB64 }));
+      res.end();
+    }));
+    const upPort = await listen(upstream);
+
+    const proxy = track(createVerifyingProxy({
+      upstream: `http://127.0.0.1:${upPort}`,
+      expectedPcr0: PCR0,
+      nonceHeader: 'x-tee-nonce',
+      enforce: true,
+      verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => injectedNonce }),
+    }));
+    const proxyPort = await listen(proxy);
+
+    const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
+    expect(injectedNonce.length).toBeGreaterThan(0);
     expect(res.status).toBe(200);
-    expect(res.body).toBe('{"ok":true}');
+    expect(res.body).toBe(upstreamBody.toString('utf8'));
+  });
+
+  it('blocks when nonceHeader was injected but proof uses a different nonce', async () => {
+    const { privateKey, pubB64 } = newKey();
+    const upstreamBody = Buffer.from('event: message_stop\ndata: {"ok":1}\n\n', 'utf8');
+    let injectedNonce = '';
+    const upstream = track(http.createServer((req, res) => {
+      injectedNonce = String(req.headers['x-tee-nonce'] || '');
+      const wrongNonce = randomBytes(32).toString('base64');
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(upstreamBody);
+      res.write(signProof({ nonce: wrongNonce, body: upstreamBody, privateKey, pubB64 }));
+      res.end();
+    }));
+    const upPort = await listen(upstream);
+
+    const proxy = track(createVerifyingProxy({
+      upstream: `http://127.0.0.1:${upPort}`,
+      expectedPcr0: PCR0,
+      nonceHeader: 'x-tee-nonce',
+      enforce: true,
+      verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => injectedNonce }),
+    }));
+    const proxyPort = await listen(proxy);
+
+    const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
+    expect(injectedNonce.length).toBeGreaterThan(0);
+    expect(res.status).toBe(502);
+    expect(res.body).toContain('tee_verification_failed');
   });
 });

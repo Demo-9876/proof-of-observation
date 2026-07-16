@@ -1,0 +1,6 @@
+github.com/aliyun/acs-apsara-enclave v0.1.1-0.20260715102441-f81674a6b341 h1:5w+R4KtPyByd5Cze60r23yEvnwnPqrCt42DkDZ0NXrs=
+github.com/aliyun/acs-apsara-enclave v0.1.1-0.20260715102441-f81674a6b341/go.mod h1:YxvG8VPlhlA34jh5+h+rXYvw3odarptjgOA3jaJ3PHE=
+github.com/google/go-tpm v0.9.6 h1:Ku42PT4LmjDu1H5C5ISWLlpI1mj+Zq7sPGKoRw2XROA=
+github.com/google/go-tpm v0.9.6/go.mod h1:h9jEsEECg7gtLis0upRBQU+GhYVH6jMjrFxI8u6bVUY=
+golang.org/x/sys v0.21.0 h1:rF+pYz3DAGSQAxAu1CbC7catZg4ebC4UIeIhKxBZvws=
+golang.org/x/sys v0.21.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
