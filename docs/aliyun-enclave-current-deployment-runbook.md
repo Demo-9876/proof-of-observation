@@ -1,19 +1,47 @@
-# 当前版本部署到阿里云 Enclave 的验证 Runbook
+# 阿里云 Enclave runtime 部署与 fixture 校准 Runbook
 
-本文记录当前分支将 `aliyun-vtpm` proof 生成端部署到阿里云 Enclave，并拿到真实 `QuoteReport.Cert` / TPM quote fixture 的最小可执行步骤。
+本文分成两条互相独立的流程，避免把正式 runtime 部署和旧 fixture 校准混在一起：
 
-当前版本的定位：
+- **流程 A：正式 runtime 部署**
+  用于当前主路径。构建并运行 `deploy/aliyun-vtpm-runtime/`，Enclave 内启动 Rust relay + Go proof helper daemon，后续由父 VM relay adapter（例如 `ai-platform-newapi`）通过 `TEE Relay Frame Protocol v1` 调用。
+- **流程 B：历史 fixture 校准**
+  只用于重现早期真实硬件校准过程，拿 `QuoteReport.Cert` / TPM quote / PCR / verifier fixture。它会构建 `deploy/aliyun-vtpm-fixture/`，使用样本 request/response bytes 生成 proof，再通过 vsock tar 包发回父 VM。**这不是当前正式部署路径。**
+
+当前版本状态：
 
 - 已实现：正式阿里云 Enclave runtime，位于 `deploy/aliyun-vtpm-runtime/`，由 Rust relay、Go proof helper daemon 和阿里云 vTPM proof 生成逻辑组成。
 - 已实现：Node verifier 的 `aliyun-vtpm` profile，可验证 quote 签名、challenge、PCR digest、PCR allowlist、`QuoteReport.Cert` root/intermediate 链和 Enclave EK CN。
 - 已校准：真实阿里云 Enclave fixture 已完成端到端验证，Node verifier 对真实 `QuoteReport.Cert` / TPM quote / PCR / request-response binding 全部通过。
 - 未实现：TypeScript 内置 CRL 解析。当前 verifier 可配置 `revocation.required=false` 先完成链路校准；生产前需要外部 CRL appraiser 或内置 CRL 检查。
 
-## 0. 真实阿里云 Enclave 校准记录
+## 0. 该走哪条流程
+
+如果你的目标是部署当前可用的阿里云 Enclave proof-of-observation runtime：
+
+```text
+走流程 A：第 1 到第 5 节
+```
+
+如果你的目标是重新生成历史校准 fixture，或者排查 `QuoteReport.Cert` / TPM quote / verifier 解析问题：
+
+```text
+走流程 B：第 6 到第 15 节
+```
+
+不要把两条流程混用：
+
+- 正式 runtime 不需要手工创建 `deploy/aliyun-vtpm-fixture/run.sh`。
+- 正式 runtime 不需要在 Enclave 内用 `socat-vsock` 把 tar 包发回父 VM。
+- fixture 流程不能证明真实用户请求已经经过完整 streaming relay。
+- fixture 流程产生的 EIF / PCR 不应作为正式 runtime 的 trust bundle。
+
+如果你只是要部署当前正式 runtime，可以跳过下一节校准记录，直接从 **第 1 节：通用前提** 开始执行。
+
+## 校准记录（非部署步骤）：真实阿里云 Enclave fixture
 
 本节记录 2026-07-16 前后在真实阿里云 Enclave 上完成的关键验证过程和结论，避免后续只看代码或 runbook 时丢失上下文。
 
-### 0.1 代码状态
+### A.1 代码状态
 
 当前阿里云 vTPM profile 相关关键提交：
 
@@ -25,7 +53,7 @@ c17829b fix: accept aliyun tpms attest wrapper
 
 父 VM / Enclave fixture 使用当前分支 `feature/aliyun-vtpm-evidence-profile`。如果后续部署机器还停留在 `0aea403`，必须至少更新到包含 `4b0386f` 和 `c17829b` 的版本，否则真实 `QuoteReport.Quoted` 可能因为 `TPM2B_ATTEST` 包装解析失败。
 
-### 0.2 真实证书样本
+### A.2 真实证书样本
 
 从真实 fixture 的 `out/tee.proof.json` 提取 `QuoteReport.Cert`：
 
@@ -54,7 +82,7 @@ SHA256 Fingerprint=0D:05:89:D7:5A:CC:6C:86:2C:D5:59:03:E0:EB:D4:01:00:E7:0C:5D:6
 - 真实 Enclave vTPM EK CN 形态为 `i-<instance-id>-enclave-<index>`，当前默认 verifier pattern `^i-[A-Za-z0-9][A-Za-z0-9-]*-enclave-[0-9]+$` 与该样本匹配。
 - Issuer 指向 `Aliyun TPM EKMF CA`，符合阿里云技术人员给出的 EKMF intermediate 方向。
 
-### 0.3 阿里云 TPM CA 与证书链
+### A.3 阿里云 TPM CA 与证书链
 
 阿里云技术人员确认的 CA 文件：
 
@@ -79,7 +107,7 @@ ekmf-ca.crt = 141805f04cd9b89bfbcd30cb792d5ca3a0a2382db6ee35720e6e27e4189e43a0
 - trust bundle 中的 root/intermediate fingerprint pin 生效。
 - EK CN pattern 检查生效。
 
-### 0.4 QuoteReport.Quoted 格式校准
+### A.4 QuoteReport.Quoted 格式校准
 
 第一次在真实 fixture 上运行 verifier 时失败点为：
 
@@ -105,7 +133,7 @@ ekmf-ca.crt = 141805f04cd9b89bfbcd30cb792d5ca3a0a2382db6ee35720e6e27e4189e43a0
 ✅ quote 签名 QuoteReport.Cert public key 验证 quote signature 通过
 ```
 
-### 0.5 真实 fixture 完整验证命令
+### A.5 真实 fixture 完整验证命令
 
 父 VM fixture 解包后组装 `bundle.json`，并用真实 nonce 运行 verifier：
 
@@ -145,7 +173,7 @@ nonce 新鲜性 proof.nonce == verifier/requester expectedNonce
 
 该结果说明当前 `aliyun-vtpm` proof 生成核心和 Node verifier 已经完成真实硬件 fixture 校准。它仍不等价于“完整 streaming relay 已完成”，因为 fixture 的 request/response bytes 是样本数据，不是真实用户请求流。
 
-## 1. 前提
+## 1. 通用前提
 
 父 VM 需要满足：
 
@@ -153,9 +181,17 @@ nonce 新鲜性 proof.nonce == verifier/requester expectedNonce
 - 已安装并可运行 `enclave-cli`。
 - 已安装 Docker。
 - 已安装 `git`，并已拉取当前分支代码到父 VM。
-- 父 VM 上有一个可用的 `socat-vsock` 可执行文件，用于 Enclave 将 fixture tar 包发回父 VM。
 - 父 VM 上有 `jq`、`openssl`、`tar`、`base64`。
-- verifier 机器上有 Node.js，并可安装/运行 `verifier` 目录依赖。
+
+额外要求按流程区分：
+
+- 流程 A 正式 runtime：
+  - 不需要 fixture tar 包回传。
+  - 后续真实请求链路需要父 VM 上有 egress proxy，例如 `socat-vsock` 或等价实现，把 Enclave 的 `CID=3:egress_port` 字节流转发到真实上游。
+  - 后续与中转站联调请看 `docs/ai-platform-newapi-aliyun-enclave-deployment.md`。
+- 流程 B 历史 fixture：
+  - 父 VM 上必须有一个可用的 `socat-vsock`，用于 Enclave 将 fixture tar 包发回父 VM。
+  - verifier 机器上需要 Node.js，并可安装/运行 `verifier` 目录依赖。
 
 如果阿里云父 VM 没有 `git`，先安装：
 
@@ -194,7 +230,7 @@ git checkout feature/aliyun-vtpm-evidence-profile
 git pull --ff-only origin feature/aliyun-vtpm-evidence-profile
 ```
 
-确认代码版本。本文档对应的本地提交为 `0aea403`，阿里云父 VM 上至少需要包含该提交：
+确认代码版本。阿里云父 VM 上至少需要包含 `aliyun-vtpm` profile、真实 QuoteReport 校准和正式 runtime 相关提交：
 
 ```bash
 git log --oneline -5
@@ -213,25 +249,11 @@ openssl version
 
 如果 `describe-enclaves` 返回 `[]`，说明当前没有运行中的 Enclave，这是正常的。
 
-## 2. 准备变量
+## 2. 流程 A：构建正式 runtime
 
-在父 VM 的仓库根目录执行：
+正式 runtime 是当前主路径。它不再手工拼 `aliyun-proof` fixture，而是直接构建 `deploy/aliyun-vtpm-runtime/`。
 
-```bash
-cd ~/proof-of-observation
-
-export IMAGE_NAME=proof-observation-aliyun-vtpm-fixture:latest
-export EIF_FILE=aliyun-vtpm-fixture.eif
-export OUT_TGZ=aliyun-vtpm-fixture.tgz
-```
-
-如果仓库路径不同，后续命令中的 `~/proof-of-observation` 替换为实际路径。
-后续每打开一个新的父 VM 终端，都需要重新执行这些 `export`，或直接把命令中的变量替换为实际文件名。
-本文档中的 vsock 接收端口固定为 `5005`；如果要改端口，必须同时修改父 VM listener 和 Enclave 内 `run.sh` 的 `vsock-connect:3:5005`。
-
-## 3. 构建正式 runtime
-
-如果目标是部署阿里云 Enclave 的完整 runtime，不再手工拼 `aliyun-proof` fixture，而是直接构建 `deploy/aliyun-vtpm-runtime/`：
+构建镜像：
 
 ```bash
 cd ~/proof-of-observation
@@ -248,30 +270,174 @@ sudo docker build --network host \
 - Go proof helper daemon `/usr/bin/aliyun-proof-helper`
 - 启动脚本 `/run.sh`
 
-如需继续构建 EIF 并记录 PCR：
+如果构建失败在 `docker.io/library/golang` 或 `docker.io/library/rust`，并出现类似下面的错误：
+
+```text
+failed to resolve source metadata for docker.io/library/golang@sha256:...
+Head "https://registry-1.docker.io/v2/library/golang/manifests/...": i/o timeout
+```
+
+这不是 Dockerfile 语法问题，而是父 VM 访问 Docker Hub 超时。正式 runtime 的 Dockerfile 默认钉死了 Go/Rust builder image digest；builder image 会影响最终 EIF/PCR，因此不要随意替换成来源不明的镜像。可选处理方式：
+
+方式一，配置可信 Docker Hub mirror 后重试构建。使用阿里云控制台分配给当前账号的镜像加速地址，或企业内部可信 mirror：
+
+```bash
+sudo mkdir -p /etc/docker
+
+sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+{
+  "registry-mirrors": [
+    "https://<your-trusted-dockerhub-mirror>"
+  ]
+}
+JSON
+
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+
+sudo docker build --network host \
+  -f deploy/aliyun-vtpm-runtime/Dockerfile \
+  -t proof-of-observation-aliyun-vtpm:latest \
+  .
+```
+
+方式二，从能访问 Docker Hub 的可信环境拉取默认 builder 镜像并 `docker save`，上传到父 VM 后 `docker load`。这可以保留默认 digest pin：
+
+```bash
+docker pull docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d
+docker pull docker.io/library/rust@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9
+
+docker save \
+  docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d \
+  docker.io/library/rust@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 \
+  -o aliyun-vtpm-builder-images.tar
+
+scp aliyun-vtpm-builder-images.tar <user>@<aliyun-parent-vm>:~/
+```
+
+父 VM 上执行：
+
+```bash
+sudo docker load -i ~/aliyun-vtpm-builder-images.tar
+
+cd ~/proof-of-observation
+
+sudo docker build --network host \
+  -f deploy/aliyun-vtpm-runtime/Dockerfile \
+  -t proof-of-observation-aliyun-vtpm:latest \
+  .
+```
+
+方式三，将这两个 builder 镜像同步到企业可信 ACR，并通过 build args 指定。注意：同步后的镜像版本必须记录到部署记录中，因为它会影响可复现构建和最终 PCR。
+
+```bash
+sudo docker build --network host \
+  -f deploy/aliyun-vtpm-runtime/Dockerfile \
+  --build-arg GO_BUILDER_IMAGE=<trusted-acr>/<namespace>/golang@sha256:<digest> \
+  --build-arg RUST_BUILDER_IMAGE=<trusted-acr>/<namespace>/rust@sha256:<digest> \
+  -t proof-of-observation-aliyun-vtpm:latest \
+  .
+```
+
+## 3. 流程 A：构建 EIF 并记录 PCR
+
+```bash
+cd ~/proof-of-observation
+
+export RUNTIME_IMAGE=proof-of-observation-aliyun-vtpm:latest
+export RUNTIME_EIF=aliyun-vtpm-runtime.eif
+```
+
+构建 EIF：
 
 ```bash
 cd ~/proof-of-observation
 
 sudo enclave-cli build-enclave \
   --docker-dir . \
-  --docker-uri proof-of-observation-aliyun-vtpm:latest \
-  --output-file aliyun-vtpm-runtime.eif \
+  --docker-uri "$RUNTIME_IMAGE" \
+  --output-file "$RUNTIME_EIF" \
   | tee build-measurements.log
 ```
 
-如果只是验证 runtime 能启动，也可以直接运行：
+记录 `build-measurements.log` 中的 PCR8/PCR9/PCR11，并把它们写入用户侧 verifier trust bundle。注意：
+
+- 每次改动 Dockerfile、Rust、Go helper、依赖、base image、构建工具版本后，都必须重新 `build-enclave`，记录新 PCR。
+- debug mode 下 measurements 全零，不能作为生产 trust bundle。
+- 正式 runtime 的 PCR 与历史 fixture EIF 的 PCR 不同，不能混用。
+
+## 4. 流程 A：启动正式 runtime
+
+```bash
+cd ~/proof-of-observation
+
+export RUNTIME_EIF=aliyun-vtpm-runtime.eif
+```
+
+启动：
 
 ```bash
 sudo enclave-cli run-enclave \
   --cpu-count 2 \
   --memory 2048 \
-  --eif-path aliyun-vtpm-runtime.eif
+  --eif-path "$RUNTIME_EIF"
 ```
 
-下面第 4 到 10 节保留为历史校准流程，用于重现真实 `QuoteReport.Cert` 样本和 verifier 校准，不再是当前主部署路径。
+记录输出中的 `EnclaveCID`，例如：
 
-## 4. 历史校准：准备最小 fixture Enclave 镜像上下文
+```text
+"EnclaveCID": 4
+```
+
+确认运行中：
+
+```bash
+sudo enclave-cli describe-enclaves
+```
+
+正式 runtime 启动后会在 Enclave 内监听：
+
+```text
+业务 relay vsock port: 5005
+metrics vsock port: 5006
+```
+
+下一步不在本文内继续展开：父 VM 上的中转站需要连接 `EnclaveCID:5005`，并提供 egress proxy。以 `ai-platform-newapi` 为例，继续阅读：
+
+```text
+docs/ai-platform-newapi-aliyun-enclave-deployment.md
+```
+
+## 5. 流程 A：正式 runtime 最小验收
+
+最小验收项：
+
+- `sudo enclave-cli describe-enclaves` 显示 Enclave `RUNNING`。
+- `build-measurements.log` 已保存，并记录 PCR8/PCR9/PCR11。
+- 用户侧 trust bundle 使用正式 runtime EIF 的 PCR，而不是 fixture EIF 的 PCR。
+- 父 VM relay adapter 使用当前 `EnclaveCID` 和端口 `5005`。
+- 父 VM egress proxy 已启动，`egress_port` 指向父 VM vsock 端口，而不是上游 HTTPS `443`。
+- 真实请求通过 relay adapter 后，用户侧 verifier 能验证 `profile=aliyun-vtpm` 的 `tee.proof`。
+
+下面开始的流程 B 仅用于历史 fixture 校准，不是当前主部署路径。
+
+## 6. 流程 B：准备旧 fixture 变量
+
+在父 VM 的仓库根目录执行：
+
+```bash
+cd ~/proof-of-observation
+
+export IMAGE_NAME=proof-observation-aliyun-vtpm-fixture:latest
+export EIF_FILE=aliyun-vtpm-fixture.eif
+export OUT_TGZ=aliyun-vtpm-fixture.tgz
+```
+
+如果仓库路径不同，后续命令中的 `~/proof-of-observation` 替换为实际路径。
+后续每打开一个新的父 VM 终端，都需要重新执行这些 `export`，或直接把命令中的变量替换为实际文件名。
+fixture 流程中的 vsock 接收端口固定为 `5005`；如果要改端口，必须同时修改父 VM listener 和 Enclave 内 `run.sh` 的 `vsock-connect:3:5005`。
+
+## 7. 流程 B：准备最小 fixture Enclave 镜像上下文
 
 这个 fixture 镜像只做一件事：在 Enclave 内调用 vTPM 生成 proof，并把 proof、request/response 样本、metadata 打包后通过 vsock 发回父 VM。
 
@@ -400,7 +566,7 @@ sudo docker build --network host -t "$IMAGE_NAME" .
 sudo docker tag "$IMAGE_NAME" docker.io/library/"$IMAGE_NAME"
 ```
 
-## 5. 构建 EIF 并记录 PCR
+## 8. 流程 B：构建 fixture EIF 并记录 PCR
 
 ```bash
 cd ~/proof-of-observation/deploy/aliyun-vtpm-fixture
@@ -431,13 +597,14 @@ sudo enclave-cli build-enclave \
 }
 ```
 
-这些值后续写入 verifier trust bundle。注意：
+这些值只写入 fixture verifier trust bundle。注意：
 
 - 构建工具版本、Docker base image、源码、依赖版本、Dockerfile、run.sh 都可能影响 PCR。
 - 生产信任的 PCR 必须来自固定源码和固定构建环境，并记录可复现构建信息。
 - 不要使用 debug mode 产生的 PCR 作为生产信任值。
+- fixture EIF 的 PCR 不能用于正式 runtime trust bundle。
 
-## 6. 启动父 VM vsock 接收端
+## 9. 流程 B：启动父 VM vsock 接收端
 
 打开一个父 VM 终端，监听 Enclave 发回的 fixture：
 
@@ -454,7 +621,7 @@ sudo ./socat-vsock -u \
 
 这个命令会阻塞等待 Enclave 连接。保持该终端不关闭。
 
-## 7. 启动 Enclave
+## 10. 流程 B：启动 fixture Enclave
 
 另开一个父 VM 终端：
 
@@ -483,7 +650,7 @@ sudo enclave-cli run-enclave \
 sudo enclave-cli describe-enclaves
 ```
 
-等待第 6 步的 vsock listener 退出或当前目录出现文件：
+等待第 9 节的 vsock listener 退出或当前目录出现文件：
 
 ```bash
 ls -lh "$OUT_TGZ"
@@ -510,7 +677,7 @@ cat out/metadata.txt
 jq '.profile, .evidence.quote_report.pcr_info.pcr_update_counter' out/tee.proof.json
 ```
 
-## 8. 提取真实 `QuoteReport.Cert`
+## 11. 流程 B：提取真实 `QuoteReport.Cert`
 
 ```bash
 cd ~/proof-of-observation/deploy/aliyun-vtpm-fixture
@@ -545,7 +712,7 @@ SHA256 Fingerprint=0D:05:89:D7:5A:CC:6C:86:2C:D5:59:03:E0:EB:D4:01:00:E7:0C:5D:6
 - 证书能否被 Node verifier 解析。
 - 如果 CN 格式与当前默认 pattern 不一致，需要更新 trust bundle 的 `enclaveSubjectCnPattern`。
 
-## 9. 准备 verifier trust bundle
+## 12. 流程 B：准备 fixture verifier trust bundle
 
 下载阿里云 TPM CA：
 
@@ -586,7 +753,7 @@ test -n "$PCR9" && test "$PCR9" != "null"
 test -n "$PCR11" && test "$PCR11" != "null"
 ```
 
-生成 trust bundle：
+生成 fixture trust bundle：
 
 ```bash
 cat > trust/aliyun-vtpm-trust.json <<EOF
@@ -632,7 +799,7 @@ jq \
 mv trust/aliyun-vtpm-trust.with-ca.json trust/aliyun-vtpm-trust.json
 ```
 
-如果第 8 步看到真实 CN 不匹配默认 pattern，先按实际 CN 调整：
+如果第 11 节看到真实 CN 不匹配默认 pattern，先按实际 CN 调整：
 
 ```bash
 jq '.platformTrust.enclaveSubjectCnPattern = "^<YOUR_REAL_PATTERN>$"' \
@@ -640,7 +807,7 @@ jq '.platformTrust.enclaveSubjectCnPattern = "^<YOUR_REAL_PATTERN>$"' \
 mv trust/tmp.json trust/aliyun-vtpm-trust.json
 ```
 
-## 10. 组装 full bundle 并验证
+## 13. 流程 B：组装 fixture full bundle 并验证
 
 `verify-real-bundle.ts` 需要 request bytes、response bytes 和 proof。组装：
 
@@ -688,7 +855,7 @@ tar czf aliyun-vtpm-verifier-inputs.tgz out trust build-measurements.log
 scp <user>@<aliyun-parent-vm>:~/proof-of-observation/deploy/aliyun-vtpm-fixture/aliyun-vtpm-verifier-inputs.tgz .
 ```
 
-本地解包后，在本地仓库执行第 10 步的 verifier 命令，路径按实际解包目录调整。
+本地解包后，在本地仓库执行本节的 verifier 命令，路径按实际解包目录调整。
 
 如果必须在父 VM 上运行 verifier，不要使用官方 Node 22 包。先检查 glibc：
 
@@ -759,7 +926,7 @@ npx tsx verify-real-bundle.ts \
 - `quote challenge` 失败：检查 `aliyun-proof` 和 verifier 是否同一分支、同一 challenge canonicalization。
 - `nonce 新鲜性` 失败：检查 `--nonce-b64` 是否来自本次 `metadata.txt`。
 
-## 11. 收集本次校准产物
+## 14. 流程 B：收集本次 fixture 校准产物
 
 建议保存：
 
@@ -783,7 +950,7 @@ deploy/aliyun-vtpm-fixture/trust/aliyun-vtpm-trust.json
 - `QuoteReport.Cert` subject / issuer / serial / sha256 fingerprint。
 - `PCR8/PCR9/PCR11`。
 
-## 12. 停止 Enclave
+## 15. 停止 Enclave
 
 ```bash
 sudo enclave-cli describe-enclaves
@@ -793,7 +960,7 @@ sudo enclave-cli describe-enclaves
 
 如果 CLI 使用的是 `stop-enclave` 而不是 `terminate-enclave`，按本机 `enclave-cli --help` 输出为准。
 
-## 13. fixture 校准链路不能证明的内容
+## 16. fixture 校准链路不能证明的内容
 
 这个 fixture 链路能证明：
 

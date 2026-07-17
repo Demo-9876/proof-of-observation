@@ -1,6 +1,8 @@
 ARG ALIYUN_ENCLAVE_PLATFORM=linux/amd64
+ARG GO_BUILDER_IMAGE=docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d
+ARG RUST_BUILDER_IMAGE=docker.io/library/rust@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9
 
-FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d AS go-builder
+FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} ${GO_BUILDER_IMAGE} AS go-builder
 
 WORKDIR /src/aliyun-enclave
 
@@ -10,7 +12,7 @@ RUN go mod download
 COPY aliyun-enclave/. ./
 RUN CGO_ENABLED=0 go build -tags aliyun_enclave -trimpath -ldflags="-s -w" -o /out/aliyun-proof-helper ./cmd/aliyun-proof-helper
 
-FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} rust@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS rust-builder
+FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} ${RUST_BUILDER_IMAGE} AS rust-builder
 
 WORKDIR /src/enclave
 
