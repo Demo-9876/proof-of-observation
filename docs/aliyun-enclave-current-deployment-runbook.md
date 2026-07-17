@@ -396,6 +396,8 @@ sudo docker build --network host \
   --build-arg GO_MODULE_PROXY=https://goproxy.cn,direct \
   --build-arg GO_SUMDB=sum.golang.google.cn \
   --build-arg RUST_BUILDER_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5" \
+  --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian \
+  --build-arg APT_SECURITY_MIRROR=https://mirrors.aliyun.com/debian-security \
   -t proof-of-observation-aliyun-vtpm:latest \
   .
 ```
@@ -413,7 +415,16 @@ Get "https://proxy.golang.org/...": i/o timeout
 --build-arg GO_SUMDB=sum.golang.google.cn
 ```
 
-不要直接设置 `GOSUMDB=off`，除非只是临时排查网络问题；关闭校验会降低依赖完整性保障。若后续构建继续卡在 Rust builder 的 `apt-get update`，说明父 VM 访问 Debian 源不稳定，需要给 Rust builder 配置可信 Debian mirror，或把已安装依赖的 Rust builder 镜像固化后推送到企业 ACR。
+不要直接设置 `GOSUMDB=off`，除非只是临时排查网络问题；关闭校验会降低依赖完整性保障。
+
+如果构建长时间停在 Rust builder 的 `apt-get update` / `apt-get install`，并且日志里在访问 `http://deb.debian.org/debian`，说明父 VM 访问 Debian 官方源很慢。使用上面的 `APT_MIRROR` / `APT_SECURITY_MIRROR` build args 后重试即可。默认 Dockerfile 仍使用 Debian 官方源；在阿里云父 VM 上建议显式传：
+
+```bash
+--build-arg APT_MIRROR=https://mirrors.aliyun.com/debian
+--build-arg APT_SECURITY_MIRROR=https://mirrors.aliyun.com/debian-security
+```
+
+apt mirror 可能影响最终镜像文件系统和 EIF/PCR，必须纳入构建记录。更稳的生产做法是把已安装 `cmake clang libclang-dev` 的 Rust builder 镜像固化后推送到企业 ACR，并用固定 digest 作为 `RUST_BUILDER_IMAGE`。
 
 构建记录中至少保存：
 
@@ -426,6 +437,8 @@ Get "https://proxy.golang.org/...": i/o timeout
 - `docker build` 使用的 `--build-arg`。
   - `GO_MODULE_PROXY`
   - `GO_SUMDB`
+  - `APT_MIRROR`
+  - `APT_SECURITY_MIRROR`
 - 本次 `build-enclave` 输出的 PCR8/PCR9/PCR11。
 
 ## 3. 流程 A：构建 EIF 并记录 PCR
