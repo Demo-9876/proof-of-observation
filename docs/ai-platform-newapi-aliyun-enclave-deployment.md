@@ -294,7 +294,29 @@ sudo docker build --network host \
   .
 ```
 
-如果 Docker Hub 拉取慢或失败，需要把 Dockerfile 中 builder/base image 提前同步到可访问的镜像仓库，或在有公网访问的环境构建后推送到 ACR。
+如果 Docker Hub 拉取慢或失败，需要把 Dockerfile 中 builder/base image 提前同步到可访问的镜像仓库，或在有公网访问的环境构建后推送到 ACR。注意 final runtime base 必须是 Debian bookworm 系或其它 glibc/libstdc++ 兼容镜像；不要用 Alibaba Cloud Linux 2 / glibc 2.17 作为 final runtime，否则 `/attest` 会因 `GLIBC_2.xx not found` 启动失败，Enclave 内不会监听 `5005/5006`。
+
+在阿里云父 VM 上使用 ACR 镜像和国内网络源构建时，可显式传入：
+
+```bash
+export ACR_REGISTRY=<your-acr-registry>
+export ACR_NAMESPACE=<your-namespace>
+
+sudo docker build --network host \
+  -f deploy/aliyun-vtpm-runtime/Dockerfile \
+  --build-arg GO_BUILDER_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/golang:amd64-sha256-98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d" \
+  --build-arg GO_MODULE_PROXY=https://goproxy.cn,direct \
+  --build-arg GO_SUMDB=sum.golang.google.cn \
+  --build-arg RUST_BUILDER_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5" \
+  --build-arg RUNTIME_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim" \
+  --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian \
+  --build-arg APT_SECURITY_MIRROR=https://mirrors.aliyun.com/debian-security \
+  --build-arg CARGO_REGISTRY_PROTOCOL=sparse \
+  --build-arg CARGO_REGISTRY_REPLACE_WITH=rsproxy-sparse \
+  --build-arg CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/ \
+  -t proof-of-observation-aliyun-vtpm:latest \
+  .
+```
 
 ### 5.3 构建 EIF 并记录 PCR
 

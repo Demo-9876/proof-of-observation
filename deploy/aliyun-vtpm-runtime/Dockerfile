@@ -8,6 +8,7 @@ ARG APT_SECURITY_MIRROR=http://deb.debian.org/debian-security
 ARG CARGO_REGISTRY_PROTOCOL=sparse
 ARG CARGO_REGISTRY_REPLACE_WITH=
 ARG CARGO_REGISTRY_MIRROR=
+ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim
 
 FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} ${GO_BUILDER_IMAGE} AS go-builder
 
@@ -72,7 +73,23 @@ COPY enclave/src ./src
 
 RUN cargo build --release --locked
 
-FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} alibaba-cloud-linux-2-registry.cn-hangzhou.cr.aliyuncs.com/alinux2/alinux2@sha256:2af515d7e03e94ca394d78cdeb3aa337f2fa6c5f71053a1f567dd91c86cc3938
+FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} ${RUNTIME_IMAGE}
+
+ARG APT_MIRROR
+ARG APT_SECURITY_MIRROR
+
+RUN set -eux; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+      if [ -f "$f" ]; then \
+        sed -i \
+          -e "s|http://deb.debian.org/debian-security|${APT_SECURITY_MIRROR}|g" \
+          -e "s|http://deb.debian.org/debian|${APT_MIRROR}|g" \
+          "$f"; \
+      fi; \
+    done; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates libstdc++6; \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=rust-builder /src/enclave/target/release/attest /attest
 COPY --from=go-builder /out/aliyun-proof-helper /usr/bin/aliyun-proof-helper

@@ -270,6 +270,8 @@ sudo docker build --network host \
 - Go proof helper daemon `/usr/bin/aliyun-proof-helper`
 - 启动脚本 `/run.sh`
 
+重要：正式 runtime 的 final stage 默认使用 `docker.io/library/debian:bookworm-slim`，而不是 Alibaba Cloud Linux 2。当前 `/attest` 在 Rust Debian builder 中构建，依赖较新的 glibc / libstdc++；如果 final runtime 使用 alinux2 / glibc 2.17，Enclave 内 `/attest` 会因 `GLIBC_2.xx not found` 直接退出，`5005/5006` 都不会监听。
+
 如果构建失败在 `docker.io/library/golang` 或 `docker.io/library/rust`，并出现类似下面的错误：
 
 ```text
@@ -277,7 +279,7 @@ failed to resolve source metadata for docker.io/library/golang@sha256:...
 Head "https://registry-1.docker.io/v2/library/golang/manifests/...": i/o timeout
 ```
 
-这不是 Dockerfile 语法问题，而是父 VM 访问 Docker Hub 超时。正式 runtime 的 Dockerfile 默认钉死了 Go/Rust builder image digest；builder image 会影响最终 EIF/PCR，因此不要随意替换成来源不明的镜像。可选处理方式：
+这不是 Dockerfile 语法问题，而是父 VM 访问 Docker Hub 超时。正式 runtime 的 Dockerfile 默认钉死了 Go/Rust builder image digest，并默认使用 Debian bookworm-slim 作为 final runtime；builder image 和 runtime base image 都会影响最终 EIF/PCR，因此不要随意替换成来源不明或 glibc 不兼容的镜像。可选处理方式：
 
 方式一，配置可信 Docker Hub mirror 后重试构建。使用阿里云控制台分配给当前账号的镜像加速地址，或企业内部可信 mirror：
 
@@ -306,10 +308,12 @@ sudo docker build --network host \
 ```bash
 docker pull docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d
 docker pull docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5
+docker pull docker.io/library/debian:bookworm-slim
 
 docker save \
   docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d \
   docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5 \
+  docker.io/library/debian:bookworm-slim \
   -o aliyun-vtpm-builder-images.tar
 
 scp aliyun-vtpm-builder-images.tar <user>@<aliyun-parent-vm>:~/
@@ -328,7 +332,7 @@ sudo docker build --network host \
   .
 ```
 
-方式三，将这两个 builder 镜像同步到企业可信 ACR，并通过 build args 指定。注意：同步后的镜像版本必须记录到部署记录中，因为它会影响可复现构建和最终 PCR。
+方式三，将 Go builder、Rust builder 和 Debian bookworm-slim runtime base 同步到企业可信 ACR，并通过 build args 指定。注意：同步后的镜像版本必须记录到部署记录中，因为它会影响可复现构建和最终 PCR。
 
 如果父 VM 已经能通过 `docker pull docker.io/library/golang@sha256:...` 或其它可信网络环境拉到 builder 镜像，可以按下面步骤上传到 ACR。以下示例中的 `<your-acr-registry>`、`<your-namespace>` 替换成实际 ACR 地址和命名空间：
 
@@ -387,6 +391,19 @@ sudo docker push \
   "$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5"
 ```
 
+runtime base 也需要使用 Debian bookworm 系镜像，不能用 alinux2 代替。示例：
+
+```bash
+sudo docker pull docker.io/library/debian:bookworm-slim
+
+sudo docker tag \
+  docker.io/library/debian:bookworm-slim \
+  "$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim"
+
+sudo docker push \
+  "$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim"
+```
+
 使用 ACR builder 镜像构建正式 runtime：
 
 ```bash
@@ -396,6 +413,7 @@ sudo docker build --network host \
   --build-arg GO_MODULE_PROXY=https://goproxy.cn,direct \
   --build-arg GO_SUMDB=sum.golang.google.cn \
   --build-arg RUST_BUILDER_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5" \
+  --build-arg RUNTIME_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim" \
   --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian \
   --build-arg APT_SECURITY_MIRROR=https://mirrors.aliyun.com/debian-security \
   --build-arg CARGO_REGISTRY_PROTOCOL=sparse \
@@ -429,6 +447,16 @@ Get "https://proxy.golang.org/...": i/o timeout
 
 apt mirror 可能影响最终镜像文件系统和 EIF/PCR，必须纳入构建记录。更稳的生产做法是把已安装 `cmake clang libclang-dev` 的 Rust builder 镜像固化后推送到企业 ACR，并用固定 digest 作为 `RUST_BUILDER_IMAGE`。
 
+如果正式 runtime 启动后 `vsock-connect:<CID>:5006` 超时，先检查 runtime 镜像内 `/attest` 的动态库兼容性：
+
+```bash
+sudo docker run --rm --entrypoint /bin/sh \
+  proof-of-observation-aliyun-vtpm:latest \
+  -c 'ldd /attest || true; ldd /usr/bin/aliyun-proof-helper || true'
+```
+
+如果看到 `GLIBC_2.xx not found`、`CXXABI_1.3.9 not found` 或 `libstdc++.so.6` 版本不足，说明 final runtime base 与 Rust builder 不兼容。必须重新使用 Debian bookworm 系 final runtime 构建镜像、重新 `build-enclave`，并记录新的 PCR。
+
 如果构建长时间停在 Rust builder 的 `cargo build --release --locked`，并且日志里出现下面的下载超时：
 
 ```text
@@ -451,6 +479,8 @@ Cargo mirror 也属于构建输入，可能影响最终镜像文件系统和 EIF
 - 原始 Docker Hub digest：
   - `docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d`
   - `docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5`
+- runtime base：
+  - `docker.io/library/debian:bookworm-slim` 或企业 ACR 中等价的 Debian bookworm 系镜像
 - ACR tag：
   - `$ACR_REGISTRY/$ACR_NAMESPACE/golang:amd64-sha256-98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d`
   - `$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5`
