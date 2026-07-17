@@ -393,10 +393,27 @@ sudo docker push \
 sudo docker build --network host \
   -f deploy/aliyun-vtpm-runtime/Dockerfile \
   --build-arg GO_BUILDER_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/golang:amd64-sha256-98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d" \
+  --build-arg GO_MODULE_PROXY=https://goproxy.cn,direct \
+  --build-arg GO_SUMDB=sum.golang.google.cn \
   --build-arg RUST_BUILDER_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5" \
   -t proof-of-observation-aliyun-vtpm:latest \
   .
 ```
+
+如果构建失败在 `go mod download`，并出现类似下面的错误：
+
+```text
+Get "https://proxy.golang.org/...": i/o timeout
+```
+
+说明父 VM 访问默认 Go module proxy 超时。使用上面的 `GO_MODULE_PROXY` / `GO_SUMDB` build args 后重试即可。默认 Dockerfile 仍使用官方 `https://proxy.golang.org,direct` 和 `sum.golang.org`；在国内网络构建时建议显式传：
+
+```bash
+--build-arg GO_MODULE_PROXY=https://goproxy.cn,direct
+--build-arg GO_SUMDB=sum.golang.google.cn
+```
+
+不要直接设置 `GOSUMDB=off`，除非只是临时排查网络问题；关闭校验会降低依赖完整性保障。若后续构建继续卡在 Rust builder 的 `apt-get update`，说明父 VM 访问 Debian 源不稳定，需要给 Rust builder 配置可信 Debian mirror，或把已安装依赖的 Rust builder 镜像固化后推送到企业 ACR。
 
 构建记录中至少保存：
 
@@ -407,6 +424,8 @@ sudo docker build --network host \
   - `$ACR_REGISTRY/$ACR_NAMESPACE/golang:amd64-sha256-98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d`
   - `$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5`
 - `docker build` 使用的 `--build-arg`。
+  - `GO_MODULE_PROXY`
+  - `GO_SUMDB`
 - 本次 `build-enclave` 输出的 PCR8/PCR9/PCR11。
 
 ## 3. 流程 A：构建 EIF 并记录 PCR
