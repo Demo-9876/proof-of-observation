@@ -4,10 +4,146 @@
 
 当前版本的定位：
 
-- 已实现：Enclave 内 `aliyun-proof` CLI / Go library，调用阿里云 vTPM 生成 `QuoteReport`，输出 `tee-exchange-v2` proof。
+- 已实现：正式阿里云 Enclave runtime，位于 `deploy/aliyun-vtpm-runtime/`，由 Rust relay、Go proof helper daemon 和阿里云 vTPM proof 生成逻辑组成。
 - 已实现：Node verifier 的 `aliyun-vtpm` profile，可验证 quote 签名、challenge、PCR digest、PCR allowlist、`QuoteReport.Cert` root/intermediate 链和 Enclave EK CN。
-- 未实现：完整 streaming relay。当前 runbook 先跑最小 fixture 链路；完整用户请求流式转发仍需后续把 `proof.GenerateFromHashes` 接入 Enclave 内 relay。
+- 已校准：真实阿里云 Enclave fixture 已完成端到端验证，Node verifier 对真实 `QuoteReport.Cert` / TPM quote / PCR / request-response binding 全部通过。
 - 未实现：TypeScript 内置 CRL 解析。当前 verifier 可配置 `revocation.required=false` 先完成链路校准；生产前需要外部 CRL appraiser 或内置 CRL 检查。
+
+## 0. 真实阿里云 Enclave 校准记录
+
+本节记录 2026-07-16 前后在真实阿里云 Enclave 上完成的关键验证过程和结论，避免后续只看代码或 runbook 时丢失上下文。
+
+### 0.1 代码状态
+
+当前阿里云 vTPM profile 相关关键提交：
+
+```text
+0aea403 feat: add aliyun vtpm evidence profile
+4b0386f fix: calibrate aliyun vtpm verifier
+c17829b fix: accept aliyun tpms attest wrapper
+```
+
+父 VM / Enclave fixture 使用当前分支 `feature/aliyun-vtpm-evidence-profile`。如果后续部署机器还停留在 `0aea403`，必须至少更新到包含 `4b0386f` 和 `c17829b` 的版本，否则真实 `QuoteReport.Quoted` 可能因为 `TPM2B_ATTEST` 包装解析失败。
+
+### 0.2 真实证书样本
+
+从真实 fixture 的 `out/tee.proof.json` 提取 `QuoteReport.Cert`：
+
+```bash
+jq -r '.evidence.quote_report.cert_b64' out/tee.proof.json | base64 -d > out/QuoteReport.Cert.der
+openssl x509 -inform DER -in out/QuoteReport.Cert.der -out out/QuoteReport.Cert.pem
+openssl x509 -in out/QuoteReport.Cert.pem -noout \
+  -subject \
+  -issuer \
+  -serial \
+  -fingerprint -sha256
+```
+
+真实输出：
+
+```text
+subject= /C=CN/O=Aliyun/OU=TPM Endorsement Key Certificate/CN=i-bp124j9zt94mo16k7bu2-enclave-1
+issuer= /C=CN/O=Aliyun/OU=Aliyun TPM Endorsement Key Manufacture CA/CN=Aliyun TPM EKMF CA
+serial=0656B93ED9C6B7C962B6D0BB682AE880DC7F44
+SHA256 Fingerprint=0D:05:89:D7:5A:CC:6C:86:2C:D5:59:03:E0:EB:D4:01:00:E7:0C:5D:68:11:97:E4:08:86:A6:15:12:C6:5B:C6
+```
+
+结论：
+
+- `QuoteReport.Cert` 是可解析的 DER X.509 证书。
+- 真实 Enclave vTPM EK CN 形态为 `i-<instance-id>-enclave-<index>`，当前默认 verifier pattern `^i-[A-Za-z0-9][A-Za-z0-9-]*-enclave-[0-9]+$` 与该样本匹配。
+- Issuer 指向 `Aliyun TPM EKMF CA`，符合阿里云技术人员给出的 EKMF intermediate 方向。
+
+### 0.3 阿里云 TPM CA 与证书链
+
+阿里云技术人员确认的 CA 文件：
+
+```text
+EK intermediate CA:
+https://aliyun-tpm-ca.oss-cn-beijing.aliyuncs.com/pki001/ekmf-ca.crt
+
+EK root CA:
+https://aliyun-tpm-ca.oss-cn-beijing.aliyuncs.com/pki001/root-ca.crt
+```
+
+已观察并写入 trust bundle 的 SHA-256 指纹：
+
+```text
+root-ca.crt = 870d6e888c3531b69983f0aebb7b9802aa097065ae01a825913ad398ce96252f
+ekmf-ca.crt = 141805f04cd9b89bfbcd30cb792d5ca3a0a2382db6ee35720e6e27e4189e43a0
+```
+
+真实 verifier 已验证：
+
+- `QuoteReport.Cert` 能 chain 到上述阿里云 TPM root / EKMF intermediate。
+- trust bundle 中的 root/intermediate fingerprint pin 生效。
+- EK CN pattern 检查生效。
+
+### 0.4 QuoteReport.Quoted 格式校准
+
+第一次在真实 fixture 上运行 verifier 时失败点为：
+
+```text
+❌ quote 结构 unexpected TPM magic: 0x91ff54
+❌ quote 签名 QuoteReport.Cert public key 验证 quote signature 失败
+❌ PCR digest quote 未解析，无法核对 PCR digest
+```
+
+排查结论：
+
+- 阿里云 SDK 产出的 `QuoteReport.Quoted` 真实格式可能是 `TPM2B_ATTEST`，前 2 字节为 big-endian size，内部才是 `TPMS_ATTEST`。
+- verifier 需要接受两种输入：
+  - bare `TPMS_ATTEST`，开头 magic 为 `0xff544347`；
+  - wrapped `TPM2B_ATTEST`，剥离 2 字节 size 后再按 `TPMS_ATTEST` 解析。
+- TPM quote signature 验证必须覆盖内层 `TPMS_ATTEST` bytes。
+
+修复后 verifier 输出包含：
+
+```text
+✅ QuoteReport 字段 quoted/signature/Cert DER 已解码，Cert 可解析为 X.509；quoted 为 TPM2B_ATTEST，已剥离 size 前缀
+✅ quote 结构 TPMS_ATTEST quote 结构可解析
+✅ quote 签名 QuoteReport.Cert public key 验证 quote signature 通过
+```
+
+### 0.5 真实 fixture 完整验证命令
+
+父 VM fixture 解包后组装 `bundle.json`，并用真实 nonce 运行 verifier：
+
+```bash
+cd ~/proof-of-observation/verifier
+
+NONCE_B64=$(grep '^nonce_b64=' ../deploy/aliyun-vtpm-fixture/out/metadata.txt | cut -d= -f2-)
+
+npx tsx verify-real-bundle.ts \
+  ../deploy/aliyun-vtpm-fixture/out/bundle.json \
+  --trust ../deploy/aliyun-vtpm-fixture/trust/aliyun-vtpm-trust.json \
+  --nonce-b64 "$NONCE_B64" \
+  --host api.example.com
+```
+
+最终真实硬件验证结果：
+
+```text
+── 真硬件 · 完整产品离线验证 (v2) ──
+Evidence profile profile=aliyun-vtpm
+QuoteReport 字段 quoted/signature/Cert DER 已解码，Cert 可解析为 X.509；quoted 为 TPM2B_ATTEST，已剥离 size 前缀
+quote 结构 TPMS_ATTEST quote 结构可解析
+quote 签名 QuoteReport.Cert public key 验证 quote signature 通过
+quote challenge quote extraData == sha256(challenge_payload)
+PCRInfo parsed
+PCR selection Quote PCR selection == PCRInfo.PCRSelectionOut
+PCR digest quote 内 PCR digest == PCRInfo.PCRValues 重算值
+PCR allowlist required PCR allowlist contains sha256:8, sha256:9, sha256:11
+sha256:8 / sha256:9 / sha256:11 均等于 allowlist
+平台证明链 QuoteReport.Cert chains to Aliyun TPM root; EK CN=i-bp124j9zt94mo16k7bu2-enclave-1
+nonce 新鲜性 proof.nonce == verifier/requester expectedNonce
+上游 host 签名覆盖的上游 host == api.example.com(path /v1/messages)
+响应签名 声明验签通过,且你收到的响应体哈希吻合
+请求绑定 你发的请求体哈希 == 签名覆盖值
+判定: ✅ 全过
+```
+
+该结果说明当前 `aliyun-vtpm` proof 生成核心和 Node verifier 已经完成真实硬件 fixture 校准。它仍不等价于“完整 streaming relay 已完成”，因为 fixture 的 request/response bytes 是样本数据，不是真实用户请求流。
 
 ## 1. 前提
 
@@ -93,113 +229,49 @@ export OUT_TGZ=aliyun-vtpm-fixture.tgz
 后续每打开一个新的父 VM 终端，都需要重新执行这些 `export`，或直接把命令中的变量替换为实际文件名。
 本文档中的 vsock 接收端口固定为 `5005`；如果要改端口，必须同时修改父 VM listener 和 Enclave 内 `run.sh` 的 `vsock-connect:3:5005`。
 
-## 3. 构建 `aliyun-proof`
+## 3. 构建正式 runtime
 
-真实 vTPM adapter 需要 `aliyun_enclave` build tag。
-
-如果父 VM 已安装 Go：
+如果目标是部署阿里云 Enclave 的完整 runtime，不再手工拼 `aliyun-proof` fixture，而是直接构建 `deploy/aliyun-vtpm-runtime/`：
 
 ```bash
-cd ~/proof-of-observation/aliyun-enclave
-go test ./...
-go test -tags aliyun_enclave ./...
+cd ~/proof-of-observation
 
-mkdir -p bin
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-  go build -tags aliyun_enclave -o bin/aliyun-proof ./cmd/aliyun-proof
-
-ls -lh bin/aliyun-proof
-file bin/aliyun-proof
-```
-
-如果父 VM 没有 Go，可以用能访问的 Go builder 镜像构建。注意不同环境的 Docker registry 可能不同，按实际网络改 `FROM` 镜像。
-
-不要执行 `docker pull "golang:1.24-bookworm AS builder"`；`AS builder` 只属于 Dockerfile 的 `FROM` 语法，不是镜像 tag。若要提前拉镜像，应执行 `sudo docker pull golang:1.24-bookworm`。
-
-```bash
-cd ~/proof-of-observation/aliyun-enclave
-
-cat > Dockerfile.build <<'EOF'
-FROM golang:1.24-bookworm AS builder
-WORKDIR /src
-ARG GOPROXY=https://proxy.golang.org,direct
-ENV GOPROXY=$GOPROXY
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -tags aliyun_enclave -o /out/aliyun-proof ./cmd/aliyun-proof
-EOF
-```
-
-创建好 `Dockerfile.build` 后，继续执行下面的构建和拷贝步骤，把 builder 镜像里的静态二进制取回到父 VM：
-
-```bash
-cd ~/proof-of-observation/aliyun-enclave
-
-sudo docker build --network host -f Dockerfile.build -t aliyun-proof-builder .
-cid=$(sudo docker create aliyun-proof-builder)
-mkdir -p bin
-sudo docker cp "$cid:/out/aliyun-proof" bin/aliyun-proof
-sudo docker rm "$cid"
-sudo chown "$(id -u):$(id -g)" bin/aliyun-proof
-chmod +x bin/aliyun-proof
-
-ls -lh bin/aliyun-proof
-file bin/aliyun-proof
-./bin/aliyun-proof --help
-```
-
-如果 `go mod download` 因网络失败，可以换国内 Go proxy，例如：
-
-```bash
 sudo docker build --network host \
-  --build-arg GOPROXY=https://goproxy.cn,direct \
-  -f Dockerfile.build \
-  -t aliyun-proof-builder .
+  -f deploy/aliyun-vtpm-runtime/Dockerfile \
+  -t proof-of-observation-aliyun-vtpm:latest \
+  .
 ```
 
-如果父 VM 拉取 `golang:1.24-bookworm` 超时，例如看到 `Get "https://registry-1.docker.io/v2/": net/http: request canceled while waiting for connection`，说明 Docker Hub 访问不通。优先改用下面的方式在父 VM 直接安装 Go，再回到本节开头的“父 VM 已安装 Go”路径构建：
+构建完成后，runtime 镜像内已经包含：
+
+- Rust Enclave relay 可执行文件 `/attest`
+- Go proof helper daemon `/usr/bin/aliyun-proof-helper`
+- 启动脚本 `/run.sh`
+
+如需继续构建 EIF 并记录 PCR：
 
 ```bash
-cd /tmp
+cd ~/proof-of-observation
 
-curl -L \
-  https://mirrors.aliyun.com/golang/go1.24.3.linux-amd64.tar.gz \
-  -o go1.24.3.linux-amd64.tar.gz
-
-sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go1.24.3.linux-amd64.tar.gz
-
-export PATH=/usr/local/go/bin:$PATH
-go version
+sudo enclave-cli build-enclave \
+  --docker-dir . \
+  --docker-uri proof-of-observation-aliyun-vtpm:latest \
+  --output-file aliyun-vtpm-runtime.eif \
+  | tee build-measurements.log
 ```
 
-然后重新构建：
+如果只是验证 runtime 能启动，也可以直接运行：
 
 ```bash
-cd ~/proof-of-observation/aliyun-enclave
-
-go env -w GOPROXY=https://goproxy.cn,direct
-go test ./...
-go test -tags aliyun_enclave ./...
-
-mkdir -p bin
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-  go build -tags aliyun_enclave -o bin/aliyun-proof ./cmd/aliyun-proof
-
-ls -lh bin/aliyun-proof
-file bin/aliyun-proof
-./bin/aliyun-proof --help
+sudo enclave-cli run-enclave \
+  --cpu-count 2 \
+  --memory 2048 \
+  --eif-path aliyun-vtpm-runtime.eif
 ```
 
-如果公司内有可访问的 ACR / 私有镜像仓库，也可以把 `golang:1.24-bookworm` 预先同步进去，然后把 `Dockerfile.build` 第一行改成内部镜像地址，例如：
+下面第 4 到 10 节保留为历史校准流程，用于重现真实 `QuoteReport.Cert` 样本和 verifier 校准，不再是当前主部署路径。
 
-```Dockerfile
-FROM <your-acr-registry>/golang:1.24-bookworm AS builder
-```
-
-## 4. 准备最小 fixture Enclave 镜像上下文
+## 4. 历史校准：准备最小 fixture Enclave 镜像上下文
 
 这个 fixture 镜像只做一件事：在 Enclave 内调用 vTPM 生成 proof，并把 proof、request/response 样本、metadata 打包后通过 vsock 发回父 VM。
 
@@ -721,7 +793,7 @@ sudo enclave-cli describe-enclaves
 
 如果 CLI 使用的是 `stop-enclave` 而不是 `terminate-enclave`，按本机 `enclave-cli --help` 输出为准。
 
-## 13. 当前版本不能证明的内容
+## 13. fixture 校准链路不能证明的内容
 
 这个 fixture 链路能证明：
 
@@ -736,12 +808,12 @@ sudo enclave-cli describe-enclaves
 - 上游响应已经边流式返回边 hash。
 - CRL 已经被生产 verifier 检查。
 
-完整生产链路还需要：
+正式 runtime 链路应继续验证：
 
-1. 在 Enclave 内实现或移植 streaming relay。
-2. relay 读取 verifier/requester nonce，并传入 `proof.GenerateFromHashes`。
-3. Enclave 内终结上游 TLS，验证上游证书。
-4. 流式转发响应，同时增量计算 request/response hash。
-5. 流末追加 `event: tee.proof`。
-6. 用户侧用 `tee-verify-proxy --enforce --trust ... --nonce-header ...` 或离线 bundle verifier 做强校验。
-7. 接入 CRL appraiser，或把 CRL 解析加入 Node verifier。
+1. Rust relay 是否按标准 frame protocol 接收真实用户请求。
+2. relay 是否读取 verifier/requester nonce，并传给 Go proof helper。
+3. Enclave 内是否终结上游 TLS，并验证上游证书。
+4. 响应是否边流式转发边增量计算 `response_body_sha256`。
+5. 流末是否追加 `event: tee.proof` 或等价 `RESP_TRAILER`。
+6. 用户侧是否用 `tee-verify-proxy --enforce --trust ... --nonce-header ...` 或离线 bundle verifier 做强校验。
+7. 生产 verifier 是否接入 CRL appraiser，或把 CRL 解析加入 Node verifier。

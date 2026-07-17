@@ -1,5 +1,7 @@
 # Alibaba Cloud Enclave proof generator
 
+[中文版](README.zh-CN.md)
+
 This module is the Alibaba Cloud Enclave-side proof generation prototype for the
 `aliyun-vtpm` evidence profile.
 
@@ -55,6 +57,7 @@ Alibaba Cloud Enclave build environment, add the official SDK module and build:
 cd aliyun-enclave
 go get github.com/aliyun/acs-apsara-enclave/sdk/attest@f81674a6b341e7b835d33ee5da9cb2add6a24379
 go build -tags aliyun_enclave ./cmd/aliyun-proof
+go build -tags aliyun_enclave ./cmd/aliyun-proof-helper
 ```
 
 ## Generate a proof
@@ -107,13 +110,56 @@ streaming proxy should use that API after hashing request and response bytes
 incrementally, so it does not need to buffer the full upstream response before
 creating the proof.
 
+## Helper daemon
+
+`aliyun-proof-helper` is the Enclave-local daemon used by the Rust streaming
+relay. It listens on a Unix domain socket, owns the in-process Ed25519 signing
+key, reuses the Alibaba Cloud vTPM attester, and returns a complete
+`aliyun-vtpm` `tee.proof` for request/response hashes supplied by the relay.
+
+```bash
+aliyun-proof-helper --socket /run/aliyun-proof-helper.sock
+```
+
+The relay should set:
+
+```bash
+export TEE_PROFILE=aliyun-vtpm
+export ALIYUN_PROOF_HELPER_SOCKET=/run/aliyun-proof-helper.sock
+```
+
+A startup script can wait for readiness with:
+
+```bash
+aliyun-proof-helper --socket /run/aliyun-proof-helper.sock --health-check
+```
+
+The helper protocol is a 4-byte big-endian length prefix followed by JSON. The
+request payload is capped at 64 KiB and the response payload at 4 MiB.
+
+## Runtime image
+
+The combined Alibaba Cloud Enclave runtime lives in
+`deploy/aliyun-vtpm-runtime/`:
+
+- `deploy/aliyun-vtpm-runtime/Dockerfile`
+- `deploy/aliyun-vtpm-runtime/run.sh`
+
+Build it from the repo root with:
+
+```bash
+sudo docker build --network host \
+  -f deploy/aliyun-vtpm-runtime/Dockerfile \
+  -t proof-of-observation-aliyun-vtpm:latest \
+  .
+```
+
 ## Current limits
 
-- This is the Enclave-side proof generation core plus a CLI that supports both
-  file and hash-only inputs. The final streaming relay still needs to call this
-  library/CLI after it has streamed upstream bytes and computed the hashes.
-- Production verifier release still needs a real Alibaba Cloud Enclave
-  `QuoteReport.Cert` fixture to confirm the exact CN shape, plus CRL checking or
-  an external CRL appraisal step.
+- This is the Enclave-side proof generation core plus the helper daemon used by
+  the Rust streaming relay. Full production rollout still requires building and
+  validating the combined Rust relay + helper EIF on Alibaba Cloud Enclave.
+- Production verifier release still needs CRL checking or an external CRL
+  appraisal step.
 - Browser verifier support for `aliyun-vtpm` is intentionally out of scope for
   the first phase.

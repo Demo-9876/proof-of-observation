@@ -1,8 +1,9 @@
 # Evidence Profile: `aliyun-vtpm`
 
 Status: **Node verifier supports experimental quote/PCR verification and local
-certificate-chain appraisal. Production rollout still requires real
-`QuoteReport.Cert` fixtures and CRL checking integration.**
+certificate-chain appraisal. Real Alibaba Cloud Enclave fixtures have been
+calibrated. Production rollout still requires CRL checking integration and the
+full streaming relay path.**
 
 This document defines the Alibaba Cloud Enclave vTPM evidence profile for
 `proof-of-observation`.
@@ -180,8 +181,9 @@ with the profile so the trust decisions are not lost:
    rooting the EK certificate to Alibaba Cloud's TPM CA chain.
 4. Ordinary ECS vTPM and Enclave vTPM can be distinguished from the EK
    certificate subject CN. Ordinary vTPM uses an instance id such as `i-xxxxx`;
-   Enclave vTPM uses a suffixed form such as `i-xxxxxxx-01`. A real certificate
-   sample should still be collected to confirm the exact production pattern.
+   Enclave vTPM uses a suffixed form. A real certificate sample observed during
+   integration used `i-bp124j9zt94mo16k7bu2-enclave-1`, so the current default
+   verifier pattern is `^i-[A-Za-z0-9][A-Za-z0-9-]*-enclave-[0-9]+$`.
 5. Revocation uses CRL files in the same `aliyun-tpm-ca` OSS bucket. Alibaba
    Cloud stated there is no known key-leak issue and the CRL is empty at the
    time of the reply, but production verifiers should still have a CRL policy.
@@ -261,23 +263,22 @@ The verifier must perform these checks:
 7. Parse `QuoteReport.Cert` and extract its public key.
 8. Verify `QuoteReport.signature` over the inner `TPMS_ATTEST` with the public
    key from `QuoteReport.Cert`.
-9. If `requirePlatformTrust=true`, verify `QuoteReport.Cert` chains to the
+9. Verify quote `extraData` equals `sha256(challenge_payload)`.
+10. If `requirePlatformTrust=true`, verify `QuoteReport.Cert` chains to the
    configured Alibaba Cloud TPM root/intermediate certificates.
-10. Verify certificate validity, configured root/intermediate fingerprints,
+11. Verify certificate validity, configured root/intermediate fingerprints,
    Enclave EK subject CN pattern, and revocation status according to verifier
    trust configuration.
-11. If the chain is missing, report `platform_trust_missing`; if the chain is
+12. If the chain is missing, report `platform_trust_missing`; if the chain is
    configured but fails, report `platform_trust_invalid`.
-12. `platform_trust_missing` may pass only in experimental mode when
+13. `platform_trust_missing` may pass only in experimental mode when
     `requirePlatformTrust=false`; `platform_trust_invalid` should fail closed by
     default even in experimental mode.
-11. Verify the TPM quote signature with the EK certificate public key.
-12. Verify quote `extraData` equals `sha256(challenge_payload)`.
-13. Recompute the PCR digest from `PCRInfo.PCRValues` and
+14. Recompute the PCR digest from `PCRInfo.PCRValues` and
    `PCRInfo.PCRSelectionOut`.
-14. Compare PCR8/PCR9/PCR11 against the configured allowlist.
-15. Verify the `tee-exchange-v2` Ed25519 statement signature.
-16. Verify response bytes and optional request bytes match signed hashes.
+15. Compare PCR8/PCR9/PCR11 against the configured allowlist.
+16. Verify the `tee-exchange-v2` Ed25519 statement signature.
+17. Verify response bytes and optional request bytes match signed hashes.
 
 The current TypeScript verifier cannot directly import `google/go-tpm-tools`.
 Implementation should either:
@@ -408,10 +409,10 @@ generated in debug mode are all zero and cannot pass remote attestation.
 
 Remaining production work:
 
-- collect a real `QuoteReport.Cert` from Alibaba Cloud Enclave and confirm the
-  exact CN shape;
 - wire CRL parsing/checking or an external CRL appraisal step;
-- calibrate the TypeScript TPM parser against a real SDK `QuoteReport` fixture
-  and, ideally, cross-check with `google/go-tpm-tools`;
+- connect the `aliyun-vtpm` proof generator to the full Enclave streaming relay;
 - decide whether `pcr_update_counter` requires policy appraisal beyond being
-  included in the evidence envelope.
+  included in the evidence envelope;
+- collect additional real `QuoteReport.Cert` samples across regions/instance
+  generations if the production fleet expands beyond the currently calibrated
+  sample shape.

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -148,6 +149,26 @@ func TestGenerateFromHashesSupportsStreamingCallers(t *testing.T) {
 	}
 	if len(att.seenQualifyingData) != 32 {
 		t.Fatalf("attester did not receive a sha256 qualifying data digest")
+	}
+}
+
+func TestGenerateFromHashesRejectsMissingRequiredFields(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = GenerateFromHashes(GenerateHashedInput{
+		NonceB64:              base64.StdEncoding.EncodeToString([]byte("nonce")),
+		UpstreamHost:          "api.example.com",
+		UpstreamPath:          "",
+		HTTPMethod:            "POST",
+		HTTPStatus:            200,
+		ResponseContentType:   "text/event-stream",
+		RequestBodySHA256Hex:  SHA256Hex([]byte("request")),
+		ResponseBodySHA256Hex: SHA256Hex([]byte("response")),
+	}, GenerateOptions{PrivateKey: priv, Attester: &fakeAttester{}})
+	if err == nil || !strings.Contains(err.Error(), "upstream_path is required") {
+		t.Fatalf("expected missing field error, got %v", err)
 	}
 }
 

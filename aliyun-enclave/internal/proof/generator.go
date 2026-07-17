@@ -56,6 +56,9 @@ func GenerateFromHashes(input GenerateHashedInput, opts GenerateOptions) (TeePro
 	if opts.Attester == nil {
 		return TeeProof{}, fmt.Errorf("attester is required")
 	}
+	if err := ValidateRequiredFields(input); err != nil {
+		return TeeProof{}, err
+	}
 	if err := ValidateNoCRLF(map[string]string{
 		"nonce":             input.NonceB64,
 		"upstream_host":     input.UpstreamHost,
