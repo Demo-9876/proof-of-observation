@@ -5,6 +5,9 @@ ARG GO_SUMDB=sum.golang.org
 ARG RUST_BUILDER_IMAGE=docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5
 ARG APT_MIRROR=http://deb.debian.org/debian
 ARG APT_SECURITY_MIRROR=http://deb.debian.org/debian-security
+ARG CARGO_REGISTRY_PROTOCOL=sparse
+ARG CARGO_REGISTRY_REPLACE_WITH=
+ARG CARGO_REGISTRY_MIRROR=
 
 FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} ${GO_BUILDER_IMAGE} AS go-builder
 
@@ -26,11 +29,15 @@ FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} ${RUST_BUILDER_IMAGE} AS rust-builder
 
 ARG APT_MIRROR
 ARG APT_SECURITY_MIRROR
+ARG CARGO_REGISTRY_PROTOCOL
+ARG CARGO_REGISTRY_REPLACE_WITH
+ARG CARGO_REGISTRY_MIRROR
 
 WORKDIR /src/enclave
 
 ENV SOURCE_DATE_EPOCH=0 \
     CARGO_INCREMENTAL=0 \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=${CARGO_REGISTRY_PROTOCOL} \
     RUSTFLAGS="--remap-path-prefix=/src=/src --remap-path-prefix=/usr/local/cargo=/cargo"
 
 RUN set -eux; \
@@ -44,6 +51,18 @@ RUN set -eux; \
     done
 
 RUN apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    mkdir -p /usr/local/cargo; \
+    if [ -n "${CARGO_REGISTRY_REPLACE_WITH}" ] && [ -n "${CARGO_REGISTRY_MIRROR}" ]; then \
+      { \
+        echo "[source.crates-io]"; \
+        echo "replace-with = \"${CARGO_REGISTRY_REPLACE_WITH}\""; \
+        echo; \
+        echo "[source.${CARGO_REGISTRY_REPLACE_WITH}]"; \
+        echo "registry = \"${CARGO_REGISTRY_MIRROR}\""; \
+      } > /usr/local/cargo/config.toml; \
+    fi
 
 ENV CFLAGS="-O2 -g0 -ffile-prefix-map=/src=/src -ffile-prefix-map=/usr/local/cargo=/cargo" \
     CXXFLAGS="-O2 -g0 -ffile-prefix-map=/src=/src -ffile-prefix-map=/usr/local/cargo=/cargo"

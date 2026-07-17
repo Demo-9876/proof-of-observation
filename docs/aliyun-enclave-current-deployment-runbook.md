@@ -398,6 +398,9 @@ sudo docker build --network host \
   --build-arg RUST_BUILDER_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5" \
   --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian \
   --build-arg APT_SECURITY_MIRROR=https://mirrors.aliyun.com/debian-security \
+  --build-arg CARGO_REGISTRY_PROTOCOL=sparse \
+  --build-arg CARGO_REGISTRY_REPLACE_WITH=rsproxy-sparse \
+  --build-arg CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/ \
   -t proof-of-observation-aliyun-vtpm:latest \
   .
 ```
@@ -426,6 +429,23 @@ Get "https://proxy.golang.org/...": i/o timeout
 
 apt mirror 可能影响最终镜像文件系统和 EIF/PCR，必须纳入构建记录。更稳的生产做法是把已安装 `cmake clang libclang-dev` 的 Rust builder 镜像固化后推送到企业 ACR，并用固定 digest 作为 `RUST_BUILDER_IMAGE`。
 
+如果构建长时间停在 Rust builder 的 `cargo build --release --locked`，并且日志里出现下面的下载超时：
+
+```text
+warning: spurious network error ... Timeout was reached
+Downloaded ...
+```
+
+说明父 VM 访问 crates.io / Cargo registry 很慢。使用上面的 `CARGO_REGISTRY_*` build args 后重试即可。默认 Dockerfile 使用 Cargo sparse protocol 和官方 crates.io；在阿里云父 VM 上建议显式传：
+
+```bash
+--build-arg CARGO_REGISTRY_PROTOCOL=sparse
+--build-arg CARGO_REGISTRY_REPLACE_WITH=rsproxy-sparse
+--build-arg CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/
+```
+
+Cargo mirror 也属于构建输入，可能影响最终镜像文件系统和 EIF/PCR，必须纳入构建记录。首次构建成功后，后续应尽量复用同一个 runtime image，而不是反复重新下载依赖并重建。
+
 构建记录中至少保存：
 
 - 原始 Docker Hub digest：
@@ -439,6 +459,9 @@ apt mirror 可能影响最终镜像文件系统和 EIF/PCR，必须纳入构建�
   - `GO_SUMDB`
   - `APT_MIRROR`
   - `APT_SECURITY_MIRROR`
+  - `CARGO_REGISTRY_PROTOCOL`
+  - `CARGO_REGISTRY_REPLACE_WITH`
+  - `CARGO_REGISTRY_MIRROR`
 - 本次 `build-enclave` 输出的 PCR8/PCR9/PCR11。
 
 ## 3. 流程 A：构建 EIF 并记录 PCR
