@@ -305,11 +305,11 @@ sudo docker build --network host \
 
 ```bash
 docker pull docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d
-docker pull docker.io/library/rust@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9
+docker pull docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5
 
 docker save \
   docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d \
-  docker.io/library/rust@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 \
+  docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5 \
   -o aliyun-vtpm-builder-images.tar
 
 scp aliyun-vtpm-builder-images.tar <user>@<aliyun-parent-vm>:~/
@@ -330,14 +330,84 @@ sudo docker build --network host \
 
 方式三，将这两个 builder 镜像同步到企业可信 ACR，并通过 build args 指定。注意：同步后的镜像版本必须记录到部署记录中，因为它会影响可复现构建和最终 PCR。
 
+如果父 VM 已经能通过 `docker pull docker.io/library/golang@sha256:...` 或其它可信网络环境拉到 builder 镜像，可以按下面步骤上传到 ACR。以下示例中的 `<your-acr-registry>`、`<your-namespace>` 替换成实际 ACR 地址和命名空间：
+
+```bash
+export ACR_REGISTRY=<your-acr-registry>
+export ACR_NAMESPACE=<your-namespace>
+
+sudo docker image ls --digests | grep -E 'golang|rust'
+```
+
+Rust 官方镜像这里要特别注意：
+
+- `sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9` 是 multi-arch OCI index。
+- `sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5` 是该 index 下的 `linux/amd64` image manifest。
+- `Platform: unknown/unknown` 且 `vnd.docker.reference.type: attestation-manifest` 的 digest 不是可运行镜像，不能用于 builder。
+- 阿里云 Enclave 父 VM 是 `linux/amd64`，推送 ACR 和构建 runtime 时必须使用 `linux/amd64` builder 镜像。
+
+登录 ACR。公网版一般是：
+
+```bash
+sudo docker login registry.cn-hangzhou.aliyuncs.com
+```
+
+企业版/专有实例或 VPC 地址按实际地址登录，例如：
+
+```bash
+sudo docker login <instance-id>-registry.cn-hangzhou.cr.aliyuncs.com
+sudo docker login <instance-id>-registry-vpc.cn-hangzhou.cr.aliyuncs.com
+```
+
+给本地 Go builder digest 镜像打 ACR tag，并推送：
+
+```bash
+sudo docker tag \
+  docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d \
+  "$ACR_REGISTRY/$ACR_NAMESPACE/golang:amd64-sha256-98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d"
+
+sudo docker push \
+  "$ACR_REGISTRY/$ACR_NAMESPACE/golang:amd64-sha256-98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d"
+```
+
+Rust builder 也需要同样上传：
+
+```bash
+sudo docker pull docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5
+
+sudo docker image inspect \
+  docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5 \
+  --format '{{.Os}}/{{.Architecture}}'
+
+sudo docker tag \
+  docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5 \
+  "$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5"
+
+sudo docker push \
+  "$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5"
+```
+
+使用 ACR builder 镜像构建正式 runtime：
+
 ```bash
 sudo docker build --network host \
   -f deploy/aliyun-vtpm-runtime/Dockerfile \
-  --build-arg GO_BUILDER_IMAGE=<trusted-acr>/<namespace>/golang@sha256:<digest> \
-  --build-arg RUST_BUILDER_IMAGE=<trusted-acr>/<namespace>/rust@sha256:<digest> \
+  --build-arg GO_BUILDER_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/golang:amd64-sha256-98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d" \
+  --build-arg RUST_BUILDER_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5" \
   -t proof-of-observation-aliyun-vtpm:latest \
   .
 ```
+
+构建记录中至少保存：
+
+- 原始 Docker Hub digest：
+  - `docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d`
+  - `docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5`
+- ACR tag：
+  - `$ACR_REGISTRY/$ACR_NAMESPACE/golang:amd64-sha256-98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d`
+  - `$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5`
+- `docker build` 使用的 `--build-arg`。
+- 本次 `build-enclave` 输出的 PCR8/PCR9/PCR11。
 
 ## 3. 流程 A：构建 EIF 并记录 PCR
 
