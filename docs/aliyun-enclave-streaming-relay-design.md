@@ -543,6 +543,8 @@ Dockerfile 方案：
 
 每次发布阿里云 EIF 时，measurement runbook 至少记录：
 
+- release version；
+- release status：`active` / `deprecated` / `revoked`；
 - proof-of-observation git commit；
 - Rust `Cargo.lock` hash；
 - Go `go.sum` hash；
@@ -551,9 +553,62 @@ Dockerfile 方案：
 - Go builder image digest；
 - runtime base image digest；
 - Dockerfile / 启动脚本 hash；
-- `enclave-cli` 版本；
+- `enclave-cli build-enclave` 版本；
+- `enclave-cli run-enclave` 最低兼容版本或已测试版本列表；
+- `enclave-cli build-enclave` 完整命令；
+- runtime Docker image digest；
+- EIF sha256；
+- PCR8/PCR9/PCR11。
+
+`QuoteReport.Cert` subject / issuer / serial / SHA-256 fingerprint 只能作为 release smoke test 或部署样本记录，不能作为官方 release 的固定身份字段。第三方部署在不同 ECS 实例上时 EK 证书 CN、serial 和 fingerprint 会不同；固定信任输入应是 Aliyun TPM CA root/intermediate fingerprint、Enclave CN pattern、revocation 策略和 PCR allowlist。
+
+### 7.3 开源发布与第三方 PCR 一致性
+
+如果改造后的 proof-of-observation 面向第三方中转站开源接入，默认发布形态应是“官方 EIF + 官方 PCR + 官方 trust bundle”，而不是要求每个第三方从源码重新构建 EIF。
+
+原因：
+
+- 第三方自行构建会受 Docker/BuildKit、APT、Cargo、Go module、base image、本地缓存和 `enclave-cli` 版本影响，复现成本高且容易得到不同 PCR。
+- 第三方运行同一个官方 EIF 时，QuoteReport 中的平台 EK 证书会因实例不同而不同，但 PCR8/PCR9/PCR11 应保持一致；用户侧 verifier 通过阿里云 TPM CA 链确认平台真实性，通过 PCR allowlist 确认运行的是官方审计镜像。
+- 中转站自己的 API key、租户配置、上游路由、计费和业务策略不能进入 EIF；它们应留在父 VM Relay Adapter 或请求 frame 中，并由 Enclave 内 relay 对 host、path、请求体 hash、响应体 hash 和 nonce 做签名绑定。
+
+官方 release 应包含：
+
+- `proof-of-observation-aliyun-vtpm-vX.Y.Z.eif`；
+- `release-manifest-vX.Y.Z.json`；
+- `release-manifest-vX.Y.Z.sig`；
+- EIF sha256；
 - PCR8/PCR9/PCR11；
-- `QuoteReport.Cert` subject / issuer / serial / SHA-256 fingerprint。
+- `trust/aliyun-vtpm-trust-vX.Y.Z.json`；
+- release status：`active` / `deprecated` / `revoked`；
+- `evidence_profile=aliyun-vtpm`；
+- `proof_wire_version=2`；
+- `tee_relay_frame_protocol=v1`；
+- verifier 最低兼容版本或 commit；
+- Relay Adapter 最低协议要求；
+- runtime Docker image digest；
+- `enclave-cli build-enclave` 版本和完整命令；
+- `enclave-cli run-enclave` 最低兼容版本或已测试版本列表；
+- 源码 commit、Dockerfile / `run.sh` / lockfile hash；
+- 构建日志；
+- Aliyun TPM root/intermediate CA fingerprint、CN pattern 和 revocation 策略；
+- 官方签名。
+
+签名和发布信任链：
+
+- 官方 signing key fingerprint 必须通过独立可信渠道发布，例如官网、GitHub release security note、文档站或代码仓库 `SECURITY.md`。
+- 官方签名覆盖 `release-manifest-vX.Y.Z.json`。
+- `release-manifest` 再覆盖 EIF、trust bundle、measurements、build log 等 artifact 的 sha256。
+- 第三方必须先验证 `release-manifest` 签名，再按 manifest 中记录的 sha256 校验各 artifact；单独校验 `.sha256` 文件不足以防止 EIF 和 sha 文件一起被替换。
+
+第三方默认部署流程只需要验证 release manifest 签名、校验 artifact sha256，然后使用 `enclave-cli run-enclave --eif-path <official.eif>` 启动。启动后仍必须配置父 VM egress proxy、Relay Adapter 的 `EnclaveCID:5005`，并通过用户侧 verifier 完成真实请求验收。源码级可复现构建仍保留给审计方：审计方可以按官方记录重新构建并比对 EIF sha256 和 PCR，但这不应成为普通第三方接入的必经步骤。
+
+PCR allowlist 轮换策略：
+
+- 官方可以同时发布多份 `active` release trust bundle，或由用户侧 verifier 的上层策略保留多份 active PCR allowlist，便于灰度升级。
+- `deprecated` release 可以继续验证，但应提示接入方迁移。
+- `revoked` release 必须从默认 trust bundle 移除，或在 verifier 中显式 fail closed。
+- 发现 Enclave 内代码、依赖、构建链或协议存在安全问题时，应发布新的 EIF/PCR，并把受影响 release 标记为 `revoked`。
 
 ## 8. 安全边界与失败行为
 

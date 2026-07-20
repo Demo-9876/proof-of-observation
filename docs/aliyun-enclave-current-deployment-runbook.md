@@ -1,9 +1,11 @@
 # 阿里云 Enclave runtime 部署与 fixture 校准 Runbook
 
-本文分成两条互相独立的流程，避免把正式 runtime 部署和旧 fixture 校准混在一起：
+本文分成三条互相独立的操作路径，避免把第三方部署、内部构建发布和旧 fixture 校准混在一起：
 
-- **流程 A：正式 runtime 部署**
-  用于当前主路径。构建并运行 `deploy/aliyun-vtpm-runtime/`，Enclave 内启动 Rust relay + Go proof helper daemon，后续由父 VM relay adapter（例如 `ai-platform-newapi`）通过 `TEE Relay Frame Protocol v1` 调用。
+- **流程 A1：第三方部署官方 EIF**
+  面向接入方和第三方中转站。默认不从源码构建，不重新计算 EIF，只校验官方发布的 EIF / release manifest / trust bundle 签名和 sha256，然后直接运行官方 EIF。
+- **流程 A2：内部或审计方构建发布 EIF**
+  面向官方 release、内部部署和独立审计。构建 `deploy/aliyun-vtpm-runtime/`，生成 EIF，记录 PCR8/PCR9/PCR11，并发布 release artifact。
 - **流程 B：历史 fixture 校准**
   只用于重现早期真实硬件校准过程，拿 `QuoteReport.Cert` / TPM quote / PCR / verifier fixture。它会构建 `deploy/aliyun-vtpm-fixture/`，使用样本 request/response bytes 生成 proof，再通过 vsock tar 包发回父 VM。**这不是当前正式部署路径。**
 
@@ -33,10 +35,17 @@
 
 ## 0. 该走哪条流程
 
-如果你的目标是部署当前可用的阿里云 Enclave proof-of-observation runtime：
+如果你是第三方中转站，只想部署官方审计过的阿里云 Enclave runtime：
 
 ```text
-走流程 A：第 1 到第 5 节
+走流程 A1：第 0.1 节 -> 第 1 节 -> 第 4 节 -> 第 5 节
+不要执行第 2、3 节的源码构建和 EIF 构建。
+```
+
+如果你是官方发布方、内部部署方或独立审计方，需要从源码构建并固化 PCR：
+
+```text
+走流程 A2：第 1 节 -> 第 2 节 -> 第 3 节 -> 第 4 节 -> 第 5 节
 ```
 
 如果你的目标是重新生成历史校准 fixture，或者排查 `QuoteReport.Cert` / TPM quote / verifier 解析问题：
@@ -45,14 +54,108 @@
 走流程 B：第 6 到第 15 节
 ```
 
-不要把两条流程混用：
+不要把三条路径混用：
 
+- 第三方部署官方 EIF 不需要拉取源码、构建 Docker image 或执行 `build-enclave`。
+- 内部/审计方构建发布 EIF 才需要第 2、3 节。
 - 正式 runtime 不需要手工创建 `deploy/aliyun-vtpm-fixture/run.sh`。
 - 正式 runtime 不需要在 Enclave 内用 `socat-vsock` 把 tar 包发回父 VM。
 - fixture 流程不能证明真实用户请求已经经过完整 streaming relay。
 - fixture 流程产生的 EIF / PCR 不应作为正式 runtime 的 trust bundle。
 
-如果你只是要部署当前正式 runtime，可以跳过下一节校准记录，直接从 **第 1 节：通用前提** 开始执行。
+如果你只是要部署官方发布的正式 runtime，可以跳过后面的校准记录和第 2、3 节构建流程。
+
+## 0.1 流程 A1：第三方部署官方 EIF
+
+为了让不同第三方中转站都能得到同一组 PCR，推荐把“官方发布 EIF + PCR”作为默认交付方式，把“从源码复现构建”作为审计和高级验证路径。
+
+官方每次 release 应发布以下 artifact：
+
+```text
+proof-of-observation-aliyun-vtpm-vX.Y.Z.eif
+proof-of-observation-aliyun-vtpm-vX.Y.Z.eif.sha256
+proof-of-observation-aliyun-vtpm-vX.Y.Z.measurements.json
+trust/aliyun-vtpm-trust-vX.Y.Z.json
+release-manifest-vX.Y.Z.json
+build-measurements-vX.Y.Z.log
+release-manifest-vX.Y.Z.sig
+```
+
+其中 `release-manifest` 至少记录：
+
+- release 版本号和源码 commit。
+- release 状态：`active` / `deprecated` / `revoked`。
+- `evidence_profile=aliyun-vtpm`。
+- `proof_wire_version=2`。
+- `tee_relay_frame_protocol=v1`。
+- verifier 最低兼容版本或 commit。
+- Relay Adapter 最低协议要求。
+- runtime Docker image digest。
+- EIF sha256。
+- PCR8/PCR9/PCR11。
+- `enclave-cli build-enclave` 版本；当前固定记录为 `Enclave CLI 1.0.8`。
+- `enclave-cli run-enclave` 最低兼容版本或已测试版本列表；当前至少记录 `Enclave CLI 1.0.8`。
+- `enclave-cli build-enclave` 完整命令。
+- 目标架构 `linux/amd64`。
+- Go/Rust builder image digest、runtime base image digest。
+- Dockerfile、`run.sh`、`Cargo.lock`、`go.sum` hash。
+- Aliyun TPM root/intermediate CA fingerprint、CN pattern 和 revocation 策略。
+- 官方 signing key fingerprint，例如 `<OFFICIAL_SIGNING_KEY_FINGERPRINT>`。
+
+签名规则：
+
+- 官方 signing key fingerprint 必须通过独立可信渠道发布，例如官网、GitHub release security note、文档站或代码仓库 `SECURITY.md`。
+- 官方签名覆盖 `release-manifest-vX.Y.Z.json`。
+- `release-manifest` 内再记录 EIF、trust bundle、measurements、build log 等 artifact 的 sha256。
+- 第三方必须先验证 `release-manifest` 签名，再按 manifest 中记录的 sha256 校验各 artifact；单独校验 `.sha256` 文件不足以防止 EIF 和 sha 文件一起被替换。
+
+第三方中转站默认不需要重新构建 runtime Docker image 或 EIF。本节只完成官方发布物校验：
+
+```bash
+# 1. 按官方发布方式验证 release-manifest 签名。
+# 示例命令按实际签名工具选择：cosign verify-blob、minisign -Vm 或 gpg --verify。
+
+# 2. 按 release-manifest 校验 EIF / trust bundle / measurements / build log sha256。
+MANIFEST=release-manifest-vX.Y.Z.json
+EIF=proof-of-observation-aliyun-vtpm-vX.Y.Z.eif
+TRUST=trust/aliyun-vtpm-trust-vX.Y.Z.json
+MEASUREMENTS=proof-of-observation-aliyun-vtpm-vX.Y.Z.measurements.json
+BUILD_LOG=build-measurements-vX.Y.Z.log
+
+verify_manifest_hash() {
+  label="$1"
+  file="$2"
+  jq_path="$3"
+  actual="$(sha256sum "$file" | awk '{print $1}')"
+  expected="$(jq -r "$jq_path" "$MANIFEST")"
+  if [ "$actual" != "$expected" ]; then
+    echo "[error] ${label} hash mismatch: actual=${actual} expected=${expected}" >&2
+    return 1
+  fi
+  echo "[ok] ${label} hash matches release-manifest"
+}
+
+verify_manifest_hash "EIF" "$EIF" '.artifacts.eif.sha256'
+verify_manifest_hash "trust bundle" "$TRUST" '.artifacts.trust_bundle.sha256'
+verify_manifest_hash "measurements" "$MEASUREMENTS" '.artifacts.measurements.sha256'
+verify_manifest_hash "build log" "$BUILD_LOG" '.artifacts.build_log.sha256'
+
+# 可选：如果官方同时发布 .sha256 文件，可再做传输完整性检查；
+# 但 .sha256 文件不能替代已签名 release-manifest。
+sha256sum -c proof-of-observation-aliyun-vtpm-vX.Y.Z.eif.sha256
+```
+
+校验通过后，继续执行第 1 节环境检查、第 4 节启动官方 EIF、第 5 节最小验收。A1 闭环必须包含：记录 `EnclaveCID`、检查 metrics 端口 `5006`、启动父 VM egress proxy、把第三方 Relay Adapter 配到当前 `EnclaveCID:5005`，并用用户侧 verifier 验证真实请求。
+
+用户侧 verifier 使用官方发布的 `trust/aliyun-vtpm-trust-vX.Y.Z.json`。第三方父 VM、Relay Adapter、egress proxy 都不进入信任边界；proof 仍必须由 Enclave 内 Rust relay + Go proof helper 生成，并由用户侧 verifier 校验 `QuoteReport.Cert` 链、PCR8/PCR9/PCR11、nonce、host、请求体 hash、响应体 hash 和签名。
+
+注意：
+
+- 第三方的 API key、上游 host 策略、计费、租户配置、中转站业务逻辑不能烘进 EIF，否则 PCR 会变化，无法让所有第三方共享同一组 PCR。
+- 第三方实例的 `QuoteReport.Cert` CN 会因为 ECS 实例不同而不同，这是正常现象；平台真实性靠阿里云 TPM CA 链验证，代码身份靠 PCR8/PCR9/PCR11 匹配官方发布值。
+- 如果第三方自行修改 Enclave 内代码、Dockerfile、依赖或启动脚本，就必须发布自己的 EIF、PCR 和 trust bundle，不能继续声称兼容官方 PCR。
+- 官方可以同时发布多份 `active` release trust bundle，或由用户侧 verifier 的上层策略保留多份 active PCR allowlist，方便灰度升级；发现漏洞或停止支持时，必须把对应 release 状态改为 `revoked` 或从用户侧 allowlist 移除。
+- 源码级复现仍应保留：审计方可以按第 2、3 节从固定源码和固定工具链重新构建，比较 EIF sha256 和 PCR；普通第三方日常部署优先使用官方 EIF。
 
 ## 校准记录（非部署步骤）：真实阿里云 Enclave fixture
 
@@ -196,19 +299,26 @@ nonce 新鲜性 proof.nonce == verifier/requester expectedNonce
 
 - 已购买支持 Enclave 的阿里云 ECS 实例。
 - 已安装并可运行 `enclave-cli`。
-- 已安装 Docker。
-- 已安装 `git`，并已拉取当前分支代码到父 VM。
 - 父 VM 上有 `jq`、`openssl`、`tar`、`base64`。
+- A1 第三方部署官方 EIF 时：已经下载官方 release artifact，包括 EIF、trust bundle、release manifest 和签名文件。
+- A1 第三方部署官方 EIF 时：如果 Relay Adapter 使用 Docker 部署，则父 VM 还需要 Docker；只运行官方 EIF 本身不需要 Docker。
+- A2 内部/审计方构建或 B fixture 校准时：已安装 Docker、`git`，并已拉取当前分支代码到父 VM。
 
 额外要求按流程区分：
 
-- 流程 A 正式 runtime：
+- 流程 A1 第三方部署官方 EIF：
+  - 不需要源码仓库、Docker build、`build-enclave` 或 fixture tar 包回传。
+  - 需要能运行官方发布的 EIF，并能启动父 VM egress proxy。
+- 流程 A2 内部/审计方构建正式 runtime：
   - 不需要 fixture tar 包回传。
+  - 需要源码仓库、Docker build 依赖和 `build-enclave`。
   - 后续真实请求链路需要父 VM 上有 egress proxy，例如 `socat-vsock` 或等价实现，把 Enclave 的 `CID=3:egress_port` 字节流转发到真实上游。
   - 后续与中转站联调请看 `docs/ai-platform-newapi-aliyun-enclave-deployment.md`。
 - 流程 B 历史 fixture：
   - 父 VM 上必须有一个可用的 `socat-vsock`，用于 Enclave 将 fixture tar 包发回父 VM。
   - verifier 机器上需要 Node.js，并可安装/运行 `verifier` 目录依赖。
+
+以下源码拉取步骤只适用于流程 A2 和流程 B。A1 第三方部署官方 EIF 时可以跳过。
 
 如果阿里云父 VM 没有 `git`，先安装：
 
@@ -258,17 +368,30 @@ git rev-parse --short HEAD
 
 ```bash
 sudo enclave-cli describe-enclaves
-docker version
-git --version
 jq --version
 openssl version
 ```
 
+A1 如果 Relay Adapter 使用 Docker 部署，还需要检查 Docker：
+
+```bash
+docker version
+```
+
+A2 / B 还需要检查 Docker 和源码仓库工具：
+
+```bash
+docker version
+git --version
+```
+
 如果 `describe-enclaves` 返回 `[]`，说明当前没有运行中的 Enclave，这是正常的。
 
-## 2. 流程 A：构建正式 runtime
+## 2. 流程 A2：内部/审计方构建正式 runtime
 
-正式 runtime 是当前主路径。它不再手工拼 `aliyun-proof` fixture，而是直接构建 `deploy/aliyun-vtpm-runtime/`。
+本节只适用于官方发布方、内部部署方或独立审计方。第三方中转站如果使用官方发布的 EIF，应跳过本节和第 3 节，直接使用第 0.1 节的官方 EIF 部署流程。
+
+正式 runtime 不再手工拼 `aliyun-proof` fixture，而是直接构建 `deploy/aliyun-vtpm-runtime/`。
 
 构建镜像：
 
@@ -325,12 +448,13 @@ sudo docker build --network host \
 ```bash
 docker pull docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d
 docker pull docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5
-docker pull docker.io/library/debian:bookworm-slim
+docker pull --platform linux/amd64 \
+  docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e
 
 docker save \
   docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d \
   docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5 \
-  docker.io/library/debian:bookworm-slim \
+  docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e \
   -o aliyun-vtpm-builder-images.tar
 
 scp aliyun-vtpm-builder-images.tar <user>@<aliyun-parent-vm>:~/
@@ -524,7 +648,9 @@ Cargo mirror 也属于构建输入，可能影响最终镜像文件系统和 EIF
    - 记录完整 `enclave-cli build-enclave` 命令、目标架构 `linux/amd64`、输出 EIF sha256、`build-measurements.log` 和 PCR8/PCR9/PCR11。
    - 使用同一个 runtime image digest、同一个 `enclave-cli build-enclave` 版本和同一组参数时，兼容的阿里云父 VM 应构建出相同 measurements；正式发布前仍应在至少两台机器上交叉构建并比对 PCR。
 
-## 3. 流程 A：构建 EIF 并记录 PCR
+## 3. 流程 A2：构建 EIF 并记录 PCR
+
+本节用于官方发布或审计复现。第三方直接部署官方 EIF 时不执行本节。
 
 ```bash
 cd ~/proof-of-observation
@@ -579,13 +705,28 @@ sed -n '/^{/,$p' build-measurements.log | jq '.Measurements'
 - debug mode 下 measurements 全零，不能作为生产 trust bundle。
 - 正式 runtime 的 PCR 与历史 fixture EIF 的 PCR 不同，不能混用。
 
-## 4. 流程 A：启动正式 runtime
+## 4. 流程 A1/A2：启动正式 runtime
+
+本节适用于两种输入：
+
+- A1：官方 release 提供的 `proof-of-observation-aliyun-vtpm-vX.Y.Z.eif`。
+- A2：第 3 节本地构建得到的 `aliyun-vtpm-runtime.eif`。
+
+A1 第三方部署官方 EIF 时：
+
+```bash
+cd ~/proof-of-observation-release-vX.Y.Z
+export RUNTIME_EIF=proof-of-observation-aliyun-vtpm-vX.Y.Z.eif
+```
+
+A2 本地构建时：
 
 ```bash
 cd ~/proof-of-observation
-
 export RUNTIME_EIF=aliyun-vtpm-runtime.eif
 ```
+
+两者二选一，不要同时设置。
 
 启动：
 
@@ -621,16 +762,31 @@ metrics vsock port: 5006
 docs/ai-platform-newapi-aliyun-enclave-deployment.md
 ```
 
-## 5. 流程 A：正式 runtime 最小验收
+## 5. 流程 A1/A2：正式 runtime 最小验收
 
 最小验收项：
 
 - `sudo enclave-cli describe-enclaves` 显示 Enclave `RUNNING`。
-- `build-measurements.log` 已保存，并记录 PCR8/PCR9/PCR11。
+- A1 第三方部署：官方 release manifest、EIF sha256、trust bundle 和签名已校验。
+- A2 内部/审计方构建：`build-measurements.log` 已保存，并记录 PCR8/PCR9/PCR11。
 - 用户侧 trust bundle 使用正式 runtime EIF 的 PCR，而不是 fixture EIF 的 PCR。
 - 父 VM relay adapter 使用当前 `EnclaveCID` 和端口 `5005`。
 - 父 VM egress proxy 已启动，`egress_port` 指向父 VM vsock 端口，而不是上游 HTTPS `443`。
 - 真实请求通过 relay adapter 后，用户侧 verifier 能验证 `profile=aliyun-vtpm` 的 `tee.proof`。
+
+metrics 端口检查示例：
+
+```bash
+export ENCLAVE_CID=<EnclaveCID>
+export SOCAT_VSOCK=/path/to/socat-vsock
+
+timeout 5 sudo "$SOCAT_VSOCK" -u \
+  vsock-connect:${ENCLAVE_CID}:5006 \
+  - \
+  | xxd -g1 -c16
+```
+
+能读到长度前缀加 JSON metrics，说明正式 runtime 已启动并监听。随后再启动父 VM egress proxy，并按第三方中转站的 Relay Adapter 文档配置 `EnclaveCID:5005`。
 
 下面开始的流程 B 仅用于历史 fixture 校准，不是当前主部署路径。
 
