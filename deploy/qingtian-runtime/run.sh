@@ -20,6 +20,7 @@ fi
 : "${QINGTIAN_PARENT_CIDS:=3}"
 : "${QTSM_SDK_DIR:=third_party/qingtian-sdk}"
 : "${APT_MIRROR:=}"
+: "${CARGO_REGISTRY_MIRROR:=}"
 : "${QINGTIAN_PRIVATE_KEY:=private-key.pem}"
 : "${QINGTIAN_SIGNING_CERTIFICATE:=server.pem}"
 : "${QINGTIAN_START_EXTRA_ARGS:=}"
@@ -35,6 +36,7 @@ fi
 docker build --no-cache \
   --build-arg "QTSM_SDK_DIR=$QTSM_SDK_DIR" \
   --build-arg "APT_MIRROR=$APT_MIRROR" \
+  --build-arg "CARGO_REGISTRY_MIRROR=$CARGO_REGISTRY_MIRROR" \
   --build-arg "POO_PARENT_CIDS=$QINGTIAN_PARENT_CIDS" \
   -f deploy/qingtian-runtime/Dockerfile \
   -t "$QINGTIAN_IMAGE" .

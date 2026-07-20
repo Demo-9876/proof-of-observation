@@ -119,6 +119,7 @@ QINGTIAN_MEM=4096
 QINGTIAN_PARENT_CIDS=3
 QTSM_SDK_DIR=third_party/qingtian-sdk
 APT_MIRROR=https://repo.huaweicloud.com/debian
+CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/
 QINGTIAN_PRIVATE_KEY=private-key.pem
 QINGTIAN_SIGNING_CERTIFICATE=server.pem
 QINGTIAN_START_EXTRA_ARGS=
@@ -126,6 +127,8 @@ EOF
 ```
 
 `QINGTIAN_PARENT_CIDS` 会被写入 EIF 环境变量并影响 `PCR0`。生产发布时必须固定并记录。
+
+`CARGO_REGISTRY_MIRROR` 只影响 Docker 构建阶段的 Rust 依赖下载，不会写入最终运行镜像；如果 ECS 能直接访问 `index.crates.io`，可以留空。
 
 ## 6. 构建 Docker Image、生成 Signed EIF、启动 Enclave
 
@@ -340,4 +343,3 @@ qingtian-release-pcrs.json
 - proof 中 `profile` 为 `qingtian`。
 - Node CLI verifier 使用 `qingtian-trust.e2e.json` 验证 SSE 和 multipart 均通过。
 - 发布材料包含 source revision、SDK revision、Docker image digest、EIF sha256、PCR0、PCR8、trust config 和完整 proof bundle。
-

@@ -8,6 +8,7 @@
 #   docker build --no-cache \
 #     --build-arg QTSM_SDK_DIR=third_party/qingtian-sdk \
 #     --build-arg APT_MIRROR=https://repo.huaweicloud.com/debian \
+#     --build-arg CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/ \
 #     --build-arg POO_PARENT_CIDS=3 \
 #     -f deploy/qingtian-runtime/Dockerfile \
 #     -t proof-observation-qingtian:dev .
@@ -16,6 +17,7 @@ FROM rust:1-bookworm AS builder
 
 ARG QTSM_SDK_DIR=third_party/qingtian-sdk
 ARG APT_MIRROR=
+ARG CARGO_REGISTRY_MIRROR=
 ARG POO_PARENT_CIDS=3
 
 WORKDIR /src
@@ -42,6 +44,11 @@ RUN if [ -n "$APT_MIRROR" ]; then \
       make \
       pkg-config && \
     rm -rf /var/lib/apt/lists/*
+
+RUN if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
+      mkdir -p /usr/local/cargo && \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n\n[net]\ngit-fetch-with-cli = true\n' "$CARGO_REGISTRY_MIRROR" > /usr/local/cargo/config.toml; \
+    fi
 
 COPY ${QTSM_SDK_DIR}/enclave/qtsm /opt/qingtian/qtsm
 RUN cd /opt/qingtian/qtsm/lib && \
