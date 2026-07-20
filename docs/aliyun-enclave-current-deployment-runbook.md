@@ -14,6 +14,23 @@
 - 已校准：真实阿里云 Enclave fixture 已完成端到端验证，Node verifier 对真实 `QuoteReport.Cert` / TPM quote / PCR / request-response binding 全部通过。
 - 未实现：TypeScript 内置 CRL 解析。当前 verifier 可配置 `revocation.required=false` 先完成链路校准；生产前需要外部 CRL appraiser 或内置 CRL 检查。
 
+已确认版本与固定输入：
+
+| 项目 | 当前记录 | 说明 |
+| --- | --- | --- |
+| 代码分支 | `feature/aliyun-vtpm-evidence-profile` | 阿里云 vTPM profile 与 runtime relay 开发分支。 |
+| Enclave CLI | `Enclave CLI 1.0.8` | PCR 复现必须固定该版本，并记录 `build-enclave` 完整命令。 |
+| Docker CE | `26.1.4-1.el7` | 阿里云父 VM 已从系统自带 Docker `1.13.1-210.git7d71120.1.al7` 升级；旧版本不支持当前 Dockerfile 写法。 |
+| Docker CLI | `26.1.4-1.el7` | 与 Docker CE 一起安装。 |
+| containerd.io | `1.6.33-3.1.el7` | 与 Docker CE 一起安装。 |
+| docker-buildx-plugin | `0.14.1-1.el7` | 当前 runtime build 使用 BuildKit 语法，建议保留该插件版本记录。 |
+| docker-compose-plugin | `2.27.1-1.el7` | 当前流程不依赖 Compose，仅作为父 VM Docker 环境记录。 |
+| Go builder image | `docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d` | 已确认 `linux/amd64`。如同步到 ACR，tag 中应保留 `amd64-sha256-...`。 |
+| Rust builder image | `docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5` | 已确认 `linux/amd64`。不要使用 multi-arch index `sha256:19817ead...` 作为 builder digest。 |
+| Runtime base image | `docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e` | Debian bookworm-slim amd64 manifest；final stage 不能换回 Alibaba Cloud Linux 2。 |
+| 父 VM verifier Node | `v20.19.0` glibc-217 unofficial build | 只用于父 VM 上运行 Node verifier，不进入 Enclave TCB。 |
+| 本地 verifier Node | `v24.16.0` | 本地验证时曾使用；不是 PCR 复现输入。 |
+
 ## 0. 该走哪条流程
 
 如果你的目标是部署当前可用的阿里云 Enclave proof-of-observation runtime：
@@ -394,14 +411,15 @@ sudo docker push \
 runtime base 也需要使用 Debian bookworm 系镜像，不能用 alinux2 代替。示例：
 
 ```bash
-sudo docker pull docker.io/library/debian:bookworm-slim
+sudo docker pull --platform linux/amd64 \
+  docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e
 
 sudo docker tag \
-  docker.io/library/debian:bookworm-slim \
-  "$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim"
+  docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e \
+  "$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim-amd64"
 
 sudo docker push \
-  "$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim"
+  "$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim-amd64"
 ```
 
 使用 ACR builder 镜像构建正式 runtime：
@@ -413,7 +431,7 @@ sudo docker build --network host \
   --build-arg GO_MODULE_PROXY=https://goproxy.cn,direct \
   --build-arg GO_SUMDB=sum.golang.google.cn \
   --build-arg RUST_BUILDER_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5" \
-  --build-arg RUNTIME_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim" \
+  --build-arg RUNTIME_IMAGE="$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim-amd64" \
   --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian \
   --build-arg APT_SECURITY_MIRROR=https://mirrors.aliyun.com/debian-security \
   --build-arg CARGO_REGISTRY_PROTOCOL=sparse \
@@ -480,10 +498,11 @@ Cargo mirror 也属于构建输入，可能影响最终镜像文件系统和 EIF
   - `docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d`
   - `docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5`
 - runtime base：
-  - `docker.io/library/debian:bookworm-slim` 或企业 ACR 中等价的 Debian bookworm 系镜像
+  - `docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e` 或企业 ACR 中等价的 Debian bookworm 系 `linux/amd64` 镜像
 - ACR tag：
   - `$ACR_REGISTRY/$ACR_NAMESPACE/golang:amd64-sha256-98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d`
   - `$ACR_REGISTRY/$ACR_NAMESPACE/rust:amd64-sha256-64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5`
+  - `$ACR_REGISTRY/$ACR_NAMESPACE/debian:bookworm-slim-amd64`
 - `docker build` 使用的 `--build-arg`。
   - `GO_MODULE_PROXY`
   - `GO_SUMDB`
@@ -494,6 +513,17 @@ Cargo mirror 也属于构建输入，可能影响最终镜像文件系统和 EIF
   - `CARGO_REGISTRY_MIRROR`
 - 本次 `build-enclave` 输出的 PCR8/PCR9/PCR11。
 
+如果后续目标是让其它机器复现同一组 PCR，推荐把流程分成两层记录：
+
+1. 源码到 runtime Docker image 的复现。
+   - 记录源码 commit、Dockerfile、`run.sh`、`Cargo.lock`、`go.sum`、Go/Rust builder image digest、runtime base image digest、Docker/BuildKit 版本和所有 build args。
+   - 这一层会受到 APT/Go/Cargo 镜像源和依赖解析结果影响；生产上更稳的做法是先统一构建 runtime Docker image，并按 digest 分发。
+2. runtime Docker image 到 EIF/PCR 的复现。
+   - 记录 runtime Docker image digest，而不是只记录 tag。
+   - 记录 `enclave-cli` 版本；当前已验证父 VM 输出为 `Enclave CLI 1.0.8`。
+   - 记录完整 `enclave-cli build-enclave` 命令、目标架构 `linux/amd64`、输出 EIF sha256、`build-measurements.log` 和 PCR8/PCR9/PCR11。
+   - 使用同一个 runtime image digest、同一个 `enclave-cli build-enclave` 版本和同一组参数时，兼容的阿里云父 VM 应构建出相同 measurements；正式发布前仍应在至少两台机器上交叉构建并比对 PCR。
+
 ## 3. 流程 A：构建 EIF 并记录 PCR
 
 ```bash
@@ -501,6 +531,26 @@ cd ~/proof-of-observation
 
 export RUNTIME_IMAGE=proof-of-observation-aliyun-vtpm:latest
 export RUNTIME_EIF=aliyun-vtpm-runtime.eif
+```
+
+构建前记录复现输入：
+
+```bash
+git rev-parse HEAD
+docker version
+docker image inspect "$RUNTIME_IMAGE" \
+  --format 'Id={{.Id}} RepoDigests={{json .RepoDigests}} Os={{.Os}} Arch={{.Architecture}}'
+
+enclave-cli --version
+rpm -qa | egrep 'enclave|docker|containerd|kernel' | sort
+uname -a
+cat /etc/os-release
+```
+
+当前阿里云父 VM 的 `enclave-cli --version` 应记录为：
+
+```text
+Enclave CLI 1.0.8
 ```
 
 构建 EIF：
@@ -515,9 +565,17 @@ sudo enclave-cli build-enclave \
   | tee build-measurements.log
 ```
 
+记录 EIF 文件摘要：
+
+```bash
+sha256sum "$RUNTIME_EIF"
+sed -n '/^{/,$p' build-measurements.log | jq '.Measurements'
+```
+
 记录 `build-measurements.log` 中的 PCR8/PCR9/PCR11，并把它们写入用户侧 verifier trust bundle。注意：
 
 - 每次改动 Dockerfile、Rust、Go helper、依赖、base image、构建工具版本后，都必须重新 `build-enclave`，记录新 PCR。
+- 如果使用已经统一构建好的 runtime Docker image，则 builder 镜像、Go/Cargo/APT mirror 不再参与本次 EIF 构建；此时必须固定并记录 runtime image digest。
 - debug mode 下 measurements 全零，不能作为生产 trust bundle。
 - 正式 runtime 的 PCR 与历史 fixture EIF 的 PCR 不同，不能混用。
 
