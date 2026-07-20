@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use aws_nitro_enclaves_nsm_api::api::{Request, Response};
-use aws_nitro_enclaves_nsm_api::driver::{nsm_init, nsm_process_request};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use serde::Deserialize;
-use serde_bytes::ByteBuf;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -23,7 +21,13 @@ use vsock::{VsockAddr, VsockListener, VsockStream};
 mod egress_boring;
 mod egress_openssl;
 mod egress_rustls_aws_lc;
+mod evidence;
+#[cfg(feature = "nitro")]
+mod evidence_nitro;
+#[cfg(feature = "qingtian")]
+mod evidence_qingtian;
 mod h2_client;
+use crate::evidence::EvidenceProvider;
 use attest::tls_profile;
 
 trait ReadWrite: Read + Write {}
@@ -33,8 +37,57 @@ fn decode_profile(head: &ReqHead) -> Option<tls_profile::TlsProfile> {
     tls_profile::decode(&B64.decode(head.tls_spec.as_deref()?).ok()?).ok()
 }
 
+fn parse_parent_cid_candidates(raw: Option<&str>) -> Result<Vec<u32>, String> {
+    let Some(raw) = raw else {
+        return Ok(vec![DEFAULT_PARENT_CID]);
+    };
+    let mut cids = Vec::new();
+    for part in raw.split(',') {
+        let item = part.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let cid = item
+            .parse::<u32>()
+            .map_err(|e| format!("invalid parent CID `{item}` in POO_PARENT_CIDS: {e}"))?;
+        if !cids.contains(&cid) {
+            cids.push(cid);
+        }
+    }
+    if cids.is_empty() {
+        return Err("POO_PARENT_CIDS/POO_PARENT_CID did not contain any CID".into());
+    }
+    Ok(cids)
+}
+
+fn parent_cid_candidates() -> Result<Vec<u32>, String> {
+    let raw = env::var("POO_PARENT_CIDS")
+        .ok()
+        .or_else(|| env::var("POO_PARENT_CID").ok());
+    parse_parent_cid_candidates(raw.as_deref())
+}
+
+fn connect_parent_vsock(port: u32) -> Result<VsockStream, String> {
+    let cids = parent_cid_candidates()?;
+    let mut errors = Vec::new();
+    for cid in &cids {
+        match VsockStream::connect(&VsockAddr::new(*cid, port)) {
+            Ok(sock) => return Ok(sock),
+            Err(e) => errors.push(format!("{cid}: {e}")),
+        }
+    }
+    Err(format!(
+        "连 vsock-proxy 失败: tried parent CID(s) [{}] on port {port}; {}",
+        cids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        errors.join("; ")
+    ))
+}
+
 const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
-const PARENT_CID: u32 = 3;
+const DEFAULT_PARENT_CID: u32 = 3;
 const PORT: u32 = 5005;
 const DOMAIN_V2: &str = "tee-exchange-v2";
 
@@ -460,28 +513,12 @@ fn stream_plain<R: Read + ?Sized, F: FnMut(&[u8]) -> Result<(), String>>(
     Ok(())
 }
 
-fn attest(fd: i32, lock: &Mutex<()>, spki: &[u8], nonce: &[u8]) -> Result<Vec<u8>, String> {
-    let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
-    match nsm_process_request(
-        fd,
-        Request::Attestation {
-            user_data: None,
-            nonce: Some(ByteBuf::from(nonce.to_vec())),
-            public_key: Some(ByteBuf::from(spki.to_vec())),
-        },
-    ) {
-        Response::Attestation { document } => Ok(document),
-        other => Err(format!("nsm: {:?}", other)),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn write_attested_trailer(
     s: &mut VsockStream,
     sk: &SigningKey,
     spki: &[u8],
-    nsm_fd: i32,
-    nsm_lock: &Mutex<()>,
+    evidence_provider: &dyn EvidenceProvider,
     m: &Metrics,
     head: &ReqHead,
     nonce_bytes: &[u8],
@@ -508,11 +545,11 @@ fn write_attested_trailer(
     );
     let sig = sk.sign(&statement).to_bytes();
     let t_nsm = Instant::now();
-    let doc = attest(nsm_fd, nsm_lock, spki, nonce_bytes)?;
+    let evidence = evidence_provider.attest(spki, nonce_bytes)?;
     m.nsm_ns_total
         .fetch_add(t_nsm.elapsed().as_nanos() as u64, Ordering::Relaxed);
     m.nsm_calls.fetch_add(1, Ordering::Relaxed);
-    let trailer = json!({
+    let mut trailer = json!({
         "v": 2,
         "alg": "ed25519",
         "public_key": B64.encode(spki),
@@ -525,8 +562,23 @@ fn write_attested_trailer(
         "request_body_sha256": req_body_hex,
         "response_body_sha256": resp_body_hex,
         "signature": B64.encode(sig),
-        "attestation": B64.encode(&doc),
+        "attestation": B64.encode(&evidence.attestation),
     });
+    let trailer_obj = trailer
+        .as_object_mut()
+        .expect("proof trailer is a JSON object");
+    if evidence.profile != "nitro" {
+        trailer_obj.insert("profile".into(), json!(evidence.profile));
+    }
+    if let Some(pcr0) = evidence.pcr0 {
+        trailer_obj.insert("pcr0".into(), json!(pcr0));
+    }
+    if let Some(pcr8) = evidence.pcr8 {
+        trailer_obj.insert("pcr8".into(), json!(pcr8));
+    }
+    if !evidence.measurements.is_empty() {
+        trailer_obj.insert("measurements".into(), json!(evidence.measurements));
+    }
     write_frame(s, RESP_TRAILER, trailer.to_string().as_bytes())
         .map_err(|e| format!("写 RESP_TRAILER: {e}"))
 }
@@ -535,8 +587,7 @@ fn handle(
     s: &mut VsockStream,
     sk: &SigningKey,
     spki: &[u8],
-    nsm_fd: i32,
-    nsm_lock: &Mutex<()>,
+    evidence_provider: &dyn EvidenceProvider,
     m: &Metrics,
 ) -> Result<(), String> {
     let (t1, head_buf) = read_frame(s, MAX_REQ_HEAD).map_err(|e| format!("读 HEAD 帧: {}", e))?;
@@ -578,8 +629,7 @@ fn handle(
 
     let profile = decode_profile(&head);
     let seed = head.tls_seed.as_deref().and_then(|s| B64.decode(s).ok());
-    let sock = VsockStream::connect(&VsockAddr::new(PARENT_CID, head.egress_port))
-        .map_err(|e| format!("连 vsock-proxy 失败: {}", e))?;
+    let sock = connect_parent_vsock(head.egress_port)?;
     sock.set_read_timeout(Some(UPSTREAM_IO_TIMEOUT)).ok();
     sock.set_write_timeout(Some(UPSTREAM_IO_TIMEOUT)).ok();
     let norm_method = head.upstream.method.to_uppercase();
@@ -639,8 +689,7 @@ fn handle(
             s,
             sk,
             spki,
-            nsm_fd,
-            nsm_lock,
+            evidence_provider,
             m,
             &head,
             &nonce_bytes,
@@ -774,8 +823,7 @@ fn handle(
         s,
         sk,
         spki,
-        nsm_fd,
-        nsm_lock,
+        evidence_provider,
         m,
         &head,
         &nonce_bytes,
@@ -854,8 +902,7 @@ fn bump_max(cur: usize, max: &AtomicUsize) {
 struct Ctx {
     sk: Arc<SigningKey>,
     spki: Arc<Vec<u8>>,
-    nsm_fd: i32,
-    nsm_lock: Mutex<()>,
+    evidence_provider: Arc<dyn EvidenceProvider>,
     m: Metrics,
 }
 
@@ -878,8 +925,7 @@ fn worker(rx: Arc<Mutex<Receiver<VsockStream>>>, ctx: Arc<Ctx>) {
                 &mut s,
                 &ctx.sk,
                 &ctx.spki,
-                ctx.nsm_fd,
-                &ctx.nsm_lock,
+                ctx.evidence_provider.as_ref(),
                 &ctx.m,
             )
         }));
@@ -927,6 +973,42 @@ fn serve_metrics(ctx: Arc<Ctx>) {
     }
 }
 
+fn build_evidence_provider() -> Arc<dyn EvidenceProvider> {
+    let profile = env::var("TEE_PROFILE")
+        .or_else(|_| env::var("POO_EVIDENCE_PROFILE"))
+        .unwrap_or_else(|_| "nitro".to_string())
+        .to_ascii_lowercase();
+    match profile.as_str() {
+        "nitro" => {
+            #[cfg(feature = "nitro")]
+            {
+                Arc::new(evidence_nitro::NitroEvidenceProvider::new())
+            }
+            #[cfg(not(feature = "nitro"))]
+            {
+                panic!("TEE_PROFILE=nitro but binary was built without the nitro feature");
+            }
+        }
+        "qingtian" => {
+            #[cfg(feature = "qingtian")]
+            {
+                Arc::new(
+                    evidence_qingtian::QingTianEvidenceProvider::new().unwrap_or_else(|e| {
+                        panic!("failed to initialize QingTian QTSM provider: {e}")
+                    }),
+                )
+            }
+            #[cfg(not(feature = "qingtian"))]
+            {
+                panic!("TEE_PROFILE=qingtian but binary was built without the qingtian feature");
+            }
+        }
+        other => {
+            panic!("unsupported TEE_PROFILE={other}; supported profiles: nitro, qingtian");
+        }
+    }
+}
+
 fn main() {
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).unwrap();
@@ -938,12 +1020,12 @@ fn main() {
     spki_v.extend_from_slice(&vk);
     let spki = Arc::new(spki_v);
 
-    let nsm_fd = nsm_init();
+    let evidence_provider = build_evidence_provider();
+    eprintln!("evidence profile: {}", evidence_provider.profile());
     let ctx = Arc::new(Ctx {
         sk,
         spki,
-        nsm_fd,
-        nsm_lock: Mutex::new(()),
+        evidence_provider,
         m: Metrics::default(),
     });
 
@@ -1006,6 +1088,33 @@ fn main() {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod parent_cid_tests {
+    use super::*;
+
+    #[test]
+    fn parent_cid_candidates_default_to_nitro_compatible_parent() {
+        assert_eq!(
+            parse_parent_cid_candidates(None).unwrap(),
+            vec![DEFAULT_PARENT_CID]
+        );
+    }
+
+    #[test]
+    fn parent_cid_candidates_parse_lists_trim_and_deduplicate() {
+        assert_eq!(
+            parse_parent_cid_candidates(Some(" 3, 2,3, 4 ")).unwrap(),
+            vec![3, 2, 4]
+        );
+    }
+
+    #[test]
+    fn parent_cid_candidates_reject_empty_or_invalid_values() {
+        assert!(parse_parent_cid_candidates(Some(" , ")).is_err());
+        assert!(parse_parent_cid_candidates(Some("3,nope")).is_err());
     }
 }
 

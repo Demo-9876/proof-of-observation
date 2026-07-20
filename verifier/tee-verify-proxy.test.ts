@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import http from 'node:http';
 import { generateKeyPairSync, randomBytes, sign as edSign } from 'node:crypto';
 import { createVerifyingProxy } from './tee-verify-proxy.ts';
-import { TEE_PROOF_EVENT, type AttestationVerifier } from './tee-verify-core.ts';
+import { TEE_PROOF_EVENT, type AttestationVerifier, type TeeProofWire } from './tee-verify-core.ts';
 import { computeV2SigningMaterial } from './signing.ts';
 
 const PCR0 = 'aeb9e595deadbeef';
@@ -24,14 +24,14 @@ function track<T extends http.Server>(s: T): T { servers.push(s); return s; }
 function listen(s: http.Server): Promise<number> {
   return new Promise((resolve) => s.listen(0, '127.0.0.1', () => resolve((s.address() as any).port)));
 }
-function postThrough(port: number, path: string, body: string): Promise<{ status: number; body: string }> {
+function postThrough(port: number, path: string, body: string): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
       { host: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json' } },
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c) => chunks.push(c as Buffer));
-        res.on('end', () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString('utf8') }));
+        res.on('end', () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString('utf8'), headers: res.headers }));
       },
     );
     req.on('error', reject);
@@ -40,19 +40,25 @@ function postThrough(port: number, path: string, body: string): Promise<{ status
 }
 
 // 用真 Ed25519 + 真 v2 声明对给定 nonce/响应体造一个签名合法的 proof。
-function signProof(args: { nonce: string; body: Buffer; privateKey: any; pubB64: string }): string {
+function makeProof(args: {
+  nonce: string;
+  body: Buffer;
+  privateKey: any;
+  pubB64: string;
+  respContentType?: string;
+}): TeeProofWire {
   const { statement, digests } = computeV2SigningMaterial({
     nonceB64: args.nonce,
     upstreamHost: HOST,
     upstreamPath: PATH,
     httpMethod: 'POST',
     httpStatus: 200,
-    respContentType: 'text/event-stream',
+    respContentType: args.respContentType ?? 'text/event-stream',
     requestBody: REQUEST_BODY,
     responseBody: args.body,
   });
   const signature = edSign(null, statement, args.privateKey).toString('base64');
-  const wire = {
+  return {
     v: 2,
     alg: 'ed25519',
     public_key: args.pubB64,
@@ -61,14 +67,50 @@ function signProof(args: { nonce: string; body: Buffer; privateKey: any; pubB64:
     upstream_path: PATH,
     http_method: 'POST',
     http_status: 200,
-    resp_content_type: 'text/event-stream',
+    resp_content_type: args.respContentType ?? 'text/event-stream',
     request_body_sha256: digests.requestBody.toString('hex'),
     response_body_sha256: digests.responseBody.toString('hex'),
     signature,
     attestation: 'AA==', // 桩忽略内容
     pcr0: PCR0,
   };
-  return `event: ${TEE_PROOF_EVENT}\ndata: ${JSON.stringify(wire)}\n\n`;
+}
+
+function signProof(args: { nonce: string; body: Buffer; privateKey: any; pubB64: string; respContentType?: string }): string {
+  return `event: ${TEE_PROOF_EVENT}\ndata: ${JSON.stringify(makeProof(args))}\n\n`;
+}
+
+function formatMultipart(params: {
+  rawBody: Buffer;
+  rawContentType: string;
+  proof: TeeProofWire;
+  boundary: string;
+}): { body: Buffer; contentType: string } {
+  const proofBody = Buffer.from(JSON.stringify(params.proof), 'utf8');
+  const responseHead = Buffer.from([
+    `--${params.boundary}`,
+    `Content-Type: ${params.rawContentType}`,
+    'Content-Disposition: inline; name="response"',
+    'Content-Transfer-Encoding: binary',
+    `Content-Length: ${params.rawBody.byteLength}`,
+    '',
+    '',
+  ].join('\r\n'), 'utf8');
+  const proofHead = Buffer.from([
+    '',
+    `--${params.boundary}`,
+    'Content-Type: application/vnd.proof-observation.proof+json',
+    'Content-Disposition: attachment; name="proof"',
+    'Content-Transfer-Encoding: binary',
+    `Content-Length: ${proofBody.byteLength}`,
+    '',
+    '',
+  ].join('\r\n'), 'utf8');
+  const end = Buffer.from(`\r\n--${params.boundary}--\r\n`, 'utf8');
+  return {
+    body: Buffer.concat([responseHead, params.rawBody, proofHead, proofBody, end]),
+    contentType: `multipart/mixed; boundary=${params.boundary}`,
+  };
 }
 
 // att 桩:声称背书 publicKey、对 nonceGetter() 这个 nonce、跑 PCR0 镜像。nonce 在请求中途才确定 → 用 getter。
@@ -176,6 +218,91 @@ describe('createVerifyingProxy (fail-open)', () => {
     expect(res.body).toBe('{"choices":[{"message":{"content":"hi"}}]}');
     expect(verdicts[0].v).toBeNull();
     expect(verdicts[0].ctx.attested).toBe(false);
+  });
+
+  it('verifies and strips a genuine multipart proof response', async () => {
+    const { privateKey, pubB64 } = newKey();
+    const rawBody = Buffer.from('{"choices":[{"message":{"content":"hi"}}]}', 'utf8');
+    let relayNonce = '';
+    const upstream = track(http.createServer((_req, res) => {
+      relayNonce = randomBytes(16).toString('base64');
+      const multipart = formatMultipart({
+        rawBody,
+        rawContentType: 'application/json',
+        proof: makeProof({
+          nonce: relayNonce,
+          body: rawBody,
+          privateKey,
+          pubB64,
+          respContentType: 'application/json',
+        }),
+        boundary: 'proof-observation-proxy-open',
+      });
+      res.writeHead(200, { 'content-type': multipart.contentType });
+      res.end(multipart.body);
+    }));
+    const upPort = await listen(upstream);
+
+    const verdicts: any[] = [];
+    const proxy = track(createVerifyingProxy({
+      upstream: `http://127.0.0.1:${upPort}`,
+      expectedPcr0: PCR0,
+      verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
+      onVerdict: (v, ctx) => verdicts.push({ v, ctx }),
+    }));
+    const proxyPort = await listen(proxy);
+
+    const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
+    expect(res.status).toBe(200);
+    expect(res.body).toBe(rawBody.toString('utf8'));
+    expect(res.headers['content-type']).toBe('application/json');
+    expect(res.body).not.toContain('proof-observation-proxy-open');
+    expect(verdicts).toHaveLength(1);
+    expect(verdicts[0].v.ok, JSON.stringify(verdicts[0].v.checks)).toBe(true);
+    expect(verdicts[0].ctx.attested).toBe(true);
+  });
+
+  it('logs a failed multipart proof verdict but still returns the stripped raw body', async () => {
+    const { privateKey, pubB64 } = newKey();
+    const original = Buffer.from('{"choices":[{"message":{"content":"hi"}}]}', 'utf8');
+    const tampered = Buffer.from('{"choices":[{"message":{"content":"evil"}}]}', 'utf8');
+    let relayNonce = '';
+    const upstream = track(http.createServer((_req, res) => {
+      relayNonce = randomBytes(16).toString('base64');
+      const multipart = formatMultipart({
+        rawBody: tampered,
+        rawContentType: 'application/json',
+        proof: makeProof({
+          nonce: relayNonce,
+          body: original,
+          privateKey,
+          pubB64,
+          respContentType: 'application/json',
+        }),
+        boundary: 'proof-observation-proxy-open-tampered',
+      });
+      res.writeHead(200, { 'content-type': multipart.contentType });
+      res.end(multipart.body);
+    }));
+    const upPort = await listen(upstream);
+
+    const verdicts: any[] = [];
+    const proxy = track(createVerifyingProxy({
+      upstream: `http://127.0.0.1:${upPort}`,
+      expectedPcr0: PCR0,
+      verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
+      onVerdict: (v, ctx) => verdicts.push({ v, ctx }),
+    }));
+    const proxyPort = await listen(proxy);
+
+    const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
+    expect(res.status).toBe(200);
+    expect(res.body).toBe(tampered.toString('utf8'));
+    expect(res.headers['content-type']).toBe('application/json');
+    expect(res.body).not.toContain('proof-observation-proxy-open-tampered');
+    expect(verdicts[0].v.ok).toBe(false);
+    expect(verdicts[0].v.checks.find((c: any) => c.name === '响应签名')?.ok).toBe(false);
+    expect(verdicts[0].ctx.attested).toBe(true);
   });
 
   it('preserves byte-exactness across the holdback boundary (body ≫ holdback)', async () => {
@@ -327,7 +454,45 @@ describe('createVerifyingProxy (--enforce / fail-closed)', () => {
     expect(res.body).not.toContain('tee.proof');
   });
 
-  it('passes non-attested responses through under enforce (does not block what it cannot attest)', async () => {
+  it('lets a genuine multipart proof response through under enforce', async () => {
+    const { privateKey, pubB64 } = newKey();
+    const rawBody = Buffer.from('{"choices":[{"message":{"content":"hi"}}]}', 'utf8');
+    let relayNonce = '';
+    const upstream = track(http.createServer((_req, res) => {
+      relayNonce = randomBytes(16).toString('base64');
+      const multipart = formatMultipart({
+        rawBody,
+        rawContentType: 'application/json',
+        proof: makeProof({
+          nonce: relayNonce,
+          body: rawBody,
+          privateKey,
+          pubB64,
+          respContentType: 'application/json',
+        }),
+        boundary: 'proof-observation-proxy-enforce',
+      });
+      res.writeHead(200, { 'content-type': multipart.contentType });
+      res.end(multipart.body);
+    }));
+    const upPort = await listen(upstream);
+
+    const proxy = track(createVerifyingProxy({
+      upstream: `http://127.0.0.1:${upPort}`,
+      expectedPcr0: PCR0,
+      enforce: true,
+      verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
+    }));
+    const proxyPort = await listen(proxy);
+
+    const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
+    expect(res.status).toBe(200);
+    expect(res.body).toBe(rawBody.toString('utf8'));
+    expect(res.headers['content-type']).toBe('application/json');
+    expect(res.body).not.toContain('proof-observation-proxy-enforce');
+  });
+
+  it('blocks non-attested responses under enforce', async () => {
     const upstream = track(http.createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{"ok":true}');
@@ -343,7 +508,66 @@ describe('createVerifyingProxy (--enforce / fail-closed)', () => {
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
+    expect(res.status).toBe(502);
+    expect(res.body).toContain('tee_proof_missing');
+    expect(res.body).not.toContain('ok');
+  });
+
+  it('injects nonceHeader and requires proof.nonce to match it', async () => {
+    const { privateKey, pubB64 } = newKey();
+    const upstreamBody = Buffer.from('event: message_stop\ndata: {"ok":1}\n\n', 'utf8');
+    let injectedNonce = '';
+    const upstream = track(http.createServer((req, res) => {
+      injectedNonce = String(req.headers['x-tee-nonce'] || '');
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(upstreamBody);
+      res.write(signProof({ nonce: injectedNonce, body: upstreamBody, privateKey, pubB64 }));
+      res.end();
+    }));
+    const upPort = await listen(upstream);
+
+    const proxy = track(createVerifyingProxy({
+      upstream: `http://127.0.0.1:${upPort}`,
+      expectedPcr0: PCR0,
+      nonceHeader: 'x-tee-nonce',
+      enforce: true,
+      verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => injectedNonce }),
+    }));
+    const proxyPort = await listen(proxy);
+
+    const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
+    expect(injectedNonce.length).toBeGreaterThan(0);
     expect(res.status).toBe(200);
-    expect(res.body).toBe('{"ok":true}');
+    expect(res.body).toBe(upstreamBody.toString('utf8'));
+  });
+
+  it('blocks when nonceHeader was injected but proof uses a different nonce', async () => {
+    const { privateKey, pubB64 } = newKey();
+    const upstreamBody = Buffer.from('event: message_stop\ndata: {"ok":1}\n\n', 'utf8');
+    let injectedNonce = '';
+    const upstream = track(http.createServer((req, res) => {
+      injectedNonce = String(req.headers['x-tee-nonce'] || '');
+      const staleNonce = randomBytes(16).toString('base64');
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(upstreamBody);
+      res.write(signProof({ nonce: staleNonce, body: upstreamBody, privateKey, pubB64 }));
+      res.end();
+    }));
+    const upPort = await listen(upstream);
+
+    const proxy = track(createVerifyingProxy({
+      upstream: `http://127.0.0.1:${upPort}`,
+      expectedPcr0: PCR0,
+      nonceHeader: 'x-tee-nonce',
+      enforce: true,
+      verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => injectedNonce }),
+    }));
+    const proxyPort = await listen(proxy);
+
+    const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
+    expect(injectedNonce.length).toBeGreaterThan(0);
+    expect(res.status).toBe(502);
+    expect(res.body).toContain('tee_verification_failed');
+    expect(res.body).toContain('nonce');
   });
 });

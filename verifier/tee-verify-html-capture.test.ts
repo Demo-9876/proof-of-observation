@@ -108,6 +108,12 @@ describe('docs/tee-verify.html capture parser preserves signed response bytes', 
     expect(html).not.toContain('✓ 成立');
   });
 
+  it('fails closed instead of treating QingTian evidence as Nitro in the browser verifier', () => {
+    expect(html).toContain("const profile=t.profile||'nitro';");
+    expect(html).toContain("if(profile!=='nitro') throw new Error(profile==='qingtian'?tt('unsupportedQingTianProfile'):tt('unsupportedEvidenceProfile',profile));");
+    expect(html).toContain('unsupportedQingTianProfile');
+  });
+
   it('renders the final trust verdict as a scannable summary card', () => {
     expect(html).toContain('.result-fields { display:grid; grid-template-columns:1.4fr 1fr 1.05fr 1.45fr');
     expect(html).toContain('.result-chain { display:grid; grid-template-columns:repeat(3,minmax(0,1fr))');

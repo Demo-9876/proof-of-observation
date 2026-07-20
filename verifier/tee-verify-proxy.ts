@@ -1,12 +1,13 @@
 // 本地校验代理(透明每调验,「最省心」的客户端验证组件)。
 //
-//   npx tsx tee-verify-proxy.ts --upstream https://api.example.com --pcr0 <hex> [--port 8788] [--enforce]
+//   npx tsx tee-verify-proxy.ts --upstream https://api.example.com (--pcr0 <hex> | --trust <trust.json>) [--port 8788] [--enforce] [--nonce-header x-tee-nonce]
 //
 // 把你的 LLM 客户端 baseURL 改指向本代理(http://127.0.0.1:8788),其余照常调用。代理对每次请求:
 //   ① 原样转发到真实上游(relay),逐字节回传给你的客户端 —— 流式不破(holdback 只压住流末)。
-//      不注入任何头:nonce 由 relay 端生成、随 proof 回(客户端不提供 —— 见 docs/TEE.md §5)。
-//   ② 流末剥掉带外 `event: tee.proof`,对其余字节(= 飞地签名的上游原文)走 v2 response-only 验证:
-//      attestation 链 + PCR0 + 公钥绑定 + nonce 绑定 + 声明验签;并**读出签名覆盖的 upstream_host/path**。
+//      默认不注入 nonce；若配置 --nonce-header,代理每请求生成 nonce 并要求 proof.nonce 匹配。
+//   ② 剥掉带外 proof(SSE 末尾 `event: tee.proof` 或 multipart proof part),对其余字节
+//      (= 飞地签名的上游原文)走 v2 response-only 验证:
+//      Evidence profile trust + 公钥绑定 + nonce/新鲜性 + 声明验签;并**读出签名覆盖的 upstream_host/path**。
 //   ③ 默认 fail-open:无论判定都把响应交给客户端,但把判定**大声打到本代理日志**(持续抽查/威慑)。
 //      `--enforce`:fail-closed —— 整段缓冲、验过才放行;有 proof 但验不过回 502(牺牲流式,换强阻断)。
 //
@@ -19,13 +20,17 @@
 import http from 'node:http';
 import https from 'node:https';
 import { realpathSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath, URL } from 'node:url';
 import {
   verifyTeeExchange,
   parseTeeProofEvent,
+  parseTeeProofCapture,
   type AttestationVerifier,
   type TeeVerifyResult,
 } from './tee-verify-core.ts';
+import type { EvidenceTrust } from './evidence-profile.ts';
+import { loadTrustConfig, requirePcr0OrTrust } from './trust-config.ts';
 
 // 转发时必须丢弃的逐跳头(由本代理自行重设帧):
 const HOP_BY_HOP = new Set([
@@ -37,7 +42,9 @@ const DEFAULT_HOLDBACK = 64 * 1024; // 须 ≥ 最大 proof 体积(含 COSE atte
 
 export interface VerifyingProxyOptions {
   upstream: string; // 真实上游 base URL,如 https://api.example.com
-  expectedPcr0: string; // 审计公布的镜像度量
+  expectedPcr0?: string; // legacy Nitro shorthand
+  trust?: EvidenceTrust; // profile-aware trust config; required for non-Nitro
+  nonceHeader?: string; // 可选:每请求生成 nonce 并用该 header 发给 relay,再强制 proof.nonce 匹配
   enforce?: boolean; // true=fail-closed(缓冲+阻断);默认 false=fail-open(流式+日志)
   holdback?: number; // 流式压住流末的字节数;默认 64KiB
   verifyAttestationDoc?: AttestationVerifier; // 默认真 COSE;测试注桩
@@ -61,8 +68,10 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
     clientReq.on('end', () => {
       const reqBody = Buffer.concat(reqChunks);
       const target = new URL(clientReq.url || '/', upstreamUrl);
+      const expectedNonceB64 = opts.nonceHeader ? randomBytes(32).toString('base64') : undefined;
 
-      // 透传客户端头(发往 relay 的 Authorization 是用户自己的 key,保留),只改写 host 与 content-length(不注入任何头)。
+      // 透传客户端头(发往 relay 的 Authorization 是用户自己的 key,保留),只改写 host/content-length;
+      // 若配置 nonceHeader,再注入本次 verifier/requester nonce。
       const headers: Record<string, string | string[]> = {};
       for (const [k, v] of Object.entries(clientReq.headers)) {
         if (v == null || HOP_BY_HOP.has(k.toLowerCase())) continue;
@@ -71,14 +80,15 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
       headers['host'] = target.host;
       delete headers['content-length'];
       if (reqBody.length) headers['content-length'] = String(reqBody.length);
+      if (opts.nonceHeader && expectedNonceB64) headers[opts.nonceHeader] = expectedNonceB64;
 
-      // nonce 不由代理生成/注入:relay 端生成、随 proof 回(见 docs/TEE.md §5)。ctx.nonce 取自
-      // 已验证的 proof(仅供日志展示);核心缺省即以 proof.nonce 做一致性核对。
+      // 默认 nonce 可由 relay 端生成、随 proof 回；若配置 nonceHeader,这里生成并注入,
+      // 核心会强制 proof.nonce 与注入值一致。ctx.nonce 取自已验证 proof,仅供日志展示。
       const report = (verdict: TeeVerifyResult | null, attested: boolean, nonce = '') =>
         opts.onVerdict?.(verdict, { method: clientReq.method || 'GET', path: clientReq.url || '/', nonce, attested });
       const runVerify = (body: Buffer, proof: any): TeeVerifyResult =>
         verifyTeeExchange(
-          { expectedPcr0: opts.expectedPcr0, responseBody: body, proof },
+          { expectedPcr0: opts.expectedPcr0, trust: opts.trust, expectedNonceB64, responseBody: body, proof },
           { verifyAttestationDoc: opts.verifyAttestationDoc },
         );
 
@@ -86,24 +96,53 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
       const up = transport.request(target, { method: clientReq.method, headers }, (upRes) => {
         upResRef = upRes;
         const ct = String(upRes.headers['content-type'] || '');
-        const streaming = ct.includes('text/event-stream');
+        const lowerCt = ct.toLowerCase();
+        const streaming = lowerCt.includes('text/event-stream');
+        const multipart = lowerCt.includes('multipart/mixed');
 
-        // ── fail-closed:整段缓冲,验过(或本就无 proof)才放行;有 proof 但验不过 → 502。
+        // ── fail-closed:整段缓冲,有 proof 且验过才放行;缺 proof 或验不过 → 502。
         if (opts.enforce) {
           const buf: Buffer[] = [];
           upRes.on('data', (c: Buffer) => buf.push(c));
           upRes.on('end', () => {
             const whole = Buffer.concat(buf);
-            const { body, proof } = parseTeeProofEvent(whole.toString('utf8'));
+            const { body, proof } = parseTeeProofCapture(whole, ct);
             const verdict = proof ? runVerify(body, proof) : null;
             report(verdict, Boolean(proof), proof?.nonce ?? '');
+            if (!proof) {
+              clientRes.writeHead(502, { 'content-type': 'application/json' });
+              clientRes.end(JSON.stringify({ error: 'tee_proof_missing' }));
+              return;
+            }
             if (proof && (!verdict || !verdict.ok)) {
               clientRes.writeHead(502, { 'content-type': 'application/json' });
               clientRes.end(JSON.stringify({ error: 'tee_verification_failed', checks: verdict?.checks ?? null }));
               return;
             }
-            copyHeaders(upRes, clientRes, Boolean(proof));
-            clientRes.end(proof ? body : whole);
+            copyHeaders(upRes, clientRes, true, proof.resp_content_type);
+            clientRes.end(body);
+          });
+          upRes.on('error', () => endError(clientRes));
+          return;
+        }
+
+        // ── fail-open · multipart proof:缓冲剥 proof,验过/验不过都把 raw response bytes 交给客户端并记录判定。
+        if (multipart) {
+          const buf: Buffer[] = [];
+          upRes.on('data', (c: Buffer) => buf.push(c));
+          upRes.on('end', () => {
+            const whole = Buffer.concat(buf);
+            const parsed = parseTeeProofCapture(whole, ct);
+            const { body, proof } = parsed;
+            const verdict = proof ? runVerify(body, proof) : null;
+            report(verdict, Boolean(proof), proof?.nonce ?? '');
+            if (!proof && !parsed.bodyContentType) {
+              copyHeaders(upRes, clientRes, false);
+              clientRes.end(whole);
+              return;
+            }
+            copyHeaders(upRes, clientRes, true, verdict?.ok ? proof?.resp_content_type : parsed.bodyContentType);
+            clientRes.end(body);
           });
           upRes.on('error', () => endError(clientRes));
           return;
@@ -165,7 +204,7 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
   });
 }
 
-function copyHeaders(upRes: http.IncomingMessage, clientRes: http.ServerResponse, stripLength: boolean): void {
+function copyHeaders(upRes: http.IncomingMessage, clientRes: http.ServerResponse, stripLength: boolean, contentTypeOverride?: string): void {
   const out: Record<string, string | string[]> = {};
   for (const [k, v] of Object.entries(upRes.headers)) {
     if (v == null) continue;
@@ -174,6 +213,7 @@ function copyHeaders(upRes: http.IncomingMessage, clientRes: http.ServerResponse
     if (stripLength && lk === 'content-length') continue; // 剥了 proof → 长度变了,交给 Node 重设
     out[k] = v as string | string[];
   }
+  if (contentTypeOverride) out['content-type'] = contentTypeOverride;
   clientRes.writeHead(upRes.statusCode || 200, out);
 }
 
@@ -191,17 +231,27 @@ function runCli(): void {
 
   const upstream = flag('--upstream') ?? process.env.TEE_PROXY_UPSTREAM;
   const pcr0 = flag('--pcr0');
+  const trustPath = flag('--trust');
+  const nonceHeader = flag('--nonce-header');
   const port = Number(flag('--port') ?? process.env.TEE_PROXY_PORT ?? 8788);
   const enforce = has('--enforce');
-  if (!upstream || !pcr0) {
-    console.error('用法: tsx tee-verify-proxy.ts --upstream <url> --pcr0 <hex> [--port 8788] [--enforce]');
-    console.error('  把客户端 baseURL 指向 http://127.0.0.1:<port>;--pcr0 为审计公布、可由 reproducible-build 复算的镜像度量。');
+  const usage = '用法: tsx tee-verify-proxy.ts --upstream <url> (--pcr0 <hex> | --trust <trust.json>) [--port 8788] [--enforce] [--nonce-header x-tee-nonce]';
+  if (!upstream) {
+    console.error(usage);
+    process.exit(2);
+  }
+  requirePcr0OrTrust({ pcr0, trustPath, usage });
+  const trust = loadTrustConfig(trustPath, pcr0);
+  if (!trust) {
+    console.error(usage);
     process.exit(2);
   }
 
   const server = createVerifyingProxy({
     upstream,
     expectedPcr0: pcr0,
+    trust,
+    nonceHeader,
     enforce,
     onVerdict: (v, ctx) => {
       const tag = `${ctx.method} ${ctx.path}`;
@@ -215,9 +265,10 @@ function runCli(): void {
   server.listen(port, '127.0.0.1', () => {
     console.log('── 本地校验代理 ──');
     console.log(`  监听  http://127.0.0.1:${port}  →  上游 ${upstream}`);
-    console.log(`  PCR0  ${pcr0}`);
-    console.log(`  模式  ${enforce ? 'fail-closed(--enforce:有 proof 验不过 → 502)' : 'fail-open(放行 + 日志,持续抽查/威慑)'}`);
-    console.log('  用法  把你的 LLM 客户端 baseURL 改成上面的监听地址即可(代理不注入任何头;nonce 由 relay 端生成)。');
+    console.log(`  Trust ${trustPath ? trustPath : `Nitro PCR0 ${pcr0}`}`);
+    if (nonceHeader) console.log(`  nonce 每请求生成并通过 ${nonceHeader} 发送,返回 proof 必须匹配`);
+    console.log(`  模式  ${enforce ? 'fail-closed(--enforce:缺 proof 或验不过 → 502)' : 'fail-open(放行 + 日志,持续抽查/威慑)'}`);
+    console.log(`  用法  把你的 LLM 客户端 baseURL 改成上面的监听地址即可${nonceHeader ? '(会注入 nonce header)' : '(默认不注入额外头)'}。`);
     console.log('  注    response-only 会展示签名覆盖的 host;但不含请求绑定,要连「答的就是我这条请求」用整 bundle 验证。');
   });
 }
