@@ -118,7 +118,7 @@ QINGTIAN_CPUS=2
 QINGTIAN_MEM=4096
 QINGTIAN_PARENT_CIDS=3
 QTSM_SDK_DIR=third_party/qingtian-sdk
-APT_MIRROR=https://repo.huaweicloud.com/debian
+APT_MIRROR=http://repo.huaweicloud.com/debian
 CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/
 QINGTIAN_PRIVATE_KEY=private-key.pem
 QINGTIAN_SIGNING_CERTIFICATE=server.pem
@@ -127,6 +127,8 @@ EOF
 ```
 
 `QINGTIAN_PARENT_CIDS` 会被写入 EIF 环境变量并影响 `PCR0`。生产发布时必须固定并记录。
+
+`APT_MIRROR` 建议在 QingTian ECS 上使用 HTTP。`debian:bookworm-slim` 初始没有 CA 证书，若第一轮 `apt-get update` 使用 HTTPS 镜像，可能出现 `No system certificates available` / `Certificate verification failed`，导致 `ca-certificates` 自身也安装不上。APT 仍会校验 Debian Release 签名。
 
 `CARGO_REGISTRY_MIRROR` 只影响 Docker 构建阶段的 Rust 依赖下载，不会写入最终运行镜像；如果 ECS 能直接访问 `index.crates.io`，可以留空。
 

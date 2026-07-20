@@ -7,7 +7,7 @@
 # Example:
 #   docker build --no-cache \
 #     --build-arg QTSM_SDK_DIR=third_party/qingtian-sdk \
-#     --build-arg APT_MIRROR=https://repo.huaweicloud.com/debian \
+#     --build-arg APT_MIRROR=http://repo.huaweicloud.com/debian \
 #     --build-arg CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/ \
 #     --build-arg POO_PARENT_CIDS=3 \
 #     -f deploy/qingtian-runtime/Dockerfile \
