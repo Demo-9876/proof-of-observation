@@ -396,7 +396,7 @@ grep -a 'tee.proof' /tmp/qingtian-stream.sse | tail -n 2
 
 ## 10. 验证 proof
 
-本地 verifier 的完整用法见 `docs/qingtian-new-api-parent-relay-deployment.md` 第 12 节。最小检查是：
+本地 verifier 的完整用法见 `docs/qingtian-new-api-parent-relay-deployment.md` 第 13 节。最小检查是：
 
 ```bash
 cd ~/proof-of-observation/verifier
@@ -410,6 +410,55 @@ npm test
 
 ```bash
 grep -a '"profile":"qingtian"' /tmp/qingtian-nonstream.multipart /tmp/qingtian-stream.sse
+```
+
+response-only 验证会确认响应 proof、QingTian evidence、PCR、公钥绑定和响应签名；full 验证还会额外确认请求绑定。因为第 9 节已经用 `--data-binary @/tmp/qingtian-chat*.json` 保存了实际请求体,可以直接生成 full bundle：
+
+```bash
+source ~/qingtian-proof-vars.sh
+cd ~/proof-of-observation/verifier
+
+cat > /tmp/qingtian-trust.e2e.json <<EOF
+{
+  "profile": "qingtian",
+  "expectedPcrs": {
+    "sha384:0": "$QINGTIAN_PCR0",
+    "sha384:8": "$QINGTIAN_PCR8"
+  },
+  "platformTrust": {
+    "mode": "cert-chain",
+    "trustAnchorId": "huawei-qingtian-prod",
+    "rootFingerprintsSha256": [
+      "F23443B4EB52A70719DF49BDDA0E57BB25F1C04530885DBECDBDE241C8C4F581"
+    ],
+    "revocation": {
+      "required": false,
+      "method": "crl-or-ocsp",
+      "checkedExternally": false
+    }
+  }
+}
+EOF
+
+npx tsx make-real-bundle.ts \
+  /tmp/qingtian-chat.json \
+  /tmp/qingtian-nonstream.multipart \
+  /tmp/qingtian-nonstream.full-bundle.json
+
+npx tsx verify-real-bundle.ts \
+  /tmp/qingtian-nonstream.full-bundle.json \
+  --trust /tmp/qingtian-trust.e2e.json \
+  --host dashscope.aliyuncs.com
+
+npx tsx make-real-bundle.ts \
+  /tmp/qingtian-chat-stream.json \
+  /tmp/qingtian-stream.sse \
+  /tmp/qingtian-stream.full-bundle.json
+
+npx tsx verify-real-bundle.ts \
+  /tmp/qingtian-stream.full-bundle.json \
+  --trust /tmp/qingtian-trust.e2e.json \
+  --host dashscope.aliyuncs.com
 ```
 
 ## 11. 停止和重启

@@ -15,6 +15,7 @@
 | `evidence-nitro.ts` | `nitro` profile:包装真 Nitro attestation(COSE_Sign1 / ECDSA-P384 / X.509 链到 AWS 根)验证器 |
 | `verify-attestation-cose.mjs` | Nitro COSE/P-384/X.509 链验证器 |
 | `tee-verify-stream.ts` | CLI 抓包抽查(response-only):SSE / multipart → 验 v2 proof + **读出签名覆盖的 host** |
+| `make-real-bundle.ts` | CLI 从精确请求体 + 抓包响应生成 full bundle |
 | `verify-real-bundle.ts` | CLI 整 bundle 离线验(full 档):多一项请求绑定 |
 | `tee-verify-proxy.ts` | 本地校验代理:把客户端 baseURL 指过来,每调透明验 |
 | `trust-config.ts` | `--pcr0` legacy Nitro 与 `--trust <trust.json>` profile trust config 入口 |
@@ -35,6 +36,15 @@ npx tsx tee-verify-stream.ts captured-response --trust qingtian-trust.json --non
 
 - 流式 SSE:保存完整上游 SSE 字节,末尾包含 `event: tee.proof`。
 - 非流式 proof mode:保存完整 `multipart/mixed` body,第一段是 raw response bytes,第二段是 proof；也支持终端保存的 raw body + proof 尾段。
+
+如果需要 full 档验证(额外核对“答的就是我这条请求”),必须保存实际发送的请求体字节,再生成 bundle：
+
+```bash
+npx tsx make-real-bundle.ts request.json captured-response real-bundle.json
+npx tsx verify-real-bundle.ts real-bundle.json --trust qingtian-trust.json --host dashscope.aliyuncs.com
+```
+
+`make-real-bundle.ts` 只负责剥离 capture 中的 `tee.proof` 并保存 `{ requestBody_b64, responseBody_b64, proof }`；真正的 attestation、PCR、公钥绑定、nonce、响应签名和请求绑定验证仍由 `verify-real-bundle.ts` 完成。
 
 或浏览器:开 [`../docs/tee-verify.html`](../docs/tee-verify.html) 贴流式 SSE 或非流式 proof 响应；终端保存的 body+proof 尾段也兼容。规范 PCR0 见
 [`../docs/tee-reproducible-build.md`](../docs/tee-reproducible-build.md)。

@@ -598,16 +598,20 @@ cd "$DEPLOY_DIR"
 
 source "$DEPLOY_DIR/qingtian-proof-test-vars.sh"
 
+cat > request.qingtian.nonstream.json <<EOF
+{
+  "model": "$MODEL",
+  "messages": [{"role": "user", "content": "Say hello from QingTian proof non-stream"}],
+  "stream": false
+}
+EOF
+
 curl -sS -D headers.qingtian.nonstream.txt \
   "http://127.0.0.1:$NEW_API_PORT/v1/chat/completions" \
   -H "Authorization: Bearer $NEW_API_TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-TEE-Proof: required" \
-  -d "{
-    \"model\": \"$MODEL\",
-    \"messages\": [{\"role\": \"user\", \"content\": \"Say hello from QingTian proof non-stream\"}],
-    \"stream\": false
-  }" \
+  --data-binary @request.qingtian.nonstream.json \
   -o response.qingtian.nonstream.multipart
 ```
 
@@ -655,17 +659,21 @@ cd "$DEPLOY_DIR"
 
 source "$DEPLOY_DIR/qingtian-proof-test-vars.sh"
 
+cat > request.qingtian.stream.json <<EOF
+{
+  "model": "$MODEL",
+  "messages": [{"role": "user", "content": "Say hello from QingTian proof stream"}],
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}
+EOF
+
 curl -N -sS -D headers.qingtian.stream.txt \
   "http://127.0.0.1:$NEW_API_PORT/v1/chat/completions" \
   -H "Authorization: Bearer $NEW_API_TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-TEE-Proof: required" \
-  -d "{
-    \"model\": \"$MODEL\",
-    \"messages\": [{\"role\": \"user\", \"content\": \"Say hello from QingTian proof stream\"}],
-    \"stream\": true,
-    \"stream_options\": {\"include_usage\": true}
-  }" \
+  --data-binary @request.qingtian.stream.json \
   -o response.qingtian.stream.sse
 ```
 
@@ -753,6 +761,35 @@ npx tsx tee-verify-stream.ts \
   --trust "$DEPLOY_DIR/qingtian-trust.e2e.json" \
   --host "$UPSTREAM_HOST" \
   | tee "$DEPLOY_DIR/verify-qingtian-new-api-stream.log"
+```
+
+完整请求绑定验证。该档会把实际请求体、剥离 proof 后的响应体、proof 放进同一个 bundle,再验证“答的就是这条请求”：
+
+```bash
+source ~/qingtian-proof-vars.sh
+cd "$PROOF_REPO/verifier"
+
+npx tsx make-real-bundle.ts \
+  "$DEPLOY_DIR/request.qingtian.nonstream.json" \
+  "$DEPLOY_DIR/response.qingtian.nonstream.multipart" \
+  "$DEPLOY_DIR/bundle.qingtian.nonstream.full.json"
+
+npx tsx verify-real-bundle.ts \
+  "$DEPLOY_DIR/bundle.qingtian.nonstream.full.json" \
+  --trust "$DEPLOY_DIR/qingtian-trust.e2e.json" \
+  --host "$UPSTREAM_HOST" \
+  | tee "$DEPLOY_DIR/verify-qingtian-new-api-nonstream-full.log"
+
+npx tsx make-real-bundle.ts \
+  "$DEPLOY_DIR/request.qingtian.stream.json" \
+  "$DEPLOY_DIR/response.qingtian.stream.sse" \
+  "$DEPLOY_DIR/bundle.qingtian.stream.full.json"
+
+npx tsx verify-real-bundle.ts \
+  "$DEPLOY_DIR/bundle.qingtian.stream.full.json" \
+  --trust "$DEPLOY_DIR/qingtian-trust.e2e.json" \
+  --host "$UPSTREAM_HOST" \
+  | tee "$DEPLOY_DIR/verify-qingtian-new-api-stream-full.log"
 ```
 
 通过标准：
