@@ -1,6 +1,16 @@
-# QingTian qproxy E2E Quickstart
+# QingTian qproxy E2E Runbook
 
-本文档是在真实 Huawei QingTian Enclave 父 VM 上，用 Huawei 官方 qproxy 重新跑 `proof-of-observation` 端到端验证的最短命令流。
+本文档是在真实 Huawei QingTian Enclave 父 VM 上，用 Huawei 官方 qproxy 跑通 `proof-of-observation` 端到端验证的可复现流程。即使上下文丢失，也应能按本文从代码拉取、QingTian 业务镜像构建、signed EIF 启动、qproxy 出网、new-api 接入，到非流式/流式 proof 请求完整复现。
+
+已验证结论：
+
+- QingTian runtime image 可构建成功。
+- `qt enclave make-img --private-key --signing-certificate` 可生成 signed EIF。
+- `PCR8` 非 0，来自 signing certificate。
+- Enclave normal mode 可启动并保持 Running。
+- Huawei qproxy 双端链路可用。
+- DashScope 上游通过 `8444` 出网可返回模型响应和 `profile=qingtian` proof。
+- OpenAI 上游预留 `8445`，生产可同时配置多个上游。
 
 约定：
 
@@ -11,6 +21,29 @@
 - Enclave control port：`5005`
 - DashScope 走 egress port `8444`
 - OpenAI 走 egress port `8445`
+
+最终链路：
+
+```text
+client
+  -> new-api on QingTian parent VM
+  -> AF_VSOCK cid=4 port=5005
+  -> /attest inside QingTian enclave
+  -> TCP 127.0.0.1:<egress_port> inside enclave
+  -> qproxy enclave
+  -> AF_VSOCK parent cid=3 vsock_port=<egress_port>
+  -> qproxy host on parent VM
+  -> TCP 127.0.0.1:<egress_port> on parent VM
+  -> parent-local TCP mapper
+  -> real upstream host:443
+```
+
+关键约束：
+
+- 接入方协议不变：new-api 仍然只把 `egress_port` 放进 request head，proof wire protocol 保持和 Nitro 版兼容。
+- qproxy 必须双端运行：enclave 内 `qproxy enclave` 由业务镜像启动；父 VM 上必须启动 `qproxy host`。
+- 多个 HTTPS 上游都是真实 `:443` 时，qproxy 配置不能直接写多个 `tcp_port = 443`。本文使用 parent-local TCP mapper，把 qproxy 的 `127.0.0.1:8444/8445` 再转到真实上游 `:443`。
+- 旧的裸 `vsock -> TCP` 转发器必须停止，否则会造成端口冲突或误走旧路径。
 
 ## 1. 拉取 qproxy 版本代码
 
@@ -26,6 +59,14 @@ git fetch origin
 git checkout feature/qingtian-enclave-technical-plan
 git pull --ff-only origin feature/qingtian-enclave-technical-plan
 git rev-parse HEAD
+```
+
+推荐至少拉到以下 commit 或更高版本：
+
+```text
+3e4ecc6 Isolate qt Docker config for QingTian image creation
+31a93a7 Fix qproxy Docker SDK crate copy
+768b49b Add QingTian qproxy runtime support
 ```
 
 ## 2. 准备 QingTian SDK
@@ -44,6 +85,13 @@ test -d third_party/qingtian-sdk/enclave/qtsm-sdk-rs
 test -d third_party/qingtian-sdk/enclave/qtsm-sdk-sys
 git -C third_party/qingtian-sdk rev-parse HEAD
 ```
+
+这些目录缺一不可：
+
+- `enclave/qtsm`：构建 `libqtsm.so`
+- `qingtian-tools/qproxy`：构建 Huawei qproxy
+- `enclave/qtsm-sdk-rs`：qproxy attestation 依赖
+- `enclave/qtsm-sdk-sys`：`qtsm-sdk-rs` 的 path dependency
 
 ## 3. 准备 EIF 签名材料
 
@@ -101,6 +149,8 @@ qt enclave query-eif --eif proof-observation-qingtian.qproxy-e2e.signed.eif \
 - `qt enclave query` 显示 `Status: Running`
 - `query-eif` 输出 `PCR0` 和非 0 `PCR8`
 
+如果上一次 Docker build 已经成功，但 `qt enclave make-img` 因 Docker auth config 失败，拉取最新代码后直接重跑本节命令即可。`run.sh` 会让 `qt` 使用干净的 `.tmp/qingtian-qt-docker-config/config.json`，不会再读取可能损坏的 `~/.docker/config.json`。
+
 ## 5. 写入父 VM 部署变量
 
 把 `QINGTIAN_PCR0` / `QINGTIAN_PCR8` 替换为上一步 `query-eif` 的输出。
@@ -129,6 +179,18 @@ source ~/qingtian-proof-vars.sh
 ```
 
 ## 6. 启动 qproxy host 和 parent-local TCP mapper
+
+先停掉旧的裸 `vsock -> TCP` 转发器。以前用临时 Python / `nc-vsock` / 其它 vsock proxy 跑通时，可能会残留旧进程：
+
+```bash
+pgrep -af 'vsock|nc-vsock|python|8444|8445|5005' || true
+
+# 按实际进程选择停止；下面命令只作为常见模式清理。
+pgrep -f 'nc-vsock' | xargs -r kill 2>/dev/null || true
+pgrep -f 'vsock.*8444|vsock.*8445' | xargs -r kill 2>/dev/null || true
+```
+
+启动新的 qproxy host 和 parent-local TCP mapper：
 
 ```bash
 source ~/qingtian-proof-vars.sh
@@ -188,6 +250,23 @@ for item in $UPSTREAM_MAPPINGS; do
 done
 tail -n 80 "$DEPLOY_DIR/qproxy/qproxy-host.out"
 ```
+
+检查点：
+
+```bash
+pgrep -af 'qingtian-proof-egres[s]'
+pgrep -af 'qproxy hos[t]'
+ss -ltnp | grep -E '127\.0\.0\.1:(8444|8445)'
+tail -n 200 /var/log/qproxy/host.log 2>/dev/null || true
+```
+
+`qproxy-host.out` 只有下面内容不代表失败：
+
+```text
+nohup: ignoring input
+```
+
+实际是否运行以 `pgrep -af 'qproxy hos[t]'` 和 `/var/log/qproxy/host.log` 为准。
 
 ## 7. 启动 new-api 容器
 
@@ -333,7 +412,72 @@ npm test
 grep -a '"profile":"qingtian"' /tmp/qingtian-nonstream.multipart /tmp/qingtian-stream.sse
 ```
 
-## 11. 常用排障命令
+## 11. 停止和重启
+
+停止顺序：
+
+```bash
+source ~/qingtian-proof-vars.sh
+
+docker rm -f "$NEW_API_CONTAINER" 2>/dev/null || true
+pgrep -f 'qproxy hos[t]' | xargs -r kill 2>/dev/null || true
+pgrep -f 'qingtian-proof-egres[s]' | xargs -r kill 2>/dev/null || true
+qt enclave stop --enclave-id 0 2>/dev/null || true
+qt enclave query
+```
+
+重启顺序：
+
+```bash
+source ~/qingtian-proof-vars.sh
+
+qt enclave start \
+  --mem 4096 \
+  --cpus 2 \
+  --eif "$PROOF_REPO/proof-observation-qingtian.qproxy-e2e.signed.eif" \
+  --cid "$ENCLAVE_CID"
+
+cd "$DEPLOY_DIR/qproxy"
+source ./upstream-mappings.env
+
+pgrep -f 'qingtian-proof-egres[s]' | xargs -r kill 2>/dev/null || true
+for item in $UPSTREAM_MAPPINGS; do
+  host="${item%:*}"
+  port="${item##*:}"
+  nohup socat -ly -lp "qingtian-proof-egress-$port" \
+    TCP-LISTEN:"$port",bind=127.0.0.1,reuseaddr,fork \
+    TCP:"$host":"$UPSTREAM_TLS_PORT" \
+    > "$DEPLOY_DIR/qproxy/tcp-mapper-$port.out" 2>&1 &
+done
+
+pgrep -f 'qproxy hos[t]' | xargs -r kill 2>/dev/null || true
+nohup qproxy host --config=./config_qproxy_egress.toml "$ENCLAVE_CID" \
+  > "$DEPLOY_DIR/qproxy/qproxy-host.out" 2>&1 &
+
+docker start "$NEW_API_CONTAINER"
+
+sleep 2
+qt enclave query
+pgrep -af 'qingtian-proof-egres[s]'
+pgrep -af 'qproxy hos[t]'
+docker ps --filter "name=$NEW_API_CONTAINER"
+```
+
+## 12. 已遇到问题和处理方式
+
+| 阶段 | 现象 | 原因 | 处理 |
+|---|---|---|---|
+| Docker build 拉基础镜像 | `registry-1.docker.io` timeout | 父 VM 到 Docker Hub 不稳定 | 配置 Docker registry mirror，或先 `docker pull` 所需基础镜像 |
+| Docker build apt | HTTPS Debian mirror 报 `No system certificates available` / `Certificate verification failed` | `debian:bookworm-slim` 首次 `apt-get update` 前没有 CA | `APT_MIRROR=http://repo.huaweicloud.com/debian`，首次 apt 用 HTTP |
+| Cargo build | 无法访问 `index.crates.io` | 父 VM 网络/DNS 对 crates.io 不稳定 | `CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/` |
+| qproxy build | `failed to read /src/enclave/qtsm-sdk-sys/Cargo.toml` | Dockerfile 只复制了 `qtsm-sdk-rs`，漏了 path dependency `qtsm-sdk-sys` | 已在 `31a93a7` 修复；拉最新代码 |
+| `qt enclave make-img` | `not enough values to unpack (expected 2, got 1)` | Python Docker SDK 解析 `~/.docker/config.json` 中坏掉的 `auth` 字段失败 | 已在 `3e4ecc6` 修复；`run.sh` 给 `qt` 使用干净 Docker config |
+| `qt enclave query` | `[]` 或 enclave 短暂 Running 后退出 | enclave 主进程退出、qproxy 启动失败或运行参数不匹配 | 看 `/var/log/qingtian_enclaves/qingtian-tool.log`，确认 `start-qingtian-attest`、`qproxy enclave` 和 `/attest` |
+| qproxy host 输出 | `qproxy-host.out` 只有 `nohup: ignoring input` | 这是 nohup 常规输出，不代表失败 | 用 `pgrep -af 'qproxy hos[t]'` 和 `/var/log/qproxy/host.log` 判断 |
+| 请求失败 | `Connection reset/refused` | qproxy host、enclave 内 qproxy、parent-local mapper 或旧 vsock 转发器冲突 | 停旧转发器，检查 `pgrep` 和 `ss -ltnp` |
+| 多上游配置 | 直接配置多个 `tcp_port = 443` 不可用 | qproxy `tcp_port` 同时作为 enclave-local listener 和 host-side target port | 使用本文 `127.0.0.1:8444/8445 -> real host:443` mapper 模式 |
+
+## 13. 常用排障命令
 
 ```bash
 qt enclave query
@@ -351,3 +495,18 @@ tail -n 200 /var/log/qproxy/host.log 2>/dev/null || true
 docker logs --tail 200 "$NEW_API_CONTAINER"
 docker exec "$NEW_API_CONTAINER" env | grep '^TEE_PROOF_'
 ```
+
+## 14. 最终成功判定
+
+全部满足才认为 qproxy E2E 跑通：
+
+- `git rev-parse HEAD` 不低于 `3e4ecc6`。
+- `qt enclave query` 显示 enclave `Status=Running`，`LaunchMode=normal`。
+- `qt enclave query-eif` 输出 `PCR8` 非 0。
+- `pgrep -af 'qproxy hos[t]'` 有 qproxy host 进程。
+- `pgrep -af 'qingtian-proof-egres[s]'` 有 `8444` / `8445` 的 `socat` 进程。
+- `ss -ltnp` 显示 `127.0.0.1:8444` 和 `127.0.0.1:8445` 正在监听。
+- new-api 容器启动，环境变量包含 `TEE_PROOF_ENABLED=true`、`TEE_PROOF_ENCLAVE_CID=4`、`TEE_PROOF_ENCLAVE_PORT=5005`。
+- 非流式请求响应中包含 `"profile":"qingtian"`。
+- 流式请求 SSE 末尾包含 `tee.proof` 事件。
+- Node verifier 对保存的 response/proof 校验通过。
