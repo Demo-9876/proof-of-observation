@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -32,6 +33,16 @@ use attest::tls_profile;
 
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write + ?Sized> ReadWrite for T {}
+
+fn log_stderr(args: fmt::Arguments<'_>) {
+    let _ = writeln!(std::io::stderr(), "{args}");
+}
+
+macro_rules! elog {
+    ($($arg:tt)*) => {
+        log_stderr(format_args!($($arg)*))
+    };
+}
 
 fn decode_profile(head: &ReqHead) -> Option<tls_profile::TlsProfile> {
     tls_profile::decode(&B64.decode(head.tls_spec.as_deref()?).ok()?).ok()
@@ -940,7 +951,7 @@ fn worker(rx: Arc<Mutex<Receiver<VsockStream>>>, ctx: Arc<Ctx>) {
             }
             Ok(Err(e)) => {
                 ctx.m.failed.fetch_add(1, Ordering::Relaxed);
-                eprintln!("handle error: {}", e);
+                elog!("handle error: {}", e);
                 let _ = write_frame(
                     &mut s,
                     ERR,
@@ -951,7 +962,7 @@ fn worker(rx: Arc<Mutex<Receiver<VsockStream>>>, ctx: Arc<Ctx>) {
             }
             Err(_) => {
                 ctx.m.panicked.fetch_add(1, Ordering::Relaxed);
-                eprintln!("handle panicked (caught)");
+                elog!("handle panicked (caught)");
             }
         }
     }
@@ -961,7 +972,7 @@ fn serve_metrics(ctx: Arc<Ctx>) {
     let l = match VsockListener::bind(&VsockAddr::new(VMADDR_CID_ANY, METRICS_PORT)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("metrics bind 失败: {}", e);
+            elog!("metrics bind 失败: {}", e);
             return;
         }
     };
@@ -1021,7 +1032,7 @@ fn main() {
     let spki = Arc::new(spki_v);
 
     let evidence_provider = build_evidence_provider();
-    eprintln!("evidence profile: {}", evidence_provider.profile());
+    elog!("evidence profile: {}", evidence_provider.profile());
     let ctx = Arc::new(Ctx {
         sk,
         spki,
@@ -1040,7 +1051,7 @@ fn main() {
             .spawn(move || worker(rx, ctx))
         {
             Ok(_) => spawned += 1,
-            Err(e) => eprintln!("起 worker {} 失败（非致命）: {}", i, e),
+            Err(e) => elog!("起 worker {} 失败（非致命）: {}", i, e),
         }
     }
 
@@ -1050,14 +1061,18 @@ fn main() {
             .name("metrics".into())
             .spawn(move || serve_metrics(ctx))
         {
-            eprintln!("起 metrics 线程失败（非致命）: {}", e);
+            elog!("起 metrics 线程失败（非致命）: {}", e);
         }
     }
 
     let listener = VsockListener::bind(&VsockAddr::new(VMADDR_CID_ANY, PORT)).expect("bind vsock");
-    eprintln!(
+    elog!(
         "listening on vsock :{} (workers={}/{}, queue={}), metrics :{}",
-        PORT, spawned, N_WORKERS, QUEUE_CAP, METRICS_PORT
+        PORT,
+        spawned,
+        N_WORKERS,
+        QUEUE_CAP,
+        METRICS_PORT
     );
 
     for stream in listener.incoming() {

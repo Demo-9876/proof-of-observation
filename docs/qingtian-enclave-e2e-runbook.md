@@ -201,33 +201,36 @@ openssl x509 -in root.pem -noout -subject -issuer -dates -fingerprint -sha256
 
 ## 8. 启动现有父虚机 Relay
 
-使用 Nitro 版同一套 relay，只需要把 enclave 目标改成 QingTian：
+父 VM relay 如果使用 `ai-platform-newapi`，详细部署步骤见 [`qingtian-new-api-parent-relay-deployment.md`](qingtian-new-api-parent-relay-deployment.md)。核心是启用 new-api 现有 `TEE_PROOF_*` 配置，并连接 QingTian enclave CID `4` / control port `5005`：
 
 ```bash
-export TEE_ENCLAVE_CID=4
-export TEE_ENCLAVE_PORT=5005
-export TEE_EVIDENCE_PROFILE=qingtian
-export TEE_TRUST_CONFIG="$PWD/qingtian-trust.e2e.json"
-
-# 使用你的现有 relay 启动命令；关键是连接 cid=4 port=5005。
-# 示例：
-# ./relay --enclave-cid 4 --enclave-port 5005 ...
+export TEE_PROOF_ENABLED=true
+export TEE_PROOF_REQUIRE=true
+export TEE_PROOF_ENCLAVE_CID=4
+export TEE_PROOF_ENCLAVE_PORT=5005
+export TEE_PROOF_EXPECTED_PCR0=<PCR0_FROM_QUERY_EIF>
+export TEE_PROOF_ALLOWED_HOSTS=api.openai.com
+export TEE_PROOF_EGRESS_PORTS=api.openai.com:8445
+export TEE_PROOF_TIMEOUT_SECONDS=300
+export TEE_PROOF_MAX_BODY_BYTES=67108864
+export TEE_PROOF_STORE=memory
 ```
 
-如果现有 relay 有 egress-vsock 监听配置，保持 Nitro 版相同端口即可。enclave 会根据 request head 中的 `egress_port` 连接父虚机，默认 parent CID 为 `3`。
+如果现有 relay 有 egress-vsock proxy 配置，保持 Nitro 版相同端口即可。enclave 会根据 request head 中的 `egress_port` 连接父虚机，默认 parent CID 为 `3`。
 
 ## 9. 发真实业务请求并保存完整响应
 
 流式 SSE：
 
 ```bash
-curl -N https://<你的-relay-domain>/v1/messages \
+curl -N https://<你的-relay-domain>/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <TOKEN>" \
+  -H "X-TEE-Proof: required" \
   -d '{
     "model": "<model>",
-    "max_tokens": 64,
     "stream": true,
+    "stream_options": {"include_usage": true},
     "messages": [{"role":"user","content":"Say hello from QingTian e2e"}]
   }' \
   > response.qingtian.e2e.sse
@@ -236,13 +239,12 @@ curl -N https://<你的-relay-domain>/v1/messages \
 非流式 multipart：
 
 ```bash
-curl -sS https://<你的-relay-domain>/v1/messages \
+curl -sS https://<你的-relay-domain>/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <TOKEN>" \
-  -H "x-wokey-tee-proof-mode: multipart" \
+  -H "X-TEE-Proof: required" \
   -d '{
     "model": "<model>",
-    "max_tokens": 64,
     "stream": false,
     "messages": [{"role":"user","content":"Say hello from QingTian multipart e2e"}]
   }' \
@@ -257,6 +259,16 @@ grep -a '"profile":"qingtian"' response.qingtian.e2e.sse response.qingtian.e2e.m
 ```
 
 如果没有 `tee.proof` 或 proof 中没有 `"profile":"qingtian"`，先排查 relay 是否连接到 QingTian enclave、是否启用了 proof 模式、以及 enclave 日志。
+
+如果 `qt enclave start` 返回 `Status: Running`，但随后的 `qt enclave query` 立即返回 `[]`，说明 enclave 内主进程启动后退出。先用 `--debug-mode` 启动同一个 EIF，并通过 `sudo qt enclave console --enclave-id 0` 查看 `/attest` 日志。正常启动至少应看到：
+
+```text
+QTSM Device file opened.
+evidence profile: qingtian
+listening on vsock :5005
+```
+
+如果 debug 模式稳定而 normal 模式快速退出，优先确认当前代码是否包含 non-panicking stderr logging 修复；修复后需要重新构建 Docker image 和 signed EIF，并使用新的 `PCR0`/`PCR8` 更新 trust config。
 
 ## 10. 使用 Node CLI Verifier 验证
 
