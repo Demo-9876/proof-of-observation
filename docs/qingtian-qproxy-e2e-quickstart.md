@@ -40,6 +40,8 @@ fi
 
 test -f third_party/qingtian-sdk/enclave/qtsm/lib/Makefile
 test -d third_party/qingtian-sdk/qingtian-tools/qproxy
+test -d third_party/qingtian-sdk/enclave/qtsm-sdk-rs
+test -d third_party/qingtian-sdk/enclave/qtsm-sdk-sys
 git -C third_party/qingtian-sdk rev-parse HEAD
 ```
 

@@ -36,6 +36,11 @@ if [ ! -f "$QTSM_SDK_DIR/enclave/qtsm/lib/Makefile" ]; then
   echo "clone or copy Huawei QingTian SDK, then set QTSM_SDK_DIR in $ENV_FILE" >&2
   exit 2
 fi
+if [ ! -d "$QTSM_SDK_DIR/qingtian-tools/qproxy" ] || [ ! -d "$QTSM_SDK_DIR/enclave/qtsm-sdk-rs" ] || [ ! -d "$QTSM_SDK_DIR/enclave/qtsm-sdk-sys" ]; then
+  echo "missing qproxy or Rust QTSM SDK crates under $QTSM_SDK_DIR" >&2
+  echo "required: qingtian-tools/qproxy, enclave/qtsm-sdk-rs, enclave/qtsm-sdk-sys" >&2
+  exit 2
+fi
 
 docker build --no-cache \
   --build-arg "QTSM_SDK_DIR=$QTSM_SDK_DIR" \

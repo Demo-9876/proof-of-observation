@@ -2,7 +2,8 @@
 #
 # Build context: repository root.
 # Required input: Huawei QingTian SDK checked out at QTSM_SDK_DIR, defaulting to
-# third_party/qingtian-sdk. The directory must contain enclave/qtsm/lib/Makefile.
+# third_party/qingtian-sdk. The directory must contain enclave/qtsm/lib/Makefile
+# and qingtian-tools/qproxy plus the Rust QTSM SDK crates under enclave/.
 #
 # Example:
 #   docker build --no-cache \
@@ -62,6 +63,7 @@ RUN cd /opt/qingtian/qtsm/lib && \
 
 COPY ${QTSM_SDK_DIR}/qingtian-tools/qproxy /src/qingtian-tools/qproxy
 COPY ${QTSM_SDK_DIR}/enclave/qtsm-sdk-rs /src/enclave/qtsm-sdk-rs
+COPY ${QTSM_SDK_DIR}/enclave/qtsm-sdk-sys /src/enclave/qtsm-sdk-sys
 RUN cargo build --release --manifest-path /src/qingtian-tools/qproxy/Cargo.toml --bin qproxy
 
 COPY enclave/Cargo.toml enclave/Cargo.lock /src/enclave/
