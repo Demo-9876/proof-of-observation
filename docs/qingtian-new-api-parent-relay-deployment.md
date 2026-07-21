@@ -1,235 +1,403 @@
-# QingTian 父 VM new-api Relay 部署文档
+# QingTian 父 VM new-api Relay Docker 部署 Runbook
 
-本文档梳理在 Huawei Cloud QingTian Enclave 父 VM 上部署 `ai-platform-newapi` 作为 `proof-of-observation` relay 的完整步骤。
+本文档给出在 Huawei Cloud QingTian Enclave 父 VM 上，从 `ai-platform-newapi` 源码构建 Docker 镜像并部署为 `proof-of-observation` relay 的完整操作流程。
 
-`ai-platform-newapi` 仓库路径：
+约定：
+
+- `proof-of-observation` 仓库在父 VM：`~/proof-of-observation`
+- `ai-platform-newapi` 仓库在父 VM：`~/ai-platform-newapi`
+- QingTian enclave 已用 `proof-of-observation` signed EIF 启动。
+- 当前已验证的 enclave：`CID=4`，control port：`5005`
+- 当前 signed EIF PCR：
+  - `PCR0=ce20e9feca6b19c7367460b996f7aaa336cfef9026b0765550b19bd786547465d5ea54f51d8a4d786d608c9de142677a`
+  - `PCR8=9e45f72e25849c5cfb6b91b2160fdde7666413ef451b54f2f0a61d06492fb72ed7b277541a8cd0e03757e44fc2f05949`
+
+阅读方式：
+
+- `bash` 代码块表示需要复制到 QingTian 父 VM 执行的命令。
+- `text` / `toml` / `env` 代码块只表示链路、配置内容或期望输出，不要当成 shell 命令执行。
+- 需要人工填写的敏感值会通过 `read` 命令写入本机变量文件，后续命令直接引用变量文件。
+
+完整执行顺序：
 
 ```text
-/Users/admin/Documents/code/go/code.shihuo.cn/aibrain/ai-platform-newapi
+1. 写入部署变量
+2. 检查/启动 QingTian enclave
+3. 安装或构建 qproxy
+4. 启动 qproxy host
+5. 准备 ai-platform-newapi 源码
+6. 从源码构建 new-api Docker 镜像
+7. 创建 new-api env 文件
+8. Docker 启动 new-api
+9. 在 new-api 控制台配置渠道和 token
+10. curl 验证非流式和流式 proof
+11. 用 proof-of-observation verifier 验证响应
 ```
 
-本文只描述部署和验证步骤，不要求修改 `ai-platform-newapi` 代码。
+## 0. 部署链路说明
 
-## 1. 当前实现边界
-
-父 VM 上的 new-api 不是单独的 sidecar，而是在现有 OpenAI relay 请求链路中启用 `relay/proof`：
-
-- 上游请求创建后，`relay/channel/api_request.go` 调用 `proof.TryDoRequest()`。
-- new-api 通过 Linux `AF_VSOCK` 连接 enclave：`TEE_PROOF_ENCLAVE_CID:TEE_PROOF_ENCLAVE_PORT`。
-- enclave 默认监听 control port `5005`，当前 QingTian 启动参数中 `EnclaveCID=4`。
-- enclave 收到父 VM 请求后，再通过父 VM egress vsock proxy 连接真实上游。
-- 流式响应在 SSE 尾部追加 `event: tee.proof`。
-- 非流式响应改为 `multipart/mixed`，第一段是原始上游响应 body，第二段是 `tee.proof` JSON。
-- 非流式响应会返回 `X-TEE-Proof-Id`，可通过 `GET /api/tee/proofs/:proof_id` 查询 proof；该接口使用 `TokenAuthReadOnly()`，只能由同 token 读取。
-
-当前 new-api proof 仅注册了 OpenAI relay format 的 `/v1/chat/completions`：
-
-- `chat.completions.non_stream`
-- `chat.completions.stream`
-
-不覆盖 Responses API、Claude Messages API、图片、音频、rerank 等其它 relay mode。
-
-## 2. 推荐部署拓扑
-
-推荐先使用专用 proof relay 实例灰度，不要直接在承载混合业务的主 new-api 实例上全量启用。
+实际链路：
 
 ```text
 client
-  |
-  | HTTPS /v1/chat/completions
-  v
-new-api on parent VM
-  |
-  | vsock cid=4 port=5005
-  v
-proof-of-observation enclave
-  |
-  | vsock parent cid=3 egress_port=<host-mapped-port>
-  v
-parent egress proxy
-  |
-  | TCP/TLS passthrough
-  v
-official upstream host:443
+  -> new-api Docker container on parent VM
+  -> AF_VSOCK cid=4 port=5005
+  -> proof-of-observation enclave /attest
+  -> AF_VSOCK parent cid=3 egress_port=8445
+  -> qproxy host on parent VM
+  -> TCP api.openai.com:443
 ```
 
-原因：当前代码中 `TEE_PROOF_ENABLED=true` 后，OpenAI-format chat completions JSON endpoint 会默认进入 proof-required 判断。如果同一实例还承载不在 `TEE_PROOF_ALLOWED_HOSTS` / `TEE_PROOF_EGRESS_PORTS` 内的 OpenAI chat 流量，请求可能因 eligibility 不满足而返回错误。生产灰度建议使用专用域名、专用实例或专用渠道。
+new-api 负责接入客户端请求并把符合条件的 `/v1/chat/completions` 请求送进 enclave。enclave 内部建立 TLS 并访问官方上游，父 VM 的 qproxy 只做字节转发。
 
-## 3. 前置条件
+当前 `ai-platform-newapi` 代码里的 proof 接入点：
 
-在 QingTian 父 VM 上确认 enclave 已经正常运行：
+- `relay/channel/api_request.go` 调用 `proof.TryDoRequest()`
+- `relay/proof/config.go` 读取 `TEE_PROOF_*`
+- `relay/proof/dialer_linux.go` 创建 `AF_VSOCK`
+- `relay/proof/passthrough.go` 输出 SSE tail `event: tee.proof` 或非流式 `multipart/mixed`
+- `controller/tee_proof.go` 提供 `GET /api/tee/proofs/:proof_id`
+
+## 1. 设置本次部署变量
+
+先写入固定部署变量：
 
 ```bash
+cat > ~/qingtian-proof-vars.sh <<'EOF'
+export PROOF_REPO="$HOME/proof-of-observation"
+export NEWAPI_REPO="$HOME/ai-platform-newapi"
+export DEPLOY_DIR="$HOME/new-api-qingtian-proof"
+
+export ENCLAVE_CID=4
+export ENCLAVE_PORT=5005
+export QINGTIAN_PCR0=ce20e9feca6b19c7367460b996f7aaa336cfef9026b0765550b19bd786547465d5ea54f51d8a4d786d608c9de142677a
+export QINGTIAN_PCR8=9e45f72e25849c5cfb6b91b2160fdde7666413ef451b54f2f0a61d06492fb72ed7b277541a8cd0e03757e44fc2f05949
+
+export UPSTREAM_HOST=api.openai.com
+export UPSTREAM_TLS_PORT=443
+export EGRESS_VSOCK_PORT=8445
+
+export NEW_API_IMAGE=new-api-proof:qingtian
+export NEW_API_CONTAINER=new-api-proof
+export NEW_API_PORT=7070
+EOF
+
+source ~/qingtian-proof-vars.sh
+```
+
+再写入需要按现场填写的变量。下面命令会交互式提示输入，不会把敏感值回显到终端：
+
+```bash
+source ~/qingtian-proof-vars.sh
+
+read -r -p "ai-platform-newapi Git URL: " AI_PLATFORM_NEWAPI_GIT_URL
+read -r -p "SQL_DSN: " SQL_DSN
+read -r -s -p "REDIS_CONN_STRING: " REDIS_CONN_STRING
+printf '\n'
+SESSION_SECRET="$(openssl rand -base64 48)"
+
+{
+  printf 'export AI_PLATFORM_NEWAPI_GIT_URL=%q\n' "$AI_PLATFORM_NEWAPI_GIT_URL"
+  printf 'export SQL_DSN=%q\n' "$SQL_DSN"
+  printf 'export REDIS_CONN_STRING=%q\n' "$REDIS_CONN_STRING"
+  printf 'export SESSION_SECRET=%q\n' "$SESSION_SECRET"
+} > ~/qingtian-proof-secrets.sh
+
+chmod 600 ~/qingtian-proof-secrets.sh
+source ~/qingtian-proof-secrets.sh
+```
+
+成功判断：
+
+```bash
+source ~/qingtian-proof-vars.sh
+source ~/qingtian-proof-secrets.sh
+
+test -n "$AI_PLATFORM_NEWAPI_GIT_URL"
+test -n "$SQL_DSN"
+test -n "$REDIS_CONN_STRING"
+test -n "$SESSION_SECRET"
+printf 'deploy vars ok\n'
+```
+
+## 2. 检查 QingTian Enclave 已运行
+
+执行：
+
+```bash
+source ~/qingtian-proof-vars.sh
+
 qt enclave query
-qt enclave query-eif --eif ~/proof-of-observation/proof-observation-qingtian.e2e.signed.eif
+qt enclave query-eif --eif "$PROOF_REPO/proof-observation-qingtian.e2e.signed.eif"
 ```
 
 期望：
 
-- `Status` 为 `Running`。
-- `LaunchMode` 为 `normal`。
-- `EnclaveCID` 为后续配置的 `TEE_PROOF_ENCLAVE_CID`，当前验证为 `4`。
-- `PCR8` 非 0，说明 signed EIF 生效。
+```text
+Status: Running
+EnclaveCID: 4
+PCR0: ce20e9...
+PCR8: 9e45f7...
+```
 
-当前已验证的一组 E2E PCR：
+如果 `qt enclave query` 返回 `[]`，先重新启动 enclave：
+
+```bash
+source ~/qingtian-proof-vars.sh
+
+qt enclave start \
+  --mem 4096 \
+  --cpus 2 \
+  --eif "$PROOF_REPO/proof-observation-qingtian.e2e.signed.eif" \
+  --cid "$ENCLAVE_CID"
+
+for i in $(seq 1 12); do
+  date
+  qt enclave query
+  sleep 5
+done
+```
+
+## 3. 安装/构建 qproxy
+
+说明：下面是真正需要执行的代理命令，不是 `vsock listen ...` 这种示意文本。
+
+qproxy 来自 Huawei QingTian SDK，官方父 VM 启动形式是：
 
 ```text
-PCR0=f2646224f07a0e6eb98c172ed41c820e90b2e4686728027e854fc6935488e1c7e490fc100ac5e6f3f8cc7cff3c5566c1
-PCR8=9e45f72e25849c5cfb6b91b2160fdde7666413ef451b54f2f0a61d06492fb72ed7b277541a8cd0e03757e44fc2f05949
+qproxy host --config=/path/to/config_qproxy.toml <enclave-cid>
 ```
 
-生产环境应替换为正式发布 manifest 中的 PCR0/PCR8。
-
-确认父 VM 支持 vsock：
+先安装 Rust 工具链和依赖。如果机器上已有 `cargo`，这一段可以跳过：
 
 ```bash
-uname -m
-lsmod | grep -E 'vsock|virtio_vsock|vhost_vsock' || true
-test -e /proc/net/vsock && cat /proc/net/vsock || true
+rustc -V || true
+cargo -V || true
+
+sudo yum install -y gcc make openssl-devel libcurl-devel libcbor-devel pkgconfig rust cargo || true
 ```
 
-如果 new-api 运行在 Docker 容器内，建议优先改为父 VM 裸进程/systemd 运行。若必须容器化，容器需要允许创建 `AF_VSOCK` socket，通常需要 `--privileged` 或至少放开 seccomp；上线前必须用真实 proof 请求验证。
+构建 qproxy：
 
-## 4. Egress vsock proxy
+```bash
+source ~/qingtian-proof-vars.sh
 
-new-api 配置的是 host 到 egress port 的映射：
+if [ ! -d "$PROOF_REPO/third_party/qingtian-sdk" ]; then
+  git clone https://gitee.com/HuaweiCloudDeveloper/huawei-qingtian.git \
+    "$PROOF_REPO/third_party/qingtian-sdk"
+fi
+
+cd "$PROOF_REPO/third_party/qingtian-sdk/qingtian-tools/qproxy"
+cargo build --release
+
+sudo install -m 0755 target/release/qproxy /usr/local/bin/qproxy
+qproxy --help
+```
+
+如果 `qingtian-tools/qproxy` 目录不存在，先定位当前 SDK checkout 的 qproxy 目录：
+
+```bash
+source ~/qingtian-proof-vars.sh
+find "$PROOF_REPO/third_party/qingtian-sdk" -maxdepth 5 \
+  \( -iname 'qproxy' -o -iname 'Cargo.toml' \) \
+  -print | head -n 80
+```
+
+## 4. 配置并启动 qproxy host
+
+创建配置文件。这里配置的是 enclave 出站访问 `api.openai.com:443` 时使用父 VM 的 vsock port `8445`：
+
+```bash
+source ~/qingtian-proof-vars.sh
+
+mkdir -p "$DEPLOY_DIR/qproxy"
+cd "$DEPLOY_DIR/qproxy"
+
+cat > config_qproxy_egress.toml <<EOF
+[[outbound_connections]]
+hostname = "$UPSTREAM_HOST"
+vsock_port = $EGRESS_VSOCK_PORT
+tcp_port = $UPSTREAM_TLS_PORT
+
+[log_location]
+host_log = "host.log"
+enclave_log = "enclave.log"
+log_level = "info"
+host_log_dir = "/var/log/qproxy"
+enclave_log_dir = "/var/log/qproxy"
+EOF
+
+sudo mkdir -p /var/log/qproxy
+sudo chown -R "$USER:$USER" /var/log/qproxy
+```
+
+先前台启动 qproxy，便于观察错误：
+
+```bash
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR/qproxy"
+
+qproxy host --config=./config_qproxy_egress.toml "$ENCLAVE_CID"
+```
+
+保持这个窗口不关。另开一个 SSH 窗口继续后续步骤。
+
+如果确认可用后想后台运行：
+
+```bash
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR/qproxy"
+
+pkill -f 'qproxy host' 2>/dev/null || true
+
+nohup qproxy host --config=./config_qproxy_egress.toml "$ENCLAVE_CID" \
+  > "$DEPLOY_DIR/qproxy/qproxy-host.out" 2>&1 &
+
+sleep 2
+pgrep -af 'qproxy host'
+tail -n 100 "$DEPLOY_DIR/qproxy/qproxy-host.out"
+tail -n 100 /var/log/qproxy/host.log 2>/dev/null || true
+```
+
+如果需要同时支持 DashScope，追加一个 outbound 段，并在 new-api 环境变量里同步加入 host/port：
+
+```toml
+[[outbound_connections]]
+hostname = "dashscope.aliyuncs.com"
+vsock_port = 8444
+tcp_port = 443
+```
+
+## 5. 准备 ai-platform-newapi 源码
+
+如果父 VM 上还没有源码，先克隆：
+
+```bash
+source ~/qingtian-proof-vars.sh
+source ~/qingtian-proof-secrets.sh
+
+if [ ! -d "$NEWAPI_REPO/.git" ]; then
+  git clone "$AI_PLATFORM_NEWAPI_GIT_URL" "$NEWAPI_REPO"
+fi
+
+cd "$NEWAPI_REPO"
+git status --short
+git rev-parse --abbrev-ref HEAD
+git rev-parse HEAD
+```
+
+确认源码包含 proof relay 代码：
+
+```bash
+cd "$NEWAPI_REPO"
+
+grep -R "TEE_PROOF_ENABLED" -n relay/proof | head
+grep -R "TryDoRequest" -n relay/channel relay/proof | head
+grep -R "/api/tee/proofs" -n router controller | head
+```
+
+期望能看到：
 
 ```text
-TEE_PROOF_EGRESS_PORTS=api.openai.com:8445,dashscope.aliyuncs.com:8444
+relay/proof/config.go
+relay/channel/api_request.go
+router/api-router.go
+controller/tee_proof.go
 ```
 
-含义不是 TCP 端口监听给客户端访问，而是：
+## 6. 从源码构建 new-api Docker 镜像
 
-- new-api 把 `egress_port` 写入发给 enclave 的 request head。
-- enclave 通过 parent CID `3` 连接父 VM 上该 vsock port。
-- 父 VM egress proxy 将这个 vsock 连接透明转发到对应上游 host 的 `443`。
-- TLS 在 enclave 内建立，父 VM egress proxy 只做字节转发。
-
-如果已有 Nitro 版 egress-vsock proxy，QingTian 版保持同一组 egress port 即可，只需确认 parent CID 为 `3`，enclave 能连回父 VM。
-
-部署时为每个允许的上游 host 启动一个 proxy 映射，例如：
+`ai-platform-newapi/Dockerfile` 使用了 BuildKit secret：
 
 ```text
-vsock listen :8445 -> tcp api.openai.com:443
-vsock listen :8444 -> tcp dashscope.aliyuncs.com:443
+RUN --mount=type=secret,id=gitkey,target=/root/.ssh/id_rsa go mod download
 ```
 
-由于不同环境使用的 proxy 工具不同，实际命令以现有 Nitro 部署中的 egress proxy 为准。建议统一纳入 systemd，例如：
+因此构建时必须开启 BuildKit，并提供能访问私有依赖的 SSH key。
 
-```ini
-# /etc/systemd/system/poo-egress-api-openai.service
-[Unit]
-Description=Proof of Observation egress proxy for api.openai.com
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Restart=always
-RestartSec=2
-User=root
-ExecStart=/usr/local/bin/<your-vsock-egress-proxy> \
-  --listen-vsock-port 8445 \
-  --target-host api.openai.com \
-  --target-port 443
-
-[Install]
-WantedBy=multi-user.target
-```
-
-启动和检查：
+确认 SSH key：
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now poo-egress-api-openai.service
-sudo systemctl status poo-egress-api-openai.service --no-pager -l
-sudo journalctl -u poo-egress-api-openai.service -n 100 --no-pager
+test -f "$HOME/.ssh/id_rsa"
+ssh -T git@code.shihuo.cn || true
 ```
 
-## 5. new-api 环境变量
-
-在父 VM 上为 new-api 增加以下环境变量：
+如果你的私有 Git 使用的不是 `~/.ssh/id_rsa`，先把本次构建使用的 key 写入变量：
 
 ```bash
-export TEE_PROOF_ENABLED=true
-export TEE_PROOF_REQUIRE=true
-export TEE_PROOF_ENCLAVE_CID=4
-export TEE_PROOF_ENCLAVE_PORT=5005
-export TEE_PROOF_EXPECTED_PCR0=f2646224f07a0e6eb98c172ed41c820e90b2e4686728027e854fc6935488e1c7e490fc100ac5e6f3f8cc7cff3c5566c1
-export TEE_PROOF_ALLOWED_HOSTS=api.openai.com
-export TEE_PROOF_EGRESS_PORTS=api.openai.com:8445
-export TEE_PROOF_TIMEOUT_SECONDS=300
-export TEE_PROOF_MAX_BODY_BYTES=67108864
-export TEE_PROOF_STORE=memory
-export TEE_PROOF_STORE_TTL_SECONDS=600
-export TEE_PROOF_STORE_MAX_ITEMS=10000
+read -r -p "Docker build SSH key path [$HOME/.ssh/id_rsa]: " DOCKER_BUILD_SSH_KEY
+DOCKER_BUILD_SSH_KEY="${DOCKER_BUILD_SSH_KEY:-$HOME/.ssh/id_rsa}"
+test -f "$DOCKER_BUILD_SSH_KEY"
+printf 'export DOCKER_BUILD_SSH_KEY=%q\n' "$DOCKER_BUILD_SSH_KEY" >> ~/qingtian-proof-secrets.sh
+source ~/qingtian-proof-secrets.sh
 ```
 
-变量说明：
-
-| 变量 | 说明 |
-|---|---|
-| `TEE_PROOF_ENABLED` | 总开关。`true` 后 OpenAI chat completions JSON endpoint 会进入 proof eligibility。 |
-| `TEE_PROOF_REQUIRE` | 建议生产 `true`。proof 不可用时 fail closed，而不是降级到普通上游请求。 |
-| `TEE_PROOF_ENCLAVE_CID` | `qt enclave query` 中的 `EnclaveCID`，当前 E2E 为 `4`。 |
-| `TEE_PROOF_ENCLAVE_PORT` | enclave control port，当前实现固定为 `5005`。 |
-| `TEE_PROOF_EXPECTED_PCR0` | 当前部署对外透出的 PCR0，用于 header/审计展示；真正 verifier 还要使用 trust config 校验 PCR0/PCR8。 |
-| `TEE_PROOF_ALLOWED_HOSTS` | 允许走 proof 的上游 host 白名单，必须和 new-api 实际上游 URL 的 hostname 完全一致。 |
-| `TEE_PROOF_EGRESS_PORTS` | host 到父 VM egress vsock port 的映射，必须覆盖所有 `TEE_PROOF_ALLOWED_HOSTS`。 |
-| `TEE_PROOF_TIMEOUT_SECONDS` | new-api 等待 enclave 完成 upstream 请求和 proof 的超时时间。 |
-| `TEE_PROOF_MAX_BODY_BYTES` | 允许送入 enclave 的最大请求体大小。 |
-| `TEE_PROOF_STORE` | 当前代码只支持 `memory`。 |
-| `TEE_PROOF_STORE_TTL_SECONDS` | 非流式 proof id 查询的内存保留时间。 |
-| `TEE_PROOF_STORE_MAX_ITEMS` | 非流式 proof 内存 store 最大条数。 |
-
-多上游示例：
+构建镜像：
 
 ```bash
-export TEE_PROOF_ALLOWED_HOSTS=api.openai.com,dashscope.aliyuncs.com
-export TEE_PROOF_EGRESS_PORTS=api.openai.com:8445,dashscope.aliyuncs.com:8444
+source ~/qingtian-proof-vars.sh
+source ~/qingtian-proof-secrets.sh
+cd "$NEWAPI_REPO"
+
+export DOCKER_BUILDKIT=1
+
+docker build \
+  --secret id=gitkey,src="${DOCKER_BUILD_SSH_KEY:-$HOME/.ssh/id_rsa}" \
+  -f Dockerfile \
+  -t "$NEW_API_IMAGE" \
+  .
 ```
 
-## 6. new-api 渠道配置要求
-
-用于 proof 的渠道需要满足：
-
-- relay format 为 OpenAI。
-- endpoint 为 `/v1/chat/completions`。
-- 请求方法为 `POST`。
-- 请求 `Content-Type` 包含 `application/json`。
-- 请求体有明确 `Content-Length`，且大小不超过 `TEE_PROOF_MAX_BODY_BYTES`。
-- 上游 hostname 在 `TEE_PROOF_ALLOWED_HOSTS` 中。
-- 该 hostname 在 `TEE_PROOF_EGRESS_PORTS` 有映射。
-- 渠道不要开启会改写响应字节的设置：
-  - `ForceFormat=false`
-  - `ThinkingToContent=false`
-
-如果这些条件不满足：
-
-- `TEE_PROOF_REQUIRE=true` 或默认 proof-required 场景下会返回错误。
-- 非 required 场景下可能降级普通请求，但生产不建议依赖降级。
-
-## 7. systemd 方式部署 new-api
-
-推荐在 QingTian 父 VM 上用 systemd 直接运行 new-api，避免 Docker seccomp 对 `AF_VSOCK` 的影响。
-
-示例环境文件：
+如果当前用户没有 Docker 权限，用 `sudo -E docker build ...` 重试。构建成功后检查：
 
 ```bash
-sudo tee /etc/new-api-proof.env >/dev/null <<'EOF'
+docker image inspect "$NEW_API_IMAGE" --format '{{.Id}} {{.RepoTags}}'
+```
+
+## 7. 创建 new-api proof 环境文件
+
+创建部署目录：
+
+```bash
+source ~/qingtian-proof-vars.sh
+
+mkdir -p "$DEPLOY_DIR/data" "$DEPLOY_DIR/logs"
+cd "$DEPLOY_DIR"
+```
+
+配置说明：
+
+| 配置项 | 来源 | 说明 |
+|---|---|---|
+| `SESSION_SECRET` | `~/qingtian-proof-secrets.sh` | 多节点必须一致；本文自动随机生成。 |
+| `SQL_DSN` | `~/qingtian-proof-secrets.sh` | 生产库连接串；如果接入已有 new-api，必须使用同一个库。 |
+| `REDIS_CONN_STRING` | `~/qingtian-proof-secrets.sh` | 生产 Redis；多实例建议必填。 |
+| `TEE_PROOF_ENCLAVE_CID` | `~/qingtian-proof-vars.sh` | 必须等于 `qt enclave query` 的 `EnclaveCID`。 |
+| `TEE_PROOF_EGRESS_PORTS` | `~/qingtian-proof-vars.sh` | 必须和 qproxy `outbound_connections` 一一对应。 |
+
+执行下面命令生成 Docker `--env-file`：
+
+```bash
+source ~/qingtian-proof-vars.sh
+source ~/qingtian-proof-secrets.sh
+cd "$DEPLOY_DIR"
+
+cat > qingtian-proof.env <<EOF
+READ_CONFIG=false
 TZ=Asia/Shanghai
-SESSION_SECRET=<replace-with-production-secret>
-SQL_DSN=<replace-with-production-sql-dsn>
-REDIS_CONN_STRING=<replace-with-production-redis>
 NODE_NAME=new-api-qingtian-proof-01
+PORT=$NEW_API_PORT
+SESSION_SECRET=$SESSION_SECRET
+SQL_DSN=$SQL_DSN
+REDIS_CONN_STRING=$REDIS_CONN_STRING
 
 TEE_PROOF_ENABLED=true
 TEE_PROOF_REQUIRE=true
-TEE_PROOF_ENCLAVE_CID=4
-TEE_PROOF_ENCLAVE_PORT=5005
-TEE_PROOF_EXPECTED_PCR0=f2646224f07a0e6eb98c172ed41c820e90b2e4686728027e854fc6935488e1c7e490fc100ac5e6f3f8cc7cff3c5566c1
-TEE_PROOF_ALLOWED_HOSTS=api.openai.com
-TEE_PROOF_EGRESS_PORTS=api.openai.com:8445
+TEE_PROOF_ENCLAVE_CID=$ENCLAVE_CID
+TEE_PROOF_ENCLAVE_PORT=$ENCLAVE_PORT
+TEE_PROOF_EXPECTED_PCR0=$QINGTIAN_PCR0
+TEE_PROOF_ALLOWED_HOSTS=$UPSTREAM_HOST
+TEE_PROOF_EGRESS_PORTS=$UPSTREAM_HOST:$EGRESS_VSOCK_PORT
 TEE_PROOF_TIMEOUT_SECONDS=300
 TEE_PROOF_MAX_BODY_BYTES=67108864
 TEE_PROOF_STORE=memory
@@ -237,114 +405,149 @@ TEE_PROOF_STORE_TTL_SECONDS=600
 TEE_PROOF_STORE_MAX_ITEMS=10000
 EOF
 
-sudo chmod 600 /etc/new-api-proof.env
+chmod 600 qingtian-proof.env
+sed -E \
+  -e 's/^(SESSION_SECRET=).*/\1***masked***/' \
+  -e 's/^(SQL_DSN=).*/\1***masked***/' \
+  -e 's/^(REDIS_CONN_STRING=).*/\1***masked***/' \
+  qingtian-proof.env
 ```
 
-示例 service：
+注意：如果 `SQL_DSN` / `REDIS_CONN_STRING` 里包含 `#`、空格或特殊字符，Docker `--env-file` 可能解析异常，建议改用 `docker compose` 的 `env_file` 或在 systemd 中引用环境文件。
+
+## 8. Docker 运行 new-api proof relay
+
+new-api 容器需要创建 Linux `AF_VSOCK` socket 连接 enclave。最稳的验证方式是先用 `--network host --privileged` 启动。
 
 ```bash
-sudo tee /etc/systemd/system/new-api-proof.service >/dev/null <<'EOF'
-[Unit]
-Description=new-api proof relay for QingTian Enclave
-After=network-online.target
-Wants=network-online.target
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR"
 
-[Service]
-Type=simple
-User=ansible
-WorkingDirectory=/home/ansible/ai-platform-newapi
-EnvironmentFile=/etc/new-api-proof.env
-ExecStart=/home/ansible/ai-platform-newapi/new-api --log-dir /home/ansible/ai-platform-newapi/logs
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
+docker rm -f "$NEW_API_CONTAINER" 2>/dev/null || true
 
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now new-api-proof.service
-sudo systemctl status new-api-proof.service --no-pager -l
-sudo journalctl -u new-api-proof.service -n 100 --no-pager
-```
-
-如使用仓库内已有 `new-api.service`，只需要把 `EnvironmentFile=/etc/new-api-proof.env` 和实际 `ExecStart` 路径合并进去。
-
-## 8. Docker 方式部署 new-api
-
-如果必须用 Docker，推荐使用 host 网络并放开 seccomp/权限后再验证 vsock：
-
-```bash
-docker run -d --name new-api-proof \
+docker run -d \
+  --name "$NEW_API_CONTAINER" \
   --restart always \
   --network host \
   --privileged \
-  -v "$PWD/data:/data" \
-  -v "$PWD/logs:/app/logs" \
-  --env-file /etc/new-api-proof.env \
-  <your-new-api-image> \
+  --env-file "$DEPLOY_DIR/qingtian-proof.env" \
+  -v "$DEPLOY_DIR/data:/data" \
+  -v "$DEPLOY_DIR/logs:/app/logs" \
+  "$NEW_API_IMAGE" \
   --log-dir /app/logs
+
+sleep 3
+docker ps --filter "name=$NEW_API_CONTAINER"
+docker logs --tail 120 "$NEW_API_CONTAINER"
+curl -sS "http://127.0.0.1:$NEW_API_PORT/health" || true
 ```
 
-更收敛的容器权限可以在真实机器上逐步验证，但最小验收标准是 proof 请求能通过 enclave，不能只看 HTTP 普通请求成功。
+如果你必须使用 Compose，生成一个单独的部署文件，不修改 `ai-platform-newapi` 仓库：
 
-如果使用 `docker-compose.yml`，核心配置是：
+```bash
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR"
 
-```yaml
+cat > docker-compose.qingtian-proof.yml <<EOF
+version: "3.4"
+
 services:
-  new-api:
+  new-api-proof:
+    image: $NEW_API_IMAGE
+    container_name: $NEW_API_CONTAINER
+    restart: always
     network_mode: host
     privileged: true
+    command: --log-dir /app/logs
     env_file:
-      - /etc/new-api-proof.env
+      - ./qingtian-proof.env
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:$NEW_API_PORT/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+EOF
+
+docker compose -f docker-compose.qingtian-proof.yml up -d
 ```
 
-注意：`network_mode: host` 与 compose 中的 `ports`、自定义 bridge network 通常不能同时使用，需要按实际部署文件调整。
-
-## 9. 启动顺序
-
-建议顺序：
-
-1. 启动父 VM egress proxy。
-2. 启动 QingTian enclave。
-3. 确认 `qt enclave query` 为 `Running`。
-4. 启动 new-api proof relay。
-5. 发起 `X-TEE-Proof: required` 测试请求。
-6. 保存完整 SSE / multipart 响应并用 verifier 验证。
-
-检查命令：
+如果系统只有旧版 `docker-compose`：
 
 ```bash
-qt enclave query
-sudo systemctl status poo-egress-api-openai.service --no-pager -l
-sudo systemctl status new-api-proof.service --no-pager -l
-sudo journalctl -u new-api-proof.service -n 100 --no-pager
+docker-compose -f docker-compose.qingtian-proof.yml up -d
 ```
 
-## 10. 业务请求验证
+## 9. 配置 new-api 渠道和 Token
 
-以下示例假设 new-api 监听 `http://127.0.0.1:7070`，token 为 `<NEW_API_TOKEN>`，模型为 `<MODEL>`。
+这一节是控制台配置说明，不是 shell 命令。
 
-### 10.1 非流式 multipart
+用于 proof 的渠道需要满足：
+
+- relay format 为 OpenAI。
+- 客户端请求 endpoint 为 `/v1/chat/completions`。
+- 上游 URL 的 hostname 必须等于 `TEE_PROOF_ALLOWED_HOSTS` 中的值，例如 `api.openai.com`。
+- 渠道不要开启会改写响应字节的设置：
+  - `ForceFormat=false`
+  - `ThinkingToContent=false`
+- 请求 `Content-Type` 必须是 JSON。
+- 请求体必须有明确 `Content-Length`。
+
+如果是新数据库，需要在 new-api 管理后台创建：
+
+- 可用用户或测试 token。
+- 指向 `$UPSTREAM_HOST` 的 OpenAI-format 渠道。
+- 可路由到该渠道的模型名，例如 `<MODEL>`。
+
+后续命令用：
 
 ```bash
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR"
+
+read -r -s -p "NEW_API_TOKEN: " NEW_API_TOKEN
+printf '\n'
+read -r -p "MODEL: " MODEL
+
+{
+  printf 'export NEW_API_TOKEN=%q\n' "$NEW_API_TOKEN"
+  printf 'export MODEL=%q\n' "$MODEL"
+} > "$DEPLOY_DIR/qingtian-proof-test-vars.sh"
+
+chmod 600 "$DEPLOY_DIR/qingtian-proof-test-vars.sh"
+source "$DEPLOY_DIR/qingtian-proof-test-vars.sh"
+```
+
+## 10. 发起非流式 proof 请求
+
+执行：
+
+```bash
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR"
+
+source "$DEPLOY_DIR/qingtian-proof-test-vars.sh"
+
 curl -sS -D headers.qingtian.nonstream.txt \
-  http://127.0.0.1:7070/v1/chat/completions \
-  -H "Authorization: Bearer <NEW_API_TOKEN>" \
+  "http://127.0.0.1:$NEW_API_PORT/v1/chat/completions" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-TEE-Proof: required" \
-  -d '{
-    "model": "<MODEL>",
-    "messages": [{"role": "user", "content": "Say hello from QingTian proof non-stream"}],
-    "stream": false
-  }' \
+  -d "{
+    \"model\": \"$MODEL\",
+    \"messages\": [{\"role\": \"user\", \"content\": \"Say hello from QingTian proof non-stream\"}],
+    \"stream\": false
+  }" \
   -o response.qingtian.nonstream.multipart
 ```
 
-检查：
+检查响应：
 
 ```bash
+cd "$DEPLOY_DIR"
+
 cat headers.qingtian.nonstream.txt
 grep -i '^content-type:' headers.qingtian.nonstream.txt
 grep -i '^x-tee-proof-' headers.qingtian.nonstream.txt
@@ -353,40 +556,56 @@ grep -a '"profile":"qingtian"' response.qingtian.nonstream.multipart
 
 期望：
 
-- `Content-Type` 为 `multipart/mixed; boundary=...`。
-- header 包含 `X-TEE-Proof-Id`、`X-TEE-Proof-Version: 2`、`X-TEE-Proof-PCR0`、`X-TEE-Proof-Upstream-Host`。
-- body 中第二段包含 `"profile":"qingtian"`。
+```text
+Content-Type: multipart/mixed; boundary=...
+X-TEE-Proof-Id: ...
+X-TEE-Proof-Version: 2
+X-TEE-Proof-PCR0: ce20e9...
+X-TEE-Proof-Upstream-Host: api.openai.com
+```
 
-如需验证 proof 查询接口：
+验证 proof sidecar 查询接口：
 
 ```bash
+cd "$DEPLOY_DIR"
+
 PROOF_ID="$(awk 'BEGIN{IGNORECASE=1} /^X-TEE-Proof-Id:/ {gsub("\r","",$2); print $2}' headers.qingtian.nonstream.txt)"
+
 curl -sS \
-  "http://127.0.0.1:7070/api/tee/proofs/${PROOF_ID}" \
-  -H "Authorization: Bearer <NEW_API_TOKEN>" \
+  "http://127.0.0.1:$NEW_API_PORT/api/tee/proofs/${PROOF_ID}" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
   | tee proof-sidecar.qingtian.json
 ```
 
-### 10.2 流式 SSE
+## 11. 发起流式 SSE proof 请求
+
+执行：
 
 ```bash
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR"
+
+source "$DEPLOY_DIR/qingtian-proof-test-vars.sh"
+
 curl -N -sS -D headers.qingtian.stream.txt \
-  http://127.0.0.1:7070/v1/chat/completions \
-  -H "Authorization: Bearer <NEW_API_TOKEN>" \
+  "http://127.0.0.1:$NEW_API_PORT/v1/chat/completions" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-TEE-Proof: required" \
-  -d '{
-    "model": "<MODEL>",
-    "messages": [{"role": "user", "content": "Say hello from QingTian proof stream"}],
-    "stream": true,
-    "stream_options": {"include_usage": true}
-  }' \
+  -d "{
+    \"model\": \"$MODEL\",
+    \"messages\": [{\"role\": \"user\", \"content\": \"Say hello from QingTian proof stream\"}],
+    \"stream\": true,
+    \"stream_options\": {\"include_usage\": true}
+  }" \
   -o response.qingtian.stream.sse
 ```
 
-检查：
+检查响应：
 
 ```bash
+cd "$DEPLOY_DIR"
+
 cat headers.qingtian.stream.txt
 grep -i '^x-tee-proof-' headers.qingtian.stream.txt
 grep -a 'event: tee.proof' response.qingtian.stream.sse | tail -n 2
@@ -395,23 +614,24 @@ grep -a '"profile":"qingtian"' response.qingtian.stream.sse
 
 期望：
 
-- 流式响应 header 不暴露 `X-TEE-Proof-Id`。
+- 流式响应 header 不包含 `X-TEE-Proof-Id`。
 - SSE body 末尾包含 `event: tee.proof`。
 - proof JSON 包含 `"profile":"qingtian"`。
 
-## 11. verifier 验证
+## 12. 生成 QingTian trust config
 
-在 `proof-of-observation` 仓库中生成 trust config：
+执行：
 
 ```bash
-cd ~/proof-of-observation
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR"
 
-cat > qingtian-trust.e2e.json <<'EOF'
+cat > qingtian-trust.e2e.json <<EOF
 {
   "profile": "qingtian",
   "expectedPcrs": {
-    "sha384:0": "f2646224f07a0e6eb98c172ed41c820e90b2e4686728027e854fc6935488e1c7e490fc100ac5e6f3f8cc7cff3c5566c1",
-    "sha384:8": "9e45f72e25849c5cfb6b91b2160fdde7666413ef451b54f2f0a61d06492fb72ed7b277541a8cd0e03757e44fc2f05949"
+    "sha384:0": "$QINGTIAN_PCR0",
+    "sha384:8": "$QINGTIAN_PCR8"
   },
   "platformTrust": {
     "mode": "cert-chain",
@@ -427,26 +647,44 @@ cat > qingtian-trust.e2e.json <<'EOF'
   }
 }
 EOF
+
+cat qingtian-trust.e2e.json
+```
+
+## 13. 使用 Node CLI verifier 验证响应
+
+安装 verifier 依赖：
+
+```bash
+source ~/qingtian-proof-vars.sh
+cd "$PROOF_REPO/verifier"
+npm ci
 ```
 
 验证非流式 multipart：
 
 ```bash
-cd ~/proof-of-observation/verifier
-npm ci
-npx tsx tee-verify-stream.ts ../response.qingtian.nonstream.multipart \
-  --trust ../qingtian-trust.e2e.json \
-  --host api.openai.com \
-  | tee ../verify-qingtian-new-api-nonstream.log
+source ~/qingtian-proof-vars.sh
+cd "$PROOF_REPO/verifier"
+
+npx tsx tee-verify-stream.ts \
+  "$DEPLOY_DIR/response.qingtian.nonstream.multipart" \
+  --trust "$DEPLOY_DIR/qingtian-trust.e2e.json" \
+  --host "$UPSTREAM_HOST" \
+  | tee "$DEPLOY_DIR/verify-qingtian-new-api-nonstream.log"
 ```
 
 验证流式 SSE：
 
 ```bash
-npx tsx tee-verify-stream.ts ../response.qingtian.stream.sse \
-  --trust ../qingtian-trust.e2e.json \
-  --host api.openai.com \
-  | tee ../verify-qingtian-new-api-stream.log
+source ~/qingtian-proof-vars.sh
+cd "$PROOF_REPO/verifier"
+
+npx tsx tee-verify-stream.ts \
+  "$DEPLOY_DIR/response.qingtian.stream.sse" \
+  --trust "$DEPLOY_DIR/qingtian-trust.e2e.json" \
+  --host "$UPSTREAM_HOST" \
+  | tee "$DEPLOY_DIR/verify-qingtian-new-api-stream.log"
 ```
 
 通过标准：
@@ -461,83 +699,231 @@ npx tsx tee-verify-stream.ts ../response.qingtian.stream.sse \
 - v2 statement Ed25519 签名通过。
 - `--host` 指定的上游 host 与 proof 中签名覆盖的 host 一致。
 
-## 12. 发布前检查清单
+## 14. 停止和重启
 
-发布前逐项确认：
+停止 new-api Docker：
 
-- `qt enclave query` 显示 `Status: Running`、`LaunchMode: normal`。
+```bash
+source ~/qingtian-proof-vars.sh
+docker rm -f "$NEW_API_CONTAINER"
+```
+
+停止 qproxy：
+
+```bash
+pkill -f 'qproxy host' 2>/dev/null || true
+```
+
+停止 enclave：
+
+```bash
+qt enclave stop --enclave-id 0
+qt enclave query
+```
+
+重启顺序：
+
+```bash
+source ~/qingtian-proof-vars.sh
+
+qt enclave start \
+  --mem 4096 \
+  --cpus 2 \
+  --eif "$PROOF_REPO/proof-observation-qingtian.e2e.signed.eif" \
+  --cid "$ENCLAVE_CID"
+
+cd "$DEPLOY_DIR/qproxy"
+nohup qproxy host --config=./config_qproxy_egress.toml "$ENCLAVE_CID" \
+  > "$DEPLOY_DIR/qproxy/qproxy-host.out" 2>&1 &
+
+docker start "$NEW_API_CONTAINER"
+```
+
+## 15. 常见错误排查
+
+### 15.1 `vsock: command not found`
+
+`vsock listen :8445 -> tcp api.openai.com:443` 是映射说明，不是命令。实际命令是：
+
+```bash
+qproxy host --config=./config_qproxy_egress.toml 4
+```
+
+### 15.2 `TEE proof required but request is not eligible: upstream host not allowed`
+
+new-api 实际上游 URL 的 hostname 不在 `TEE_PROOF_ALLOWED_HOSTS`。检查 new-api 日志中的 `fullRequestURL`：
+
+```bash
+source ~/qingtian-proof-vars.sh
+docker logs "$NEW_API_CONTAINER" 2>&1 | grep 'fullRequestURL' | tail -n 20
+grep -R "fullRequestURL" -n "$DEPLOY_DIR/logs" | tail -n 20 || true
+```
+
+把真实 hostname 写入变量文件。下面命令会追加一个新上游，并同步更新 new-api env 文件；端口需要和 qproxy 中新增的 `vsock_port` 一致：
+
+```bash
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR"
+
+read -r -p "Actual upstream host: " ACTUAL_UPSTREAM_HOST
+read -r -p "Actual upstream egress vsock port: " ACTUAL_EGRESS_VSOCK_PORT
+
+{
+  printf 'export ACTUAL_UPSTREAM_HOST=%q\n' "$ACTUAL_UPSTREAM_HOST"
+  printf 'export ACTUAL_EGRESS_VSOCK_PORT=%q\n' "$ACTUAL_EGRESS_VSOCK_PORT"
+} >> "$DEPLOY_DIR/qingtian-proof-test-vars.sh"
+
+cp qingtian-proof.env "qingtian-proof.env.$(date +%Y%m%d%H%M%S).bak"
+
+python3 - "$ACTUAL_UPSTREAM_HOST" "$ACTUAL_EGRESS_VSOCK_PORT" <<'PY'
+import pathlib
+import sys
+
+host = sys.argv[1].strip()
+port = sys.argv[2].strip()
+path = pathlib.Path("qingtian-proof.env")
+lines = path.read_text().splitlines()
+
+def append_csv(current: str, item: str) -> str:
+    values = [v.strip() for v in current.split(",") if v.strip()]
+    if item not in values:
+        values.append(item)
+    return ",".join(values)
+
+out = []
+for line in lines:
+    if line.startswith("TEE_PROOF_ALLOWED_HOSTS="):
+        out.append("TEE_PROOF_ALLOWED_HOSTS=" + append_csv(line.split("=", 1)[1], host))
+    elif line.startswith("TEE_PROOF_EGRESS_PORTS="):
+        out.append("TEE_PROOF_EGRESS_PORTS=" + append_csv(line.split("=", 1)[1], f"{host}:{port}"))
+    else:
+        out.append(line)
+path.write_text("\n".join(out) + "\n")
+PY
+
+grep '^TEE_PROOF_ALLOWED_HOSTS=\|^TEE_PROOF_EGRESS_PORTS=' qingtian-proof.env
+```
+
+同时在 `config_qproxy_egress.toml` 增加对应 `[[outbound_connections]]`：
+
+```bash
+source ~/qingtian-proof-vars.sh
+source "$DEPLOY_DIR/qingtian-proof-test-vars.sh"
+cd "$DEPLOY_DIR/qproxy"
+
+cat >> config_qproxy_egress.toml <<EOF
+
+[[outbound_connections]]
+hostname = "$ACTUAL_UPSTREAM_HOST"
+vsock_port = $ACTUAL_EGRESS_VSOCK_PORT
+tcp_port = 443
+EOF
+
+tail -n 20 config_qproxy_egress.toml
+```
+
+修改后重启 qproxy 和 new-api 容器：
+
+```bash
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR/qproxy"
+
+pkill -f 'qproxy host' 2>/dev/null || true
+nohup qproxy host --config=./config_qproxy_egress.toml "$ENCLAVE_CID" \
+  > "$DEPLOY_DIR/qproxy/qproxy-host.out" 2>&1 &
+
+docker rm -f "$NEW_API_CONTAINER"
+docker run -d \
+  --name "$NEW_API_CONTAINER" \
+  --restart always \
+  --network host \
+  --privileged \
+  --env-file "$DEPLOY_DIR/qingtian-proof.env" \
+  -v "$DEPLOY_DIR/data:/data" \
+  -v "$DEPLOY_DIR/logs:/app/logs" \
+  "$NEW_API_IMAGE" \
+  --log-dir /app/logs
+```
+
+### 15.3 `TEE proof required but request is not eligible: egress port missing`
+
+host 在白名单，但 `TEE_PROOF_EGRESS_PORTS` 没有对应映射。补齐 `host:vsock_port`，并重启 new-api 容器。
+
+### 15.4 `force format may rewrite response` / `thinking_to_content may rewrite response`
+
+该渠道开启了会改写响应的设置。proof 要证明客户端收到的 body 与 enclave 观察到的 body 字节一致，父 VM 不能二次改写。关闭相关渠道设置，或新建专用 proof 渠道。
+
+### 15.5 new-api Docker 连接 enclave 失败
+
+检查 enclave：
+
+```bash
+qt enclave query
+```
+
+检查容器权限和环境变量：
+
+```bash
+source ~/qingtian-proof-vars.sh
+docker inspect "$NEW_API_CONTAINER" --format '{{json .HostConfig.NetworkMode}} {{json .HostConfig.Privileged}}'
+docker exec "$NEW_API_CONTAINER" env | grep '^TEE_PROOF_'
+docker logs --tail 200 "$NEW_API_CONTAINER"
+```
+
+如果裸进程可用但 Docker 不可用，通常是容器 seccomp/capability 阻止了 `AF_VSOCK`。先使用本文的 `--network host --privileged` 配置验证。
+
+### 15.6 qproxy 没有转发成功
+
+检查 qproxy 进程和日志：
+
+```bash
+source ~/qingtian-proof-vars.sh
+pgrep -af 'qproxy host'
+tail -n 200 "$DEPLOY_DIR/qproxy/qproxy-host.out" 2>/dev/null || true
+tail -n 200 /var/log/qproxy/host.log 2>/dev/null || true
+```
+
+检查父 VM 能访问上游：
+
+```bash
+source ~/qingtian-proof-vars.sh
+curl -Iv "https://$UPSTREAM_HOST" --connect-timeout 10
+```
+
+### 15.7 verifier 报 PCR 不匹配
+
+重新获取当前 EIF PCR：
+
+```bash
+source ~/qingtian-proof-vars.sh
+qt enclave query-eif --eif "$PROOF_REPO/proof-observation-qingtian.e2e.signed.eif"
+```
+
+如果 PCR0 改了，说明 enclave 镜像内容变了，必须更新发布 manifest 和 trust config。生产环境只允许信任正式发布 manifest 中的 PCR。
+
+## 16. 发布前检查清单
+
+执行检查：
+
+```bash
+source ~/qingtian-proof-vars.sh
+
+qt enclave query
+qt enclave query-eif --eif "$PROOF_REPO/proof-observation-qingtian.e2e.signed.eif"
+pgrep -af 'qproxy host'
+docker ps --filter "name=$NEW_API_CONTAINER"
+docker logs --tail 80 "$NEW_API_CONTAINER"
+```
+
+人工确认：
+
+- `qt enclave query` 显示 `Status=Running`、`LaunchMode=normal`。
 - Signed EIF 的 `PCR8` 非 0。
 - `TEE_PROOF_ENCLAVE_CID` 等于 `qt enclave query` 的 `EnclaveCID`。
 - `TEE_PROOF_ENCLAVE_PORT=5005`。
 - `TEE_PROOF_ALLOWED_HOSTS` 覆盖所有 proof 业务上游 host。
 - `TEE_PROOF_EGRESS_PORTS` 对每个 allowed host 都有映射。
-- 父 VM egress proxy 已启动，且端口映射到正确上游 `host:443`。
+- qproxy `outbound_connections` 对每个 allowed host 都有映射。
 - proof 渠道关闭会改写响应字节的 channel setting。
-- new-api 和 egress proxy 都纳入 systemd/容器重启策略。
 - 非流式和流式各保存一份完整响应并通过 Node CLI verifier。
-- 发布材料记录 source revision、QingTian SDK revision、EIF sha256、PCR0、PCR8、签名证书指纹和 trust config。
-
-## 13. 常见问题
-
-### 13.1 `TEE proof required but request is not eligible: upstream host not allowed`
-
-说明 new-api 实际上游 URL 的 hostname 不在 `TEE_PROOF_ALLOWED_HOSTS`。检查渠道上游地址：
-
-```bash
-grep -n "fullRequestURL" logs/*.log | tail -n 20
-```
-
-将真实 hostname 加入：
-
-```bash
-export TEE_PROOF_ALLOWED_HOSTS=api.openai.com,<actual-host>
-export TEE_PROOF_EGRESS_PORTS=api.openai.com:8445,<actual-host>:<egress-port>
-```
-
-同时启动对应 egress proxy。
-
-### 13.2 `TEE proof required but request is not eligible: egress port missing`
-
-说明 host 在白名单，但 `TEE_PROOF_EGRESS_PORTS` 没有对应映射。补齐 `host:port`。
-
-### 13.3 `TEE proof required but request is not eligible: force format may rewrite response`
-
-该渠道开启了会改写响应的 `ForceFormat`。proof 要证明客户端收到的 body 与 enclave 观察到的 body 字节一致，不能在父 VM 上二次改写。关闭该渠道设置或使用专用 proof 渠道。
-
-### 13.4 `TEE proof required but request is not eligible: thinking_to_content may rewrite response`
-
-同上，`ThinkingToContent` 会改写响应结构，关闭该设置。
-
-### 13.5 vsock 连接 enclave 失败
-
-检查：
-
-```bash
-qt enclave query
-grep -E '^TEE_PROOF_ENCLAVE_' /etc/new-api-proof.env
-sudo journalctl -u new-api-proof.service -n 100 --no-pager
-```
-
-如果 new-api 在 Docker 中运行，优先用 systemd 裸进程复测；若裸进程可用、容器不可用，说明容器权限/seccomp 阻止了 `AF_VSOCK`。
-
-### 13.6 响应里没有 `tee.proof`
-
-检查：
-
-- 请求是否命中 `/v1/chat/completions`。
-- 请求是否是 `Content-Type: application/json`。
-- 是否设置 `X-TEE-Proof: required`。
-- new-api 日志里是否有 `TEE proof` 错误。
-- enclave 是否仍在运行。
-- egress proxy 是否能连接上游。
-
-### 13.7 verifier 报 PCR 不匹配
-
-说明 trust config 中 PCR0/PCR8 与当前 signed EIF 不一致。重新获取：
-
-```bash
-qt enclave query-eif --eif ~/proof-of-observation/proof-observation-qingtian.e2e.signed.eif
-```
-
-生产环境只允许使用发布 manifest 中的 PCR，不要临时信任现场未知 PCR。
-
+- 发布材料记录 `ai-platform-newapi` revision、`proof-of-observation` revision、QingTian SDK revision、EIF sha256、PCR0、PCR8、签名证书指纹和 trust config。
