@@ -31,6 +31,16 @@ fi
 
 cd "$REPO_ROOT"
 
+: "${QINGTIAN_QT_DOCKER_CONFIG:=$REPO_ROOT/.tmp/qingtian-qt-docker-config}"
+mkdir -p "$QINGTIAN_QT_DOCKER_CONFIG"
+if [ ! -f "$QINGTIAN_QT_DOCKER_CONFIG/config.json" ]; then
+  printf '{"auths":{}}\n' > "$QINGTIAN_QT_DOCKER_CONFIG/config.json"
+fi
+
+qt_cmd() {
+  DOCKER_CONFIG="$QINGTIAN_QT_DOCKER_CONFIG" qt "$@"
+}
+
 if [ ! -f "$QTSM_SDK_DIR/enclave/qtsm/lib/Makefile" ]; then
   echo "missing QTSM SDK at $QTSM_SDK_DIR/enclave/qtsm/lib/Makefile" >&2
   echo "clone or copy Huawei QingTian SDK, then set QTSM_SDK_DIR in $ENV_FILE" >&2
@@ -69,8 +79,8 @@ if [ -n "${QINGTIAN_PRIVATE_KEY:-}" ] || [ -n "${QINGTIAN_SIGNING_CERTIFICATE:-}
   make_img_args+=(--private-key "$QINGTIAN_PRIVATE_KEY" --signing-certificate "$QINGTIAN_SIGNING_CERTIFICATE")
 fi
 
-qt "${make_img_args[@]}"
-qt enclave query-eif --eif "$QINGTIAN_EIF"
+qt_cmd "${make_img_args[@]}"
+qt_cmd enclave query-eif --eif "$QINGTIAN_EIF"
 
 start_args=(
   enclave start
@@ -87,5 +97,5 @@ if [ -n "$QINGTIAN_START_EXTRA_ARGS" ]; then
   start_args+=("${extra_args[@]}")
 fi
 
-qt "${start_args[@]}"
-qt enclave query
+qt_cmd "${start_args[@]}"
+qt_cmd enclave query

@@ -83,6 +83,7 @@ APT_MIRROR=http://repo.huaweicloud.com/debian
 CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/
 QINGTIAN_PRIVATE_KEY=private-key.pem
 QINGTIAN_SIGNING_CERTIFICATE=server.pem
+QINGTIAN_QT_DOCKER_CONFIG=
 QINGTIAN_START_EXTRA_ARGS=
 EOF
 
