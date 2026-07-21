@@ -117,6 +117,10 @@ QINGTIAN_CID=4
 QINGTIAN_CPUS=2
 QINGTIAN_MEM=4096
 QINGTIAN_PARENT_CIDS=3
+QINGTIAN_EGRESS_MODE=qproxy
+QINGTIAN_QPROXY_ENABLED=1
+QINGTIAN_QPROXY_PARENT_CID=3
+QINGTIAN_QPROXY_EGRESS_PORTS=8444,8445
 QTSM_SDK_DIR=third_party/qingtian-sdk
 APT_MIRROR=http://repo.huaweicloud.com/debian
 CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/
@@ -127,6 +131,8 @@ EOF
 ```
 
 `QINGTIAN_PARENT_CIDS` 会被写入 EIF 环境变量并影响 `PCR0`。生产发布时必须固定并记录。
+
+`QINGTIAN_EGRESS_MODE=qproxy` 是 QingTian 正式出网模式。运行镜像会先启动 Huawei 官方 `qproxy enclave`，再启动 `/attest`。父 VM 必须同时启动 `qproxy host`，并为每个上游端口启动 parent-local TCP mapper；详细步骤见 [`qingtian-new-api-parent-relay-deployment.md`](qingtian-new-api-parent-relay-deployment.md) 第 4 节。
 
 `APT_MIRROR` 建议在 QingTian ECS 上使用 HTTP。`debian:bookworm-slim` 初始没有 CA 证书，若第一轮 `apt-get update` 使用 HTTPS 镜像，可能出现 `No system certificates available` / `Certificate verification failed`，导致 `ca-certificates` 自身也安装不上。APT 仍会校验 Debian Release 签名。
 
@@ -209,14 +215,14 @@ export TEE_PROOF_REQUIRE=true
 export TEE_PROOF_ENCLAVE_CID=4
 export TEE_PROOF_ENCLAVE_PORT=5005
 export TEE_PROOF_EXPECTED_PCR0=<PCR0_FROM_QUERY_EIF>
-export TEE_PROOF_ALLOWED_HOSTS=api.openai.com
-export TEE_PROOF_EGRESS_PORTS=api.openai.com:8445
+export TEE_PROOF_ALLOWED_HOSTS=dashscope.aliyuncs.com,api.openai.com
+export TEE_PROOF_EGRESS_PORTS=dashscope.aliyuncs.com:8444,api.openai.com:8445
 export TEE_PROOF_TIMEOUT_SECONDS=300
 export TEE_PROOF_MAX_BODY_BYTES=67108864
 export TEE_PROOF_STORE=memory
 ```
 
-如果现有 relay 有 egress-vsock proxy 配置，保持 Nitro 版相同端口即可。enclave 会根据 request head 中的 `egress_port` 连接父虚机，默认 parent CID 为 `3`。
+qproxy 模式下，relay 仍然只把 `egress_port` 写入 request head；enclave 内 `/attest` 会连接本地 `127.0.0.1:<egress_port>`，由 `qproxy enclave` 转到父 VM 的 `qproxy host`。接入过 Nitro 的中转站不需要改变 proof wire 协议，只需要把 host 到 egress port 的映射配置为 QingTian 现场使用的端口。
 
 ## 9. 发真实业务请求并保存完整响应
 

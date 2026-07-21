@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use attest::tls_profile::{CertPolicy, ExtOrder, GreasePolicy, TlsProfile, TlsVersion};
-use btls::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode, SslVersion};
+use btls::ssl::{HandshakeError, SslConnector, SslMethod, SslStream, SslVerifyMode, SslVersion};
 use btls::x509::X509;
-use vsock::VsockStream;
+use std::io::{Read, Write};
 
-pub fn connect(
+pub fn connect<S: Read + Write>(
     profile: &TlsProfile,
-    sock: VsockStream,
+    sock: S,
     sni: &str,
     seed: Option<&[u8]>,
-) -> Result<SslStream<VsockStream>, String> {
+) -> Result<SslStream<S>, String> {
     let _ = seed;
     let mut b =
         SslConnector::builder(SslMethod::tls()).map_err(|e| format!("btls builder: {}", e))?;
@@ -63,8 +63,11 @@ pub fn connect(
         .build()
         .configure()
         .map_err(|e| format!("btls configure: {}", e))?;
-    cfg.connect(sni, sock)
-        .map_err(|e| format!("btls TLS 握手失败: {}", e))
+    cfg.connect(sni, sock).map_err(|e| match e {
+        HandshakeError::SetupFailure(e) => format!("btls TLS 握手初始化失败: {e}"),
+        HandshakeError::Failure(e) => format!("btls TLS 握手失败: {}", e.error()),
+        HandshakeError::WouldBlock(_) => "btls TLS 握手未完成".to_string(),
+    })
 }
 
 fn alpn_wire(protos: &[String]) -> Vec<u8> {

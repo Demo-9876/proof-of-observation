@@ -43,12 +43,22 @@ client
   -> new-api Docker container on parent VM
   -> AF_VSOCK cid=4 port=5005
   -> proof-of-observation enclave /attest
-  -> AF_VSOCK parent cid=3 egress_port=8445
+  -> TCP 127.0.0.1:<egress_port> inside enclave
+  -> qproxy enclave
+  -> AF_VSOCK parent cid=3 vsock_port=<egress_port>
   -> qproxy host on parent VM
-  -> TCP api.openai.com:443
+  -> TCP 127.0.0.1:<egress_port> on parent VM
+  -> parent-local TCP mapper
+  -> TCP <actual-upstream-host>:443
 ```
 
-new-api 负责接入客户端请求并把符合条件的 `/v1/chat/completions` 请求送进 enclave。enclave 内部建立 TLS 并访问官方上游，父 VM 的 qproxy 只做字节转发。
+new-api 负责接入客户端请求并把符合条件的 `/v1/chat/completions` 请求送进 enclave。enclave 内部建立 TLS，并通过 Huawei 官方 qproxy 出网。父 VM 的 qproxy 只做 vsock/TCP 字节转发；TLS SNI、`Host` 头和证书校验仍由 enclave 内 `/attest` 对真实上游完成。
+
+重要限制：
+
+- qproxy `outbound_connections.tcp_port` 同时是 enclave 内本地 TCP listener 端口，也是 parent 侧要连接的目标 TCP 端口。
+- 因此多个 HTTPS 上游都需要连真实 `:443` 时，不能在 qproxy 中直接写多个 `tcp_port = 443`。
+- 本文采用固定映射：qproxy 只连接 parent VM 的 `127.0.0.1:8444/8445/...`，再由 parent-local TCP mapper 转到真实上游 `dashscope.aliyuncs.com:443`、`api.openai.com:443`。这样 new-api 仍然只需要配置 `TEE_PROOF_EGRESS_PORTS=host:egress_port`，接入方协议不变。
 
 当前 `ai-platform-newapi` 代码里的 proof 接入点：
 
@@ -73,9 +83,10 @@ export ENCLAVE_PORT=5005
 export QINGTIAN_PCR0=ce20e9feca6b19c7367460b996f7aaa336cfef9026b0765550b19bd786547465d5ea54f51d8a4d786d608c9de142677a
 export QINGTIAN_PCR8=9e45f72e25849c5cfb6b91b2160fdde7666413ef451b54f2f0a61d06492fb72ed7b277541a8cd0e03757e44fc2f05949
 
-export UPSTREAM_HOST=api.openai.com
+export UPSTREAM_HOST=dashscope.aliyuncs.com
 export UPSTREAM_TLS_PORT=443
-export EGRESS_VSOCK_PORT=8445
+export EGRESS_VSOCK_PORT=8444
+export EXTRA_UPSTREAMS=api.openai.com:8445
 
 export NEW_API_IMAGE=new-api-proof:qingtian
 export NEW_API_CONTAINER=new-api-proof
@@ -205,7 +216,13 @@ find "$PROOF_REPO/third_party/qingtian-sdk" -maxdepth 5 \
 
 ## 4. 配置并启动 qproxy host
 
-创建配置文件。这里配置的是 enclave 出站访问 `api.openai.com:443` 时使用父 VM 的 vsock port `8445`：
+安装 parent-local TCP mapper 依赖。本文用 `socat`，生产也可以换成 systemd 管理的等价 TCP forwarder：
+
+```bash
+sudo yum install -y socat || sudo dnf install -y socat || sudo apt-get install -y socat
+```
+
+创建 qproxy host 配置。注意这里的 `hostname` 固定写 `127.0.0.1`，`tcp_port` 和 `vsock_port` 都使用分配给该上游的 egress port；真实上游域名由下一步 parent-local TCP mapper 处理：
 
 ```bash
 source ~/qingtian-proof-vars.sh
@@ -213,25 +230,62 @@ source ~/qingtian-proof-vars.sh
 mkdir -p "$DEPLOY_DIR/qproxy"
 cd "$DEPLOY_DIR/qproxy"
 
-cat > config_qproxy_egress.toml <<EOF
-[[outbound_connections]]
-hostname = "$UPSTREAM_HOST"
-vsock_port = $EGRESS_VSOCK_PORT
-tcp_port = $UPSTREAM_TLS_PORT
+UPSTREAM_MAPPINGS="$UPSTREAM_HOST:$EGRESS_VSOCK_PORT ${EXTRA_UPSTREAMS:-}"
 
-[log_location]
-host_log = "host.log"
-enclave_log = "enclave.log"
-log_level = "info"
-host_log_dir = "/var/log/qproxy"
-enclave_log_dir = "/var/log/qproxy"
+{
+  for item in $UPSTREAM_MAPPINGS; do
+    host="${item%:*}"
+    port="${item##*:}"
+    printf '[[outbound_connections]]\n'
+    printf 'hostname = "127.0.0.1"\n'
+    printf 'vsock_port = %s\n' "$port"
+    printf 'tcp_port = %s\n\n' "$port"
+  done
+  printf '[log_location]\n'
+  printf 'host_log = "host.log"\n'
+  printf 'enclave_log = "enclave.log"\n'
+  printf 'log_level = "info"\n'
+  printf 'host_log_dir = "/var/log/qproxy"\n'
+  printf 'enclave_log_dir = "/var/log/qproxy"\n'
+} > config_qproxy_egress.toml
+
+cat > upstream-mappings.env <<EOF
+UPSTREAM_MAPPINGS="$UPSTREAM_MAPPINGS"
+UPSTREAM_TLS_PORT="$UPSTREAM_TLS_PORT"
 EOF
 
 sudo mkdir -p /var/log/qproxy
 sudo chown -R "$USER:$USER" /var/log/qproxy
+qproxy check-config ./config_qproxy_egress.toml
 ```
 
-先前台启动 qproxy，便于观察错误：
+启动 parent-local TCP mapper。它监听父 VM 的 `127.0.0.1:<egress_port>`，转发到真实上游 `<host>:443`：
+
+```bash
+source ~/qingtian-proof-vars.sh
+cd "$DEPLOY_DIR/qproxy"
+source ./upstream-mappings.env
+
+pgrep -f 'qingtian-proof-egres[s]' | xargs -r kill 2>/dev/null || true
+
+for item in $UPSTREAM_MAPPINGS; do
+  host="${item%:*}"
+  port="${item##*:}"
+  nohup socat -ly -lp "qingtian-proof-egress-$port" \
+    TCP-LISTEN:"$port",bind=127.0.0.1,reuseaddr,fork \
+    TCP:"$host":"$UPSTREAM_TLS_PORT" \
+    > "$DEPLOY_DIR/qproxy/tcp-mapper-$port.out" 2>&1 &
+done
+
+sleep 2
+pgrep -af 'qingtian-proof-egres[s]'
+for item in $UPSTREAM_MAPPINGS; do
+  port="${item##*:}"
+  ss -ltnp | grep "127.0.0.1:$port" || true
+done
+```
+
+先前台启动 qproxy host，便于观察错误：
 
 ```bash
 source ~/qingtian-proof-vars.sh
@@ -240,32 +294,36 @@ cd "$DEPLOY_DIR/qproxy"
 qproxy host --config=./config_qproxy_egress.toml "$ENCLAVE_CID"
 ```
 
-保持这个窗口不关。另开一个 SSH 窗口继续后续步骤。
-
-如果确认可用后想后台运行：
+保持这个窗口不关。另开一个 SSH 窗口继续后续步骤。确认链路可用后，可以改成后台运行：
 
 ```bash
 source ~/qingtian-proof-vars.sh
 cd "$DEPLOY_DIR/qproxy"
 
-pkill -f 'qproxy host' 2>/dev/null || true
+pgrep -f 'qproxy hos[t]' | xargs -r kill 2>/dev/null || true
 
 nohup qproxy host --config=./config_qproxy_egress.toml "$ENCLAVE_CID" \
   > "$DEPLOY_DIR/qproxy/qproxy-host.out" 2>&1 &
 
 sleep 2
-pgrep -af 'qproxy host'
+pgrep -af 'qproxy hos[t]'
 tail -n 100 "$DEPLOY_DIR/qproxy/qproxy-host.out"
 tail -n 100 /var/log/qproxy/host.log 2>/dev/null || true
 ```
 
-如果需要同时支持 DashScope，追加一个 outbound 段，并在 new-api 环境变量里同步加入 host/port：
+检查配置和 EIF 内置端口是否一致。`deploy/qingtian-runtime/qingtian.env` 中的 `QINGTIAN_QPROXY_EGRESS_PORTS` 必须包含这里所有 egress port，例如：
 
-```toml
-[[outbound_connections]]
-hostname = "dashscope.aliyuncs.com"
-vsock_port = 8444
-tcp_port = 443
+```bash
+source ~/qingtian-proof-vars.sh
+grep '^QINGTIAN_QPROXY_EGRESS_PORTS=' "$PROOF_REPO/deploy/qingtian-runtime/qingtian.env"
+cat "$DEPLOY_DIR/qproxy/upstream-mappings.env"
+```
+
+示例对应关系：
+
+```text
+DashScope: qproxy tcp/vsock 8444 -> parent mapper 127.0.0.1:8444 -> dashscope.aliyuncs.com:443
+OpenAI:    qproxy tcp/vsock 8445 -> parent mapper 127.0.0.1:8445 -> api.openai.com:443
 ```
 
 ## 5. 准备 ai-platform-newapi 源码
@@ -382,6 +440,16 @@ source ~/qingtian-proof-vars.sh
 source ~/qingtian-proof-secrets.sh
 cd "$DEPLOY_DIR"
 
+UPSTREAM_MAPPINGS="$UPSTREAM_HOST:$EGRESS_VSOCK_PORT ${EXTRA_UPSTREAMS:-}"
+TEE_ALLOWED_HOSTS=""
+TEE_EGRESS_PORTS=""
+for item in $UPSTREAM_MAPPINGS; do
+  host="${item%:*}"
+  port="${item##*:}"
+  TEE_ALLOWED_HOSTS="${TEE_ALLOWED_HOSTS:+$TEE_ALLOWED_HOSTS,}$host"
+  TEE_EGRESS_PORTS="${TEE_EGRESS_PORTS:+$TEE_EGRESS_PORTS,}$host:$port"
+done
+
 cat > qingtian-proof.env <<EOF
 READ_CONFIG=false
 TZ=Asia/Shanghai
@@ -396,8 +464,8 @@ TEE_PROOF_REQUIRE=true
 TEE_PROOF_ENCLAVE_CID=$ENCLAVE_CID
 TEE_PROOF_ENCLAVE_PORT=$ENCLAVE_PORT
 TEE_PROOF_EXPECTED_PCR0=$QINGTIAN_PCR0
-TEE_PROOF_ALLOWED_HOSTS=$UPSTREAM_HOST
-TEE_PROOF_EGRESS_PORTS=$UPSTREAM_HOST:$EGRESS_VSOCK_PORT
+TEE_PROOF_ALLOWED_HOSTS=$TEE_ALLOWED_HOSTS
+TEE_PROOF_EGRESS_PORTS=$TEE_EGRESS_PORTS
 TEE_PROOF_TIMEOUT_SECONDS=300
 TEE_PROOF_MAX_BODY_BYTES=67108864
 TEE_PROOF_STORE=memory
@@ -708,10 +776,16 @@ source ~/qingtian-proof-vars.sh
 docker rm -f "$NEW_API_CONTAINER"
 ```
 
-停止 qproxy：
+停止 qproxy host：
 
 ```bash
-pkill -f 'qproxy host' 2>/dev/null || true
+pgrep -f 'qproxy hos[t]' | xargs -r kill 2>/dev/null || true
+```
+
+停止 parent-local TCP mapper：
+
+```bash
+pgrep -f 'qingtian-proof-egres[s]' | xargs -r kill 2>/dev/null || true
 ```
 
 停止 enclave：
@@ -733,8 +807,28 @@ qt enclave start \
   --cid "$ENCLAVE_CID"
 
 cd "$DEPLOY_DIR/qproxy"
+source ./upstream-mappings.env
+
+pgrep -f 'qingtian-proof-egres[s]' | xargs -r kill 2>/dev/null || true
+for item in $UPSTREAM_MAPPINGS; do
+  host="${item%:*}"
+  port="${item##*:}"
+  nohup socat -ly -lp "qingtian-proof-egress-$port" \
+    TCP-LISTEN:"$port",bind=127.0.0.1,reuseaddr,fork \
+    TCP:"$host":"$UPSTREAM_TLS_PORT" \
+    > "$DEPLOY_DIR/qproxy/tcp-mapper-$port.out" 2>&1 &
+done
+
+pgrep -f 'qproxy hos[t]' | xargs -r kill 2>/dev/null || true
 nohup qproxy host --config=./config_qproxy_egress.toml "$ENCLAVE_CID" \
   > "$DEPLOY_DIR/qproxy/qproxy-host.out" 2>&1 &
+
+sleep 2
+for item in $UPSTREAM_MAPPINGS; do
+  port="${item##*:}"
+  ss -ltnp | grep "127.0.0.1:$port" || true
+done
+pgrep -af 'qproxy hos[t]'
 
 docker start "$NEW_API_CONTAINER"
 ```
@@ -759,23 +853,23 @@ docker logs "$NEW_API_CONTAINER" 2>&1 | grep 'fullRequestURL' | tail -n 20
 grep -R "fullRequestURL" -n "$DEPLOY_DIR/logs" | tail -n 20 || true
 ```
 
-把真实 hostname 写入变量文件。下面命令会追加一个新上游，并同步更新 new-api env 文件；端口需要和 qproxy 中新增的 `vsock_port` 一致：
+把真实 hostname 写入变量文件。下面命令会追加一个新上游，并同步更新 new-api env 文件；端口需要是一个尚未使用的 egress port，并且必须已经包含在 EIF 构建时的 `QINGTIAN_QPROXY_EGRESS_PORTS` 中。若没有包含，需要先更新 `deploy/qingtian-runtime/qingtian.env`、重建 signed EIF 并重启 enclave。
 
 ```bash
 source ~/qingtian-proof-vars.sh
 cd "$DEPLOY_DIR"
 
 read -r -p "Actual upstream host: " ACTUAL_UPSTREAM_HOST
-read -r -p "Actual upstream egress vsock port: " ACTUAL_EGRESS_VSOCK_PORT
+read -r -p "Actual upstream egress port, e.g. 8446: " ACTUAL_EGRESS_PORT
 
 {
   printf 'export ACTUAL_UPSTREAM_HOST=%q\n' "$ACTUAL_UPSTREAM_HOST"
-  printf 'export ACTUAL_EGRESS_VSOCK_PORT=%q\n' "$ACTUAL_EGRESS_VSOCK_PORT"
+  printf 'export ACTUAL_EGRESS_PORT=%q\n' "$ACTUAL_EGRESS_PORT"
 } >> "$DEPLOY_DIR/qingtian-proof-test-vars.sh"
 
 cp qingtian-proof.env "qingtian-proof.env.$(date +%Y%m%d%H%M%S).bak"
 
-python3 - "$ACTUAL_UPSTREAM_HOST" "$ACTUAL_EGRESS_VSOCK_PORT" <<'PY'
+python3 - "$ACTUAL_UPSTREAM_HOST" "$ACTUAL_EGRESS_PORT" <<'PY'
 import pathlib
 import sys
 
@@ -804,7 +898,7 @@ PY
 grep '^TEE_PROOF_ALLOWED_HOSTS=\|^TEE_PROOF_EGRESS_PORTS=' qingtian-proof.env
 ```
 
-同时在 `config_qproxy_egress.toml` 增加对应 `[[outbound_connections]]`：
+同时在 `config_qproxy_egress.toml` 增加对应 `[[outbound_connections]]`，并启动 parent-local TCP mapper：
 
 ```bash
 source ~/qingtian-proof-vars.sh
@@ -814,12 +908,18 @@ cd "$DEPLOY_DIR/qproxy"
 cat >> config_qproxy_egress.toml <<EOF
 
 [[outbound_connections]]
-hostname = "$ACTUAL_UPSTREAM_HOST"
-vsock_port = $ACTUAL_EGRESS_VSOCK_PORT
-tcp_port = 443
+hostname = "127.0.0.1"
+vsock_port = $ACTUAL_EGRESS_PORT
+tcp_port = $ACTUAL_EGRESS_PORT
 EOF
 
 tail -n 20 config_qproxy_egress.toml
+qproxy check-config ./config_qproxy_egress.toml
+
+nohup socat -ly -lp "qingtian-proof-egress-$ACTUAL_EGRESS_PORT" \
+  TCP-LISTEN:"$ACTUAL_EGRESS_PORT",bind=127.0.0.1,reuseaddr,fork \
+  TCP:"$ACTUAL_UPSTREAM_HOST":"$UPSTREAM_TLS_PORT" \
+  > "$DEPLOY_DIR/qproxy/tcp-mapper-$ACTUAL_EGRESS_PORT.out" 2>&1 &
 ```
 
 修改后重启 qproxy 和 new-api 容器：
@@ -828,7 +928,7 @@ tail -n 20 config_qproxy_egress.toml
 source ~/qingtian-proof-vars.sh
 cd "$DEPLOY_DIR/qproxy"
 
-pkill -f 'qproxy host' 2>/dev/null || true
+pgrep -f 'qproxy hos[t]' | xargs -r kill 2>/dev/null || true
 nohup qproxy host --config=./config_qproxy_egress.toml "$ENCLAVE_CID" \
   > "$DEPLOY_DIR/qproxy/qproxy-host.out" 2>&1 &
 
@@ -878,7 +978,7 @@ docker logs --tail 200 "$NEW_API_CONTAINER"
 
 ```bash
 source ~/qingtian-proof-vars.sh
-pgrep -af 'qproxy host'
+pgrep -af 'qproxy hos[t]'
 tail -n 200 "$DEPLOY_DIR/qproxy/qproxy-host.out" 2>/dev/null || true
 tail -n 200 /var/log/qproxy/host.log 2>/dev/null || true
 ```
@@ -910,7 +1010,7 @@ source ~/qingtian-proof-vars.sh
 
 qt enclave query
 qt enclave query-eif --eif "$PROOF_REPO/proof-observation-qingtian.e2e.signed.eif"
-pgrep -af 'qproxy host'
+pgrep -af 'qproxy hos[t]'
 docker ps --filter "name=$NEW_API_CONTAINER"
 docker logs --tail 80 "$NEW_API_CONTAINER"
 ```

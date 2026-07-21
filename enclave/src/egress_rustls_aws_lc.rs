@@ -5,14 +5,14 @@
 use attest::tls_profile::{CertPolicy, ExtOrder, GreasePolicy, TlsProfile, TlsVersion};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, SignatureScheme, StreamOwned};
+use std::io::{Read, Write};
 use std::sync::{Arc, OnceLock};
-use vsock::VsockStream;
 
-pub fn connect(
+pub fn connect<S: Read + Write>(
     profile: &TlsProfile,
-    sock: VsockStream,
+    sock: S,
     sni: &str,
-) -> Result<StreamOwned<ClientConnection, VsockStream>, String> {
+) -> Result<StreamOwned<ClientConnection, S>, String> {
     validate_shape(profile)?;
     let mut roots = RootCertStore::empty();
     match profile.cert_policy {

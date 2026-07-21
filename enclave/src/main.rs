@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
@@ -33,6 +34,42 @@ use attest::tls_profile;
 
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write + ?Sized> ReadWrite for T {}
+
+enum EgressStream {
+    DirectVsock(VsockStream),
+    QProxyTcp(TcpStream),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EgressMode {
+    DirectVsock,
+    QProxyTcp,
+}
+
+impl Read for EgressStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::DirectVsock(s) => s.read(buf),
+            Self::QProxyTcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for EgressStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::DirectVsock(s) => s.write(buf),
+            Self::QProxyTcp(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::DirectVsock(s) => s.flush(),
+            Self::QProxyTcp(s) => s.flush(),
+        }
+    }
+}
 
 fn log_stderr(args: fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr(), "{args}");
@@ -95,6 +132,62 @@ fn connect_parent_vsock(port: u32) -> Result<VsockStream, String> {
             .join(","),
         errors.join("; ")
     ))
+}
+
+fn qproxy_host() -> String {
+    env::var("POO_QPROXY_HOST")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+fn connect_qproxy_tcp(port: u32) -> Result<TcpStream, String> {
+    let port: u16 = port
+        .try_into()
+        .map_err(|_| format!("qproxy local TCP port out of range: {port}"))?;
+    let addr = (qproxy_host(), port);
+    TcpStream::connect(addr.clone())
+        .map_err(|e| format!("连 qproxy enclave 失败: {}:{}; {e}", addr.0, addr.1))
+}
+
+fn parse_egress_mode(raw: Option<&str>) -> Result<EgressMode, String> {
+    match raw
+        .unwrap_or("direct-vsock")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "qproxy" | "qproxy-tcp" => Ok(EgressMode::QProxyTcp),
+        "direct-vsock" | "vsock" | "" => Ok(EgressMode::DirectVsock),
+        other => Err(format!(
+            "unsupported POO_EGRESS_MODE={other}; supported: direct-vsock, qproxy"
+        )),
+    }
+}
+
+fn egress_mode() -> Result<EgressMode, String> {
+    let raw = env::var("POO_EGRESS_MODE").ok();
+    parse_egress_mode(raw.as_deref())
+}
+
+fn connect_egress(port: u32) -> Result<EgressStream, String> {
+    match egress_mode()? {
+        EgressMode::QProxyTcp => connect_qproxy_tcp(port).map(EgressStream::QProxyTcp),
+        EgressMode::DirectVsock => connect_parent_vsock(port).map(EgressStream::DirectVsock),
+    }
+}
+
+fn set_egress_timeouts(sock: &EgressStream, timeout: Duration) {
+    match sock {
+        EgressStream::DirectVsock(s) => {
+            s.set_read_timeout(Some(timeout)).ok();
+            s.set_write_timeout(Some(timeout)).ok();
+        }
+        EgressStream::QProxyTcp(s) => {
+            s.set_read_timeout(Some(timeout)).ok();
+            s.set_write_timeout(Some(timeout)).ok();
+        }
+    }
 }
 
 const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
@@ -640,9 +733,8 @@ fn handle(
 
     let profile = decode_profile(&head);
     let seed = head.tls_seed.as_deref().and_then(|s| B64.decode(s).ok());
-    let sock = connect_parent_vsock(head.egress_port)?;
-    sock.set_read_timeout(Some(UPSTREAM_IO_TIMEOUT)).ok();
-    sock.set_write_timeout(Some(UPSTREAM_IO_TIMEOUT)).ok();
+    let sock = connect_egress(head.egress_port)?;
+    set_egress_timeouts(&sock, UPSTREAM_IO_TIMEOUT);
     let norm_method = head.upstream.method.to_uppercase();
     if profile.as_ref().map(|p| p.stack) == Some(tls_profile::Stack::RustlsAwsLc) {
         let profile = profile.as_ref().unwrap();
@@ -659,9 +751,7 @@ fn handle(
                 tls.conn.alpn_protocol()
             ));
         }
-        tls.sock
-            .set_read_timeout(Some(Duration::from_millis(250)))
-            .ok();
+        set_egress_timeouts(&tls.sock, Duration::from_millis(250));
         let h2 = profile
             .h2
             .as_ref()
@@ -1130,6 +1220,32 @@ mod parent_cid_tests {
     fn parent_cid_candidates_reject_empty_or_invalid_values() {
         assert!(parse_parent_cid_candidates(Some(" , ")).is_err());
         assert!(parse_parent_cid_candidates(Some("3,nope")).is_err());
+    }
+
+    #[test]
+    fn egress_mode_defaults_to_direct_vsock() {
+        assert_eq!(parse_egress_mode(None).unwrap(), EgressMode::DirectVsock);
+        assert_eq!(
+            parse_egress_mode(Some(" vsock ")).unwrap(),
+            EgressMode::DirectVsock
+        );
+    }
+
+    #[test]
+    fn egress_mode_accepts_qproxy_aliases() {
+        assert_eq!(
+            parse_egress_mode(Some("qproxy")).unwrap(),
+            EgressMode::QProxyTcp
+        );
+        assert_eq!(
+            parse_egress_mode(Some("QPROXY-TCP")).unwrap(),
+            EgressMode::QProxyTcp
+        );
+    }
+
+    #[test]
+    fn egress_mode_rejects_unknown_values() {
+        assert!(parse_egress_mode(Some("http-proxy")).is_err());
     }
 }
 
