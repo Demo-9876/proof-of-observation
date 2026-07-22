@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 ENV_FILE="${1:-$SCRIPT_DIR/qingtian.env}"
+if [ -n "${1:-}" ] && [ ! -f "$ENV_FILE" ]; then
+  echo "env file not found: $ENV_FILE" >&2
+  exit 2
+fi
 if [ -f "$ENV_FILE" ]; then
   # shellcheck disable=SC1090
   set -a
@@ -12,7 +16,7 @@ if [ -f "$ENV_FILE" ]; then
   set +a
 fi
 
-: "${QINGTIAN_IMAGE:=proof-observation-qingtian:dev}"
+: "${QINGTIAN_IMAGE:=${QINGTIAN_IMAGE_TAG:-proof-observation-qingtian:dev}}"
 : "${QINGTIAN_EIF:=proof-observation-qingtian.signed.eif}"
 : "${QINGTIAN_CID:=4}"
 : "${QINGTIAN_CPUS:=2}"
@@ -53,6 +57,24 @@ if [ ! -d "$QTSM_SDK_DIR/qingtian-tools/qproxy" ] || [ ! -d "$QTSM_SDK_DIR/encla
   echo "required: qingtian-tools/qproxy, enclave/qtsm-sdk-rs, enclave/qtsm-sdk-sys" >&2
   exit 2
 fi
+
+cat <<EOF
+QingTian runtime config:
+  env_file=$ENV_FILE
+  image=$QINGTIAN_IMAGE
+  eif=$QINGTIAN_EIF
+  cid=$QINGTIAN_CID
+  cpus=$QINGTIAN_CPUS
+  mem=$QINGTIAN_MEM
+  parent_cids=$QINGTIAN_PARENT_CIDS
+  egress_mode=$QINGTIAN_EGRESS_MODE
+  qproxy_enabled=$QINGTIAN_QPROXY_ENABLED
+  qproxy_parent_cid=$QINGTIAN_QPROXY_PARENT_CID
+  qproxy_egress_ports=$QINGTIAN_QPROXY_EGRESS_PORTS
+  upstream_proxy_url=$QINGTIAN_UPSTREAM_PROXY_URL
+  forward_proxy_protocol=$QINGTIAN_FORWARD_PROXY_PROTOCOL
+  qtsm_sdk_dir=$QTSM_SDK_DIR
+EOF
 
 docker build --no-cache \
   --build-arg "QTSM_SDK_DIR=$QTSM_SDK_DIR" \
