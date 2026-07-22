@@ -41,6 +41,18 @@ enum EgressStream {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardProxyProtocol {
+    HttpConnect,
+    Socks5,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForwardProxyConfig {
+    protocol: ForwardProxyProtocol,
+    port: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EgressMode {
     DirectVsock,
     QProxyTcp,
@@ -175,6 +187,223 @@ fn connect_egress(port: u32) -> Result<EgressStream, String> {
         EgressMode::QProxyTcp => connect_qproxy_tcp(port).map(EgressStream::QProxyTcp),
         EgressMode::DirectVsock => connect_parent_vsock(port).map(EgressStream::DirectVsock),
     }
+}
+
+fn parse_forward_proxy_protocol(raw: &str) -> Result<ForwardProxyProtocol, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "http" | "http-connect" | "http_connect" | "connect" => {
+            Ok(ForwardProxyProtocol::HttpConnect)
+        }
+        "socks5" | "socks5h" => Ok(ForwardProxyProtocol::Socks5),
+        "https" | "https-connect" | "https_connect" => Err(
+            "HTTPS proxy transport is not supported yet; use an HTTP CONNECT proxy endpoint".into(),
+        ),
+        other => Err(format!(
+            "unsupported forward proxy protocol `{other}`; supported: http-connect, socks5"
+        )),
+    }
+}
+
+fn parse_forward_proxy_url(raw: Option<&str>) -> Result<Option<ForwardProxyConfig>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return Ok(Some(ForwardProxyConfig {
+            protocol: parse_forward_proxy_protocol(raw)?,
+            port: None,
+        }));
+    };
+    let protocol = parse_forward_proxy_protocol(scheme)?;
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    let port = parse_proxy_authority_port(authority)?;
+    Ok(Some(ForwardProxyConfig { protocol, port }))
+}
+
+fn parse_proxy_authority_port(authority: &str) -> Result<Option<u32>, String> {
+    if authority.is_empty() {
+        return Ok(None);
+    }
+    if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return Err(format!("invalid proxy authority `{authority}`"));
+        };
+        let tail = &authority[end + 1..];
+        return parse_proxy_port_tail(authority, tail);
+    }
+    match authority.rsplit_once(':') {
+        Some((_, port)) => parse_proxy_port(authority, port).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn parse_proxy_port_tail(authority: &str, tail: &str) -> Result<Option<u32>, String> {
+    if tail.is_empty() {
+        return Ok(None);
+    }
+    let Some(port) = tail.strip_prefix(':') else {
+        return Err(format!("invalid proxy authority `{authority}`"));
+    };
+    parse_proxy_port(authority, port).map(Some)
+}
+
+fn parse_proxy_port(authority: &str, port: &str) -> Result<u32, String> {
+    let parsed = port
+        .parse::<u32>()
+        .map_err(|e| format!("invalid proxy port in `{authority}`: {e}"))?;
+    if parsed == 0 || parsed > u16::MAX as u32 {
+        return Err(format!("proxy port out of range in `{authority}`"));
+    }
+    Ok(parsed)
+}
+
+fn forward_proxy_config() -> Result<Option<ForwardProxyConfig>, String> {
+    let url = env::var("POO_UPSTREAM_PROXY_URL")
+        .ok()
+        .or_else(|| env::var("POO_FORWARD_PROXY_URL").ok());
+    if url
+        .as_deref()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return parse_forward_proxy_url(url.as_deref());
+    }
+    let protocol = env::var("POO_FORWARD_PROXY_PROTOCOL").ok();
+    parse_forward_proxy_url(protocol.as_deref())
+}
+
+fn connect_upstream_socket(
+    egress_port: u32,
+    upstream_host: &str,
+    upstream_port: u16,
+) -> Result<EgressStream, String> {
+    let proxy = forward_proxy_config()?;
+    let next_hop_port = proxy.as_ref().and_then(|p| p.port).unwrap_or(egress_port);
+    let mut sock = connect_egress(next_hop_port)?;
+    set_egress_timeouts(&sock, UPSTREAM_IO_TIMEOUT);
+    if let Some(proxy) = proxy {
+        match proxy.protocol {
+            ForwardProxyProtocol::HttpConnect => {
+                http_connect_proxy(&mut sock, upstream_host, upstream_port)?
+            }
+            ForwardProxyProtocol::Socks5 => {
+                socks5_connect_proxy(&mut sock, upstream_host, upstream_port)?
+            }
+        }
+    }
+    Ok(sock)
+}
+
+fn http_connect_proxy<S: Read + Write>(
+    sock: &mut S,
+    upstream_host: &str,
+    upstream_port: u16,
+) -> Result<(), String> {
+    let target = format!("{upstream_host}:{upstream_port}");
+    let req = format!(
+        "CONNECT {target} HTTP/1.1\r\nhost: {target}\r\nproxy-connection: keep-alive\r\n\r\n"
+    );
+    sock.write_all(req.as_bytes())
+        .map_err(|e| format!("HTTP CONNECT write failed: {e}"))?;
+    sock.flush()
+        .map_err(|e| format!("HTTP CONNECT flush failed: {e}"))?;
+
+    let mut buf = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while buf.len() < 16 * 1024 {
+        sock.read_exact(&mut byte)
+            .map_err(|e| format!("HTTP CONNECT response read failed: {e}"))?;
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    if !buf.ends_with(b"\r\n\r\n") {
+        return Err("HTTP CONNECT response header too large or incomplete".into());
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let status = head
+        .lines()
+        .next()
+        .ok_or_else(|| "HTTP CONNECT response missing status line".to_string())?;
+    let code = status
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| format!("HTTP CONNECT malformed status line: {status}"))?
+        .parse::<u16>()
+        .map_err(|e| format!("HTTP CONNECT invalid status code `{status}`: {e}"))?;
+    if !(200..300).contains(&code) {
+        return Err(format!("HTTP CONNECT proxy rejected {target}: {status}"));
+    }
+    Ok(())
+}
+
+fn socks5_connect_proxy<S: Read + Write>(
+    sock: &mut S,
+    upstream_host: &str,
+    upstream_port: u16,
+) -> Result<(), String> {
+    let host = upstream_host.as_bytes();
+    if host.is_empty() || host.len() > u8::MAX as usize {
+        return Err("SOCKS5 target host length out of range".into());
+    }
+    sock.write_all(&[0x05, 0x01, 0x00])
+        .map_err(|e| format!("SOCKS5 greeting write failed: {e}"))?;
+    sock.flush()
+        .map_err(|e| format!("SOCKS5 greeting flush failed: {e}"))?;
+    let mut greeting = [0u8; 2];
+    sock.read_exact(&mut greeting)
+        .map_err(|e| format!("SOCKS5 greeting read failed: {e}"))?;
+    if greeting != [0x05, 0x00] {
+        return Err(format!(
+            "SOCKS5 proxy rejected no-auth greeting: {:02x?}",
+            greeting
+        ));
+    }
+
+    let mut req = Vec::with_capacity(7 + host.len());
+    req.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, host.len() as u8]);
+    req.extend_from_slice(host);
+    req.extend_from_slice(&upstream_port.to_be_bytes());
+    sock.write_all(&req)
+        .map_err(|e| format!("SOCKS5 connect write failed: {e}"))?;
+    sock.flush()
+        .map_err(|e| format!("SOCKS5 connect flush failed: {e}"))?;
+
+    let mut head = [0u8; 4];
+    sock.read_exact(&mut head)
+        .map_err(|e| format!("SOCKS5 connect response read failed: {e}"))?;
+    if head[0] != 0x05 {
+        return Err(format!("SOCKS5 invalid response version: {}", head[0]));
+    }
+    if head[1] != 0x00 {
+        return Err(format!("SOCKS5 connect failed with reply code {}", head[1]));
+    }
+    let addr_len = match head[3] {
+        0x01 => 4,
+        0x03 => {
+            let mut len = [0u8; 1];
+            sock.read_exact(&mut len)
+                .map_err(|e| format!("SOCKS5 domain response read failed: {e}"))?;
+            len[0] as usize
+        }
+        0x04 => 16,
+        other => return Err(format!("SOCKS5 unsupported bound address type {other}")),
+    };
+    let mut discard = vec![0u8; addr_len + 2];
+    sock.read_exact(&mut discard)
+        .map_err(|e| format!("SOCKS5 bound address read failed: {e}"))?;
+    Ok(())
 }
 
 fn set_egress_timeouts(sock: &EgressStream, timeout: Duration) {
@@ -733,8 +962,7 @@ fn handle(
 
     let profile = decode_profile(&head);
     let seed = head.tls_seed.as_deref().and_then(|s| B64.decode(s).ok());
-    let sock = connect_egress(head.egress_port)?;
-    set_egress_timeouts(&sock, UPSTREAM_IO_TIMEOUT);
+    let sock = connect_upstream_socket(head.egress_port, &head.upstream.host, 443)?;
     let norm_method = head.upstream.method.to_uppercase();
     if profile.as_ref().map(|p| p.stack) == Some(tls_profile::Stack::RustlsAwsLc) {
         let profile = profile.as_ref().unwrap();
@@ -1199,6 +1427,38 @@ fn main() {
 #[cfg(test)]
 mod parent_cid_tests {
     use super::*;
+    use std::io::{Cursor, Result as IoResult};
+
+    struct ScriptedIo {
+        read: Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl ScriptedIo {
+        fn new(read: Vec<u8>) -> Self {
+            Self {
+                read: Cursor::new(read),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for ScriptedIo {
+        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+            self.read.read(buf)
+        }
+    }
+
+    impl Write for ScriptedIo {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn parent_cid_candidates_default_to_nitro_compatible_parent() {
@@ -1246,6 +1506,83 @@ mod parent_cid_tests {
     #[test]
     fn egress_mode_rejects_unknown_values() {
         assert!(parse_egress_mode(Some("http-proxy")).is_err());
+    }
+
+    #[test]
+    fn forward_proxy_url_parses_http_connect_and_socks5() {
+        assert_eq!(
+            parse_forward_proxy_url(Some("http://127.0.0.1:18080")).unwrap(),
+            Some(ForwardProxyConfig {
+                protocol: ForwardProxyProtocol::HttpConnect,
+                port: Some(18080),
+            })
+        );
+        assert_eq!(
+            parse_forward_proxy_url(Some("socks5://localhost:18081")).unwrap(),
+            Some(ForwardProxyConfig {
+                protocol: ForwardProxyProtocol::Socks5,
+                port: Some(18081),
+            })
+        );
+        assert_eq!(
+            parse_forward_proxy_url(Some("http-connect")).unwrap(),
+            Some(ForwardProxyConfig {
+                protocol: ForwardProxyProtocol::HttpConnect,
+                port: None,
+            })
+        );
+        assert!(parse_forward_proxy_url(Some("https://proxy.example:443")).is_err());
+    }
+
+    #[test]
+    fn http_connect_proxy_writes_connect_request_and_accepts_2xx() {
+        let mut io = ScriptedIo::new(b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec());
+
+        http_connect_proxy(&mut io, "dashscope.aliyuncs.com", 443).unwrap();
+
+        assert_eq!(
+            String::from_utf8(io.written).unwrap(),
+            "CONNECT dashscope.aliyuncs.com:443 HTTP/1.1\r\nhost: dashscope.aliyuncs.com:443\r\nproxy-connection: keep-alive\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn http_connect_proxy_rejects_non_2xx_status() {
+        let mut io =
+            ScriptedIo::new(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n".to_vec());
+
+        let err = http_connect_proxy(&mut io, "dashscope.aliyuncs.com", 443).unwrap_err();
+
+        assert!(err.contains("407"));
+    }
+
+    #[test]
+    fn socks5_connect_proxy_uses_no_auth_domain_connect() {
+        let mut response = Vec::new();
+        response.extend_from_slice(&[0x05, 0x00]);
+        response.extend_from_slice(&[0x05, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00]);
+        let mut io = ScriptedIo::new(response);
+
+        socks5_connect_proxy(&mut io, "dashscope.aliyuncs.com", 443).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0x05, 0x01, 0x00]);
+        expected.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, 21]);
+        expected.extend_from_slice(b"dashscope.aliyuncs.com");
+        expected.extend_from_slice(&443u16.to_be_bytes());
+        assert_eq!(io.written, expected);
+    }
+
+    #[test]
+    fn socks5_connect_proxy_rejects_failed_reply() {
+        let mut response = Vec::new();
+        response.extend_from_slice(&[0x05, 0x00]);
+        response.extend_from_slice(&[0x05, 0x05, 0x00, 0x01]);
+        let mut io = ScriptedIo::new(response);
+
+        let err = socks5_connect_proxy(&mut io, "dashscope.aliyuncs.com", 443).unwrap_err();
+
+        assert!(err.contains("reply code 5"));
     }
 }
 

@@ -559,3 +559,301 @@ docker exec "$NEW_API_CONTAINER" env | grep '^TEE_PROOF_'
 - 非流式请求响应中包含 `"profile":"qingtian"`。
 - 流式请求 SSE 末尾包含 `tee.proof` 事件。
 - Node verifier 对保存的 response/proof 校验通过。
+
+## 15. 代理出口验证（HTTP CONNECT / SOCKS5）
+
+本节在前面 qproxy E2E 已经跑通的基础上，再验证 Enclave 在**代理出口模式**下访问模型是否还能通过 proof 校验。
+
+这里的核心点是：
+
+- Enclave 内仍然通过 `qproxy enclave` 出网。
+- 只是把 `/attest` 发往上游的下一跳改成父 VM 本地的正向代理。
+- 模型真实 host 仍然是 `dashscope.aliyuncs.com` 或 `api.openai.com`，verifier 不变。
+- 这次实现支持两种代理握手：
+  - `http://127.0.0.1:18080` + HTTP CONNECT
+  - `socks5://127.0.0.1:18080` + SOCKS5 CONNECT
+
+### 15.1 准备父 VM 代理脚本
+
+```bash
+cat > /tmp/qingtian-forward-proxy.py <<'PY'
+#!/usr/bin/env python3
+import argparse
+import socket
+import struct
+import threading
+
+
+def relay(a, b):
+    def pump(src, dst):
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    t1 = threading.Thread(target=pump, args=(a, b), daemon=True)
+    t2 = threading.Thread(target=pump, args=(b, a), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+
+def read_line(f):
+    line = f.readline(65536)
+    if not line:
+        raise ConnectionError("client closed")
+    return line.rstrip(b"\r\n")
+
+
+def handle_http(conn):
+    f = conn.makefile("rb")
+    line = read_line(f).decode("ascii", "replace")
+    parts = line.split()
+    if len(parts) < 3 or parts[0].upper() != "CONNECT":
+        conn.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+        return
+    target = parts[1]
+    host, port = target.rsplit(":", 1)
+    port = int(port)
+    while True:
+        hdr = f.readline(65536)
+        if hdr in (b"\r\n", b"\n", b""):
+            break
+    upstream = socket.create_connection((host, port))
+    conn.sendall(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: qingtian\r\n\r\n")
+    relay(conn, upstream)
+
+
+def handle_socks5(conn):
+    head = conn.recv(2)
+    if len(head) != 2 or head[0] != 5:
+        raise ConnectionError("bad socks5 greeting")
+    nmethods = head[1]
+    methods = conn.recv(nmethods)
+    if 0 not in methods:
+        conn.sendall(b"\x05\xff")
+        return
+    conn.sendall(b"\x05\x00")
+
+    req = conn.recv(4)
+    if len(req) != 4 or req[0] != 5 or req[1] != 1:
+        raise ConnectionError("bad socks5 request")
+    atyp = req[3]
+    if atyp == 1:
+        host = socket.inet_ntoa(conn.recv(4))
+    elif atyp == 3:
+        ln = conn.recv(1)[0]
+        host = conn.recv(ln).decode("utf-8")
+    elif atyp == 4:
+        host = socket.inet_ntop(socket.AF_INET6, conn.recv(16))
+    else:
+        raise ConnectionError("unsupported atyp")
+    port = struct.unpack("!H", conn.recv(2))[0]
+    upstream = socket.create_connection((host, port))
+    conn.sendall(b"\x05\x00\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
+    relay(conn, upstream)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["http-connect", "socks5"], required=True)
+    ap.add_argument("--listen", default="127.0.0.1:18080")
+    args = ap.parse_args()
+    host, port = args.listen.rsplit(":", 1)
+    port = int(port)
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, port))
+    s.listen(128)
+    while True:
+        conn, _ = s.accept()
+        t = threading.Thread(
+            target=(handle_http if args.mode == "http-connect" else handle_socks5),
+            args=(conn,),
+            daemon=True,
+        )
+        t.start()
+
+
+if __name__ == "__main__":
+    main()
+PY
+chmod +x /tmp/qingtian-forward-proxy.py
+```
+
+### 15.2 跑 HTTP CONNECT 代理出口
+
+```bash
+source ~/qingtian-proof-vars.sh
+
+PROXY_PORT=18080
+PROXY_PID_FILE=/tmp/qingtian-forward-proxy.pid
+
+nohup /tmp/qingtian-forward-proxy.py --mode http-connect --listen 127.0.0.1:${PROXY_PORT} \
+  > /tmp/qingtian-forward-proxy-http.log 2>&1 &
+echo $! > "$PROXY_PID_FILE"
+
+cat > ~/qingtian-forward-proxy-http.env <<EOF
+QINGTIAN_IMAGE=proof-observation-qingtian:proxy-http
+QINGTIAN_EIF=proof-observation-qingtian.proxy-http.signed.eif
+QINGTIAN_CID=4
+QINGTIAN_CPUS=2
+QINGTIAN_MEM=4096
+QINGTIAN_PARENT_CIDS=3
+QINGTIAN_EGRESS_MODE=qproxy
+QINGTIAN_QPROXY_ENABLED=1
+QINGTIAN_QPROXY_PARENT_CID=3
+QINGTIAN_QPROXY_EGRESS_PORTS=${PROXY_PORT}
+QINGTIAN_UPSTREAM_PROXY_URL=http://127.0.0.1:${PROXY_PORT}
+QINGTIAN_PRIVATE_KEY=private-key.pem
+QINGTIAN_SIGNING_CERTIFICATE=server.pem
+QINGTIAN_QT_DOCKER_CONFIG=
+QINGTIAN_START_EXTRA_ARGS=
+EOF
+
+bash deploy/qingtian-runtime/run.sh ~/qingtian-forward-proxy-http.env
+```
+
+new-api 里把要走代理的上游都映射到同一个 egress port：
+
+```bash
+cat > ~/qingtian-forward-proxy-newapi.env <<EOF
+export TEE_PROOF_ENABLED=true
+export TEE_PROOF_ENCLAVE_CID=4
+export TEE_PROOF_ENCLAVE_PORT=5005
+export TEE_PROOF_EGRESS_PORTS=dashscope.aliyuncs.com:${PROXY_PORT},api.openai.com:${PROXY_PORT}
+EOF
+```
+
+发起请求：
+
+```bash
+cd "$DEPLOY_DIR"
+source ~/qingtian-forward-proxy-newapi.env
+
+cat > request.proxy-http.nonstream.json <<EOF
+{
+  "model": "qwen3.7-plus",
+  "messages": [{"role": "user", "content": "你好，请用一句话介绍一下你自己。"}],
+  "stream": false
+}
+EOF
+
+curl -sS -D headers.proxy-http.nonstream.txt \
+  "http://127.0.0.1:$NEW_API_PORT/v1/chat/completions" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "X-TEE-Proof: required" \
+  --data-binary @request.proxy-http.nonstream.json \
+  -o response.proxy-http.nonstream.multipart
+
+cat > request.proxy-http.stream.json <<EOF
+{
+  "model": "qwen3.7-plus",
+  "messages": [{"role": "user", "content": "你好，请用一句话介绍一下你自己。"}],
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}
+EOF
+
+curl -N -sS -D headers.proxy-http.stream.txt \
+  "http://127.0.0.1:$NEW_API_PORT/v1/chat/completions" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "X-TEE-Proof: required" \
+  --data-binary @request.proxy-http.stream.json \
+  -o response.proxy-http.stream.sse
+
+grep -a 'CONNECT dashscope.aliyuncs.com:443' /tmp/qingtian-forward-proxy-http.log
+grep -a '"profile":"qingtian"' response.proxy-http.nonstream.multipart response.proxy-http.stream.sse
+```
+
+verifier 验证：
+
+```bash
+cd "$PROOF_REPO/verifier"
+npm ci
+
+npx tsx tee-verify-stream.ts "$DEPLOY_DIR/response.proxy-http.nonstream.multipart" \
+  --trust "$DEPLOY_DIR/qingtian-trust.e2e.json" \
+  --host dashscope.aliyuncs.com
+
+npx tsx tee-verify-stream.ts "$DEPLOY_DIR/response.proxy-http.stream.sse" \
+  --trust "$DEPLOY_DIR/qingtian-trust.e2e.json" \
+  --host dashscope.aliyuncs.com
+
+npx tsx make-real-bundle.ts \
+  "$DEPLOY_DIR/request.proxy-http.nonstream.json" \
+  "$DEPLOY_DIR/response.proxy-http.nonstream.multipart" \
+  "$DEPLOY_DIR/bundle.proxy-http.nonstream.json"
+
+npx tsx verify-real-bundle.ts \
+  "$DEPLOY_DIR/bundle.proxy-http.nonstream.json" \
+  --trust "$DEPLOY_DIR/qingtian-trust.e2e.json" \
+  --host dashscope.aliyuncs.com
+```
+
+### 15.3 跑 SOCKS5 代理出口
+
+先停掉 HTTP CONNECT 代理，再启动 SOCKS5 代理：
+
+```bash
+kill "$(cat /tmp/qingtian-forward-proxy.pid)" 2>/dev/null || true
+
+nohup /tmp/qingtian-forward-proxy.py --mode socks5 --listen 127.0.0.1:${PROXY_PORT} \
+  > /tmp/qingtian-forward-proxy-socks5.log 2>&1 &
+echo $! > /tmp/qingtian-forward-proxy.pid
+
+cat > ~/qingtian-forward-proxy-socks5.env <<EOF
+QINGTIAN_IMAGE=proof-observation-qingtian:proxy-socks5
+QINGTIAN_EIF=proof-observation-qingtian.proxy-socks5.signed.eif
+QINGTIAN_CID=4
+QINGTIAN_CPUS=2
+QINGTIAN_MEM=4096
+QINGTIAN_PARENT_CIDS=3
+QINGTIAN_EGRESS_MODE=qproxy
+QINGTIAN_QPROXY_ENABLED=1
+QINGTIAN_QPROXY_PARENT_CID=3
+QINGTIAN_QPROXY_EGRESS_PORTS=${PROXY_PORT}
+QINGTIAN_UPSTREAM_PROXY_URL=socks5://127.0.0.1:${PROXY_PORT}
+QINGTIAN_PRIVATE_KEY=private-key.pem
+QINGTIAN_SIGNING_CERTIFICATE=server.pem
+QINGTIAN_QT_DOCKER_CONFIG=
+QINGTIAN_START_EXTRA_ARGS=
+EOF
+
+bash deploy/qingtian-runtime/run.sh ~/qingtian-forward-proxy-socks5.env
+```
+
+再次发起同样的请求，然后验证：
+
+```bash
+cd "$DEPLOY_DIR"
+source ~/qingtian-forward-proxy-newapi.env
+
+curl -sS -D headers.proxy-socks5.nonstream.txt \
+  "http://127.0.0.1:$NEW_API_PORT/v1/chat/completions" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "X-TEE-Proof: required" \
+  --data-binary @request.proxy-http.nonstream.json \
+  -o response.proxy-socks5.nonstream.multipart
+
+grep -a 'SOCKS5 connect failed' /tmp/qingtian-forward-proxy-socks5.log 2>/dev/null || true
+grep -a '"profile":"qingtian"' response.proxy-socks5.nonstream.multipart
+
+cd "$PROOF_REPO/verifier"
+npx tsx tee-verify-stream.ts "$DEPLOY_DIR/response.proxy-socks5.nonstream.multipart" \
+  --trust "$DEPLOY_DIR/qingtian-trust.e2e.json" \
+  --host dashscope.aliyuncs.com
+```
+
+如果你只想验证“通过代理访问模型仍然能通过验证”，这节就够了。HTTP CONNECT 和 SOCKS5 都会走同一套 proof verifier，差别只在 Enclave 内部的代理握手。

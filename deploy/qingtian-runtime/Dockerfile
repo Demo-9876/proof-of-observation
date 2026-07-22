@@ -12,6 +12,7 @@
 #     --build-arg CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/ \
 #     --build-arg POO_PARENT_CIDS=3 \
 #     --build-arg POO_QPROXY_EGRESS_PORTS=8444,8445 \
+#     --build-arg POO_UPSTREAM_PROXY_URL=http://127.0.0.1:18080 \
 #     -f deploy/qingtian-runtime/Dockerfile \
 #     -t proof-observation-qingtian:dev .
 
@@ -79,6 +80,8 @@ ARG POO_EGRESS_MODE=qproxy
 ARG POO_QPROXY_ENABLED=1
 ARG POO_QPROXY_PARENT_CID=3
 ARG POO_QPROXY_EGRESS_PORTS=8444,8445
+ARG POO_UPSTREAM_PROXY_URL=
+ARG POO_FORWARD_PROXY_PROTOCOL=
 
 RUN if [ -n "$APT_MIRROR" ]; then \
       sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g; s|http://security.debian.org/debian-security|$APT_MIRROR-security|g" /etc/apt/sources.list.d/debian.sources; \
@@ -103,6 +106,8 @@ ENV TEE_PROFILE=qingtian \
     POO_QPROXY_ENABLED=${POO_QPROXY_ENABLED} \
     POO_QPROXY_PARENT_CID=${POO_QPROXY_PARENT_CID} \
     POO_QPROXY_CONFIG=/etc/qproxy/config.toml \
+    POO_UPSTREAM_PROXY_URL=${POO_UPSTREAM_PROXY_URL} \
+    POO_FORWARD_PROXY_PROTOCOL=${POO_FORWARD_PROXY_PROTOCOL} \
     LD_LIBRARY_PATH=/usr/local/lib
 
 RUN mkdir -p /etc/qproxy /tmp/qproxy && \
