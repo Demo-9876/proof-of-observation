@@ -1,0 +1,103 @@
+ARG ALIYUN_ENCLAVE_PLATFORM=linux/amd64
+ARG GO_BUILDER_IMAGE=docker.io/library/golang@sha256:98d673f18a1aac43da744209873cb79323e11706f909251bcfb131828b95559d
+ARG GO_MODULE_PROXY=https://proxy.golang.org,direct
+ARG GO_SUMDB=sum.golang.org
+ARG RUST_BUILDER_IMAGE=docker.io/library/rust@sha256:64d9b7f60e3abb08d477cad983d0a3743acc53a19369ba4482510184c9c807e5
+ARG APT_MIRROR=http://deb.debian.org/debian
+ARG APT_SECURITY_MIRROR=http://deb.debian.org/debian-security
+ARG CARGO_REGISTRY_PROTOCOL=sparse
+ARG CARGO_REGISTRY_REPLACE_WITH=
+ARG CARGO_REGISTRY_MIRROR=
+ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim
+
+FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} ${GO_BUILDER_IMAGE} AS go-builder
+
+ARG GO_MODULE_PROXY
+ARG GO_SUMDB
+
+ENV GOPROXY=${GO_MODULE_PROXY} \
+    GOSUMDB=${GO_SUMDB}
+
+WORKDIR /src/aliyun-enclave
+
+COPY aliyun-enclave/go.mod aliyun-enclave/go.sum ./
+RUN go mod download
+
+COPY aliyun-enclave/. ./
+RUN CGO_ENABLED=0 go build -tags aliyun_enclave -trimpath -ldflags="-s -w" -o /out/aliyun-proof-helper ./cmd/aliyun-proof-helper
+
+FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} ${RUST_BUILDER_IMAGE} AS rust-builder
+
+ARG APT_MIRROR
+ARG APT_SECURITY_MIRROR
+ARG CARGO_REGISTRY_PROTOCOL
+ARG CARGO_REGISTRY_REPLACE_WITH
+ARG CARGO_REGISTRY_MIRROR
+
+WORKDIR /src/enclave
+
+ENV SOURCE_DATE_EPOCH=0 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=${CARGO_REGISTRY_PROTOCOL} \
+    RUSTFLAGS="--remap-path-prefix=/src=/src --remap-path-prefix=/usr/local/cargo=/cargo"
+
+RUN set -eux; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+      if [ -f "$f" ]; then \
+        sed -i \
+          -e "s|http://deb.debian.org/debian-security|${APT_SECURITY_MIRROR}|g" \
+          -e "s|http://deb.debian.org/debian|${APT_MIRROR}|g" \
+          "$f"; \
+      fi; \
+    done
+
+RUN apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    mkdir -p /usr/local/cargo; \
+    if [ -n "${CARGO_REGISTRY_REPLACE_WITH}" ] && [ -n "${CARGO_REGISTRY_MIRROR}" ]; then \
+      { \
+        echo "[source.crates-io]"; \
+        echo "replace-with = \"${CARGO_REGISTRY_REPLACE_WITH}\""; \
+        echo; \
+        echo "[source.${CARGO_REGISTRY_REPLACE_WITH}]"; \
+        echo "registry = \"${CARGO_REGISTRY_MIRROR}\""; \
+      } > /usr/local/cargo/config.toml; \
+    fi
+
+ENV CFLAGS="-O2 -g0 -ffile-prefix-map=/src=/src -ffile-prefix-map=/usr/local/cargo=/cargo" \
+    CXXFLAGS="-O2 -g0 -ffile-prefix-map=/src=/src -ffile-prefix-map=/usr/local/cargo=/cargo"
+
+COPY enclave/Cargo.toml enclave/Cargo.lock ./
+COPY enclave/src ./src
+
+RUN cargo build --release --locked
+
+FROM --platform=${ALIYUN_ENCLAVE_PLATFORM} ${RUNTIME_IMAGE}
+
+ARG APT_MIRROR
+ARG APT_SECURITY_MIRROR
+
+RUN set -eux; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+      if [ -f "$f" ]; then \
+        sed -i \
+          -e "s|http://deb.debian.org/debian-security|${APT_SECURITY_MIRROR}|g" \
+          -e "s|http://deb.debian.org/debian|${APT_MIRROR}|g" \
+          "$f"; \
+      fi; \
+    done; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates libstdc++6; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=rust-builder /src/enclave/target/release/attest /attest
+COPY --from=go-builder /out/aliyun-proof-helper /usr/bin/aliyun-proof-helper
+COPY deploy/aliyun-vtpm-runtime/run.sh /run.sh
+
+RUN chmod 0755 /attest /usr/bin/aliyun-proof-helper /run.sh
+
+ENV TEE_PROFILE=aliyun-vtpm \
+    ALIYUN_PROOF_HELPER_SOCKET=/run/aliyun-proof-helper.sock
+
+CMD ["/run.sh"]

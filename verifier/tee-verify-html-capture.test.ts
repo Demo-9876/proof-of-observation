@@ -108,6 +108,14 @@ describe('docs/tee-verify.html capture parser preserves signed response bytes', 
     expect(html).not.toContain('✓ 成立');
   });
 
+  it('reports aliyun-vtpm as unsupported in the phase-1 browser verifier', () => {
+    expect(html).toContain("const proofProfile=(working&&working.proof&&working.proof.profile)||'nitro'");
+    expect(html).toContain("if(proofProfile!=='nitro')");
+    expect(html).toContain("L('不支持的 Evidence profile','Unsupported Evidence profile')");
+    expect(html).toContain('第一阶段浏览器 verifier 只支持 AWS Nitro profile');
+    expect(html).toContain('aliyun-vtpm 需要使用 Node/CLI verifier');
+  });
+
   it('renders the final trust verdict as a scannable summary card', () => {
     expect(html).toContain('.result-fields { display:grid; grid-template-columns:1.4fr 1fr 1.05fr 1.45fr');
     expect(html).toContain('.result-chain { display:grid; grid-template-columns:repeat(3,minmax(0,1fr))');

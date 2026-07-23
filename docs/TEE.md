@@ -12,6 +12,7 @@ Ed25519 签名,并用 NSM attestation 把签名公钥 + PCR0 绑定到 AWS Nitro
 | [`proof-of-observation-protocol-v1.md`](proof-of-observation-protocol-v1.md) | **规范文本**(RFC2119,实现无关):签名声明 / attestation / wire / 验证流程 —— **以此为准** |
 | [`tee-signing-v2-design.md`](tee-signing-v2-design.md) | 设计 rationale(为什么这么分字段),非规范 |
 | [`tee-reproducible-build.md`](tee-reproducible-build.md) | 从公开源复算 PCR0 的可复现构建 |
+| [`evidence-profile-aliyun-vtpm.md`](evidence-profile-aliyun-vtpm.md) | 阿里云 Enclave vTPM Evidence profile；记录 SigningEK 证书链、EK CN 区分、CRL、PCR/debug-mode 结论 |
 | [`tee-verify.html`](tee-verify.html) — [**在线打开 ↗**](https://focuxdot.github.io/proof-of-observation/tee-verify.html) | 浏览器端验证器(贴流式 SSE / 非流式 proof 响应即验) |
 | [`tee-attestation-demo.html`](tee-attestation-demo.html) — [**在线打开 ↗**](https://focuxdot.github.io/proof-of-observation/tee-attestation-demo.html) | 自证原理交互演示页 |
 | [`../enclave/README.md`](../enclave/README.md) | 飞地 crate(受度量 TCB) |
