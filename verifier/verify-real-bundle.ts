@@ -4,7 +4,7 @@
 //   npx tsx verify-real-bundle.ts <bundle.json> (--pcr0 <hex> | --trust <trust.json>) [--host <api.example.com>] [--nonce-b64 <b64>]
 //
 //   · --pcr0  Nitro legacy:审计公布、且可由 docs/tee-reproducible-build.md 复算的镜像度量
-//   · --trust profile-aware trust config;QingTian 等非 Nitro profile 必填
+//   · --trust profile-aware trust config;Aliyun/QingTian 等非 Nitro profile 必填
 //   · --host  (可选)核对签名覆盖的 upstream_host;不给则只展示由你判断
 //   · --nonce-b64 (可选)核对用户本次挑战 nonce,防重放
 //

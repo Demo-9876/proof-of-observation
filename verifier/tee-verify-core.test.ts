@@ -5,7 +5,12 @@
 // 签名半边用真 Ed25519(自生成密钥)+ signing.ts 真 v2 声明,验的是真验签逻辑。
 
 import { describe, it, expect } from 'vitest';
-import { generateKeyPairSync, sign as edSign } from 'node:crypto';
+import { generateKeyPairSync, sign as edSign, X509Certificate } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { buildAliyunVtpmChallengeHex, buildAliyunVtpmChallengePayload } from './evidence-aliyun-vtpm.ts';
 import {
   verifyTeeExchange,
   parseTeeProofCapture,
@@ -16,7 +21,7 @@ import {
   type AttestationVerifier,
 } from './tee-verify-core.ts';
 import type { EvidenceProfileVerifier } from './evidence-profile.ts';
-import { computeV2SigningMaterial } from './signing.ts';
+import { computeV2SigningMaterial, sha256 } from './signing.ts';
 
 const NONCE = Buffer.from('a-fresh-16b-nonce').toString('base64');
 const PCR0 = 'aeb9e595deadbeef';
@@ -257,7 +262,7 @@ describe('verifyTeeExchange v2 (response-only mode)', () => {
 
     expect(r.ok).toBe(false);
     expect(r.attestation.profile).toBe('qingtian');
-    expect(r.checks.find((c) => c.name === '远程证明')?.detail).toContain('需要显式 trust config');
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.detail).toContain('必须由本地 trust.profile 显式选择');
   });
 
   it('fails closed when proof profile and trust profile differ', () => {
@@ -270,7 +275,7 @@ describe('verifyTeeExchange v2 (response-only mode)', () => {
     });
 
     expect(r.ok).toBe(false);
-    expect(r.checks.find((c) => c.name === '远程证明')?.detail).toContain('不一致');
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.detail).toContain('不一致');
   });
 
   it('fails closed when a non-Nitro trust profile is used without an explicit proof profile', () => {
@@ -287,7 +292,7 @@ describe('verifyTeeExchange v2 (response-only mode)', () => {
 
     expect(r.ok).toBe(false);
     expect(r.attestation.profile).toBe('qingtian');
-    expect(r.checks.find((c) => c.name === '远程证明')?.detail).toContain('必须显式携带 profile');
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.detail).toContain('proof 未声明同一 profile');
   });
 
   it('fails closed for a trusted but unsupported evidence profile', () => {
@@ -346,6 +351,286 @@ describe('verifyTeeExchange v2 (response-only mode)', () => {
     expect(r.attestation.publicKey).toBe(pubB64);
     expect(r.attestation.pcr8).toBe('11'.repeat(48));
     expect(r.attestation.platformTrust?.ok).toBe(true);
+  });
+});
+
+describe('verifyTeeExchange aliyun-vtpm profile (experimental local quote mode)', () => {
+  it('verifies QuoteReport signature, challenge, PCR digest, and PCR allowlist without platform trust', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: aliyunTrust(expectedPcrs),
+    });
+
+    expect(r.ok, JSON.stringify(r.checks)).toBe(true);
+    expect(r.attestation.profile).toBe('aliyun-vtpm');
+    expect(r.attestation.measurements?.['sha256:8']).toBe(expectedPcrs['sha256:8']);
+    expect(r.checks.find((c) => c.name === '平台证明链')?.ok).toBe(true);
+    expect(r.attestation.platformTrust?.status).toBe('platform_trust_missing');
+  });
+
+  it('accepts QuoteReport.quoted_b64 encoded as TPM2B_ATTEST with a size prefix', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    const evidence = proof.evidence as any;
+    const quoteMsg = Buffer.from(evidence.quote_report.quoted_b64, 'base64');
+    evidence.quote_report.quoted_b64 = tpm2b(quoteMsg).toString('base64');
+    proof.attestation = Buffer.from(JSON.stringify(evidence), 'utf8').toString('base64');
+
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: aliyunTrust(expectedPcrs),
+    });
+
+    expect(r.ok, JSON.stringify(r.checks)).toBe(true);
+    expect(r.checks.find((c) => c.name === 'QuoteReport 字段')?.detail).toContain('TPM2B_ATTEST');
+    expect(r.checks.find((c) => c.name === 'quote 结构')?.ok).toBe(true);
+    expect(r.checks.find((c) => c.name === 'quote 签名')?.ok).toBe(true);
+  });
+
+  it('fails closed when platform trust is required but no QuoteReport.Cert chain is present', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: aliyunTrust(expectedPcrs, { requirePlatformTrust: true }),
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === '平台证明链')?.ok).toBe(false);
+    expect(r.attestation.platformTrust?.status).toBe('platform_trust_missing');
+  });
+
+  it('rejects a synthetic SPKI cert unless tests explicitly allow it', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: { profile: 'aliyun-vtpm', expectedPcrs, requirePlatformTrust: false },
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'QuoteReport 字段')?.ok).toBe(false);
+  });
+
+  it('rejects missing required PCR allowlist entries', () => {
+    const { proof, responseBody } = makeAliyunSigned();
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: {
+        profile: 'aliyun-vtpm',
+        requirePlatformTrust: false,
+        allowSyntheticQuoteReportCertForTest: true,
+      },
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'PCR allowlist')?.ok).toBe(false);
+  });
+
+  it('verifies QuoteReport.Cert against configured Aliyun TPM root/intermediate and Enclave CN', () => {
+    const { proof, responseBody, expectedPcrs, chain } = makeAliyunSignedWithX509Chain('i-testabcdef-enclave-1');
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: {
+        ...aliyunTrust(expectedPcrs, { allowSyntheticQuoteReportCertForTest: false }),
+        requirePlatformTrust: true,
+        platformTrust: {
+          mode: 'cert-chain',
+          rootCertificatesPem: [chain.rootPem],
+          intermediateCertificatesPem: [chain.intermediatePem],
+          rootFingerprintsSha256: [certFingerprint(chain.rootPem)],
+          intermediateFingerprintsSha256: [certFingerprint(chain.intermediatePem)],
+          revocation: { required: false, method: 'crl' },
+        },
+      },
+    });
+
+    expect(r.ok, JSON.stringify(r.checks)).toBe(true);
+    expect(r.attestation.platformTrust?.status).toBe('ok');
+    expect(r.checks.find((c) => c.name === '平台证明链')?.ok).toBe(true);
+  });
+
+  it('rejects a QuoteReport.Cert chain whose EK CN does not identify an Enclave vTPM', () => {
+    const { proof, responseBody, expectedPcrs, chain } = makeAliyunSignedWithX509Chain('i-testabcdef');
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: {
+        ...aliyunTrust(expectedPcrs, { allowSyntheticQuoteReportCertForTest: false }),
+        requirePlatformTrust: true,
+        platformTrust: {
+          mode: 'cert-chain',
+          rootCertificatesPem: [chain.rootPem],
+          intermediateCertificatesPem: [chain.intermediatePem],
+          revocation: { required: false, method: 'crl' },
+        },
+      },
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.attestation.platformTrust?.status).toBe('platform_trust_invalid');
+    expect(r.checks.find((c) => c.name === '平台证明链')?.detail).toContain('CN');
+  });
+
+  it('fails closed when CRL revocation is required but has not been checked externally', () => {
+    const { proof, responseBody, expectedPcrs, chain } = makeAliyunSignedWithX509Chain('i-testabcdef-01');
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: {
+        ...aliyunTrust(expectedPcrs, { allowSyntheticQuoteReportCertForTest: false }),
+        requirePlatformTrust: true,
+        platformTrust: {
+          mode: 'cert-chain',
+          rootCertificatesPem: [chain.rootPem],
+          intermediateCertificatesPem: [chain.intermediatePem],
+          revocation: { required: true, method: 'crl' },
+        },
+      },
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.attestation.platformTrust?.status).toBe('platform_trust_invalid');
+    expect(r.checks.find((c) => c.name === '平台证明链')?.detail).toContain('CRL');
+  });
+
+  it('fails closed when a cert-chain trust mode is configured but the root pin does not match', () => {
+    const { proof, responseBody, expectedPcrs, chain } = makeAliyunSignedWithX509Chain('i-testabcdef-01');
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: {
+        ...aliyunTrust(expectedPcrs, { allowSyntheticQuoteReportCertForTest: false }),
+        platformTrust: {
+          mode: 'cert-chain',
+          rootCertificatesPem: [chain.rootPem],
+          intermediateCertificatesPem: [chain.intermediatePem],
+          rootFingerprintsSha256: ['00'.repeat(32)],
+        },
+      },
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.attestation.platformTrust?.status).toBe('platform_trust_invalid');
+    expect(r.checks.find((c) => c.name === '平台证明链')?.ok).toBe(false);
+  });
+
+  it('does not let proof.profile select aliyun-vtpm without local trust.profile', () => {
+    const { proof, responseBody } = makeAliyunSigned();
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.ok).toBe(false);
+  });
+
+  it('fails closed when trust.profile and proof.profile disagree', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    proof.profile = 'nitro';
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: aliyunTrust(expectedPcrs),
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.ok).toBe(false);
+  });
+
+  it('rejects a PCR allowlist mismatch', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: {
+        profile: 'aliyun-vtpm',
+        expectedPcrs: { ...expectedPcrs, 'sha256:9': '00'.repeat(32) },
+        requirePlatformTrust: false,
+        allowSyntheticQuoteReportCertForTest: true,
+      },
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'sha256:9 比对')?.ok).toBe(false);
+  });
+
+  it('rejects a challenge that was not rebuilt from the signed statement fields', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    (proof.evidence as any).challenge.qualifying_data_hex = '11'.repeat(32);
+
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: aliyunTrust(expectedPcrs),
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'qualifying data')?.ok).toBe(false);
+  });
+
+  it('rejects a non-sha256 challenge algorithm', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    (proof.evidence as any).challenge.alg = 'sha1';
+
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: aliyunTrust(expectedPcrs),
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'challenge alg')?.ok).toBe(false);
+  });
+
+  it('rejects payload_b64 tampering even if qualifying_data_hex is unchanged', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    (proof.evidence as any).challenge.payload_b64 = Buffer.from('{"profile":"aliyun-vtpm"}', 'utf8').toString('base64');
+
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: aliyunTrust(expectedPcrs),
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'challenge payload')?.ok).toBe(false);
+  });
+
+  it('rejects a corrupted quote signature', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    const evidence = proof.evidence as any;
+    const sig = Buffer.from(evidence.quote_report.signature_b64, 'base64');
+    sig[sig.length - 1] ^= 0xff;
+    evidence.quote_report.signature_b64 = sig.toString('base64');
+
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: aliyunTrust(expectedPcrs),
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'quote 签名')?.ok).toBe(false);
+  });
+
+  it('rejects an evidence envelope with the wrong profile id', () => {
+    const { proof, responseBody, expectedPcrs } = makeAliyunSigned();
+    (proof.evidence as any).profile = 'nitro';
+
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: aliyunTrust(expectedPcrs),
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'Evidence 格式')?.ok).toBe(false);
   });
 });
 
@@ -575,4 +860,202 @@ function formatProofTailCapture(params: {
   ].join('\n'), 'utf8');
   const end = Buffer.from(`\n--${params.boundary}--`, 'utf8');
   return Buffer.concat([params.rawBody, proofPart, proofBody, end]);
+}
+
+function makeAliyunSigned() {
+  const { proof, requestBody, responseBody } = makeSigned();
+  proof.profile = 'aliyun-vtpm';
+  const { publicKey: akPublicKey, privateKey: akPrivateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const pcrValues = {
+    'sha256:8': '7b0dc879a95df8afea46aa7f1e681a5b36f80adf2a37aa34c8e4856a4e3ffb39',
+    'sha256:9': 'b5753ad8242e1c3b8150caf7098f0aea082f64bcc49f04ae440bef5401e02575',
+    'sha256:11': 'f9dadb71385c36fff43e70e4796073b76ec5cb85a44705ad368433c79c12f894',
+  };
+  const pcrDigest = sha256(Buffer.concat([
+    Buffer.from(pcrValues['sha256:8'], 'hex'),
+    Buffer.from(pcrValues['sha256:9'], 'hex'),
+    Buffer.from(pcrValues['sha256:11'], 'hex'),
+  ]));
+  const challengePayload = buildAliyunVtpmChallengePayload(proof);
+  const challengeHex = buildAliyunVtpmChallengeHex(proof);
+  const quoteMsg = buildSyntheticTpmQuoteMessage(Buffer.from(challengeHex, 'hex'), pcrDigest);
+  const quoteSig = buildSyntheticTpmRsassaSignature(edSign('sha256', quoteMsg, akPrivateKey));
+  const pcrSelectionOut = buildSyntheticPcrSelection();
+  const pcrValuesRaw = buildSyntheticTpmlDigest([
+    Buffer.from(pcrValues['sha256:8'], 'hex'),
+    Buffer.from(pcrValues['sha256:9'], 'hex'),
+    Buffer.from(pcrValues['sha256:11'], 'hex'),
+  ]);
+  const evidence = {
+    profile: 'aliyun-vtpm',
+    version: 1,
+    quote_report: {
+      quoted_b64: quoteMsg.toString('base64'),
+      signature_b64: quoteSig.toString('base64'),
+      cert_b64: akPublicKey.export({ format: 'der', type: 'spki' }).toString('base64'),
+      pcr_info: {
+        pcr_values_b64: pcrValuesRaw.toString('base64'),
+        pcr_selection_out_b64: pcrSelectionOut.toString('base64'),
+        pcr_update_counter: 0,
+      },
+    },
+    challenge: {
+      alg: 'sha256',
+      payload_b64: Buffer.from(challengePayload, 'utf8').toString('base64'),
+      qualifying_data_hex: challengeHex,
+    },
+    platform_attestation: {
+      mode: 'missing',
+      cert_chain_pem: [],
+      verification_note: 'QuoteReport.Cert root/intermediate chain is not configured in experimental mode.',
+    },
+  };
+  proof.evidence = evidence;
+  proof.attestation = Buffer.from(JSON.stringify(evidence), 'utf8').toString('base64');
+  return { proof, requestBody, responseBody, expectedPcrs: pcrValues, challengeHex };
+}
+
+function makeAliyunSignedWithX509Chain(cn: string) {
+  const base = makeAliyunSigned();
+  const chain = makeTestCertificateChain(cn);
+  const evidence = base.proof.evidence as any;
+  const quoteMsg = Buffer.from(evidence.quote_report.quoted_b64, 'base64');
+  evidence.quote_report.signature_b64 = buildSyntheticTpmRsassaSignature(edSign('sha256', quoteMsg, chain.leafKeyPem)).toString('base64');
+  evidence.quote_report.cert_b64 = new X509Certificate(chain.leafPem).raw.toString('base64');
+  evidence.platform_attestation.mode = 'cert-chain';
+  base.proof.attestation = Buffer.from(JSON.stringify(evidence), 'utf8').toString('base64');
+  return { ...base, chain };
+}
+
+function makeTestCertificateChain(cn: string) {
+  const dir = mkdtempSync(join(tmpdir(), 'aliyun-vtpm-cert-chain-'));
+  const rootKey = join(dir, 'root.key');
+  const rootPem = join(dir, 'root.pem');
+  const intermediateKey = join(dir, 'intermediate.key');
+  const intermediateCsr = join(dir, 'intermediate.csr');
+  const intermediatePem = join(dir, 'intermediate.pem');
+  const leafKey = join(dir, 'leaf.key');
+  const leafCsr = join(dir, 'leaf.csr');
+  const leafPem = join(dir, 'leaf.pem');
+  const caExt = join(dir, 'ca.ext');
+  const leafExt = join(dir, 'leaf.ext');
+
+  writeFileSync(caExt, [
+    '[v3_ca]',
+    'basicConstraints=critical,CA:true',
+    'keyUsage=critical,keyCertSign,cRLSign',
+    'subjectKeyIdentifier=hash',
+    '',
+  ].join('\n'));
+  writeFileSync(leafExt, [
+    '[v3_leaf]',
+    'basicConstraints=critical,CA:false',
+    'keyUsage=critical,digitalSignature',
+    'subjectKeyIdentifier=hash',
+    '',
+  ].join('\n'));
+
+  execFileSync('openssl', ['genrsa', '-out', rootKey, '2048'], { stdio: 'ignore' });
+  execFileSync('openssl', [
+    'req', '-x509', '-new', '-nodes', '-key', rootKey, '-sha384', '-days', '3650',
+    '-subj', '/C=CN/O=Aliyun/OU=Aliyun TPM Root CA/CN=Aliyun TPM Root CA',
+    '-out', rootPem,
+    '-addext', 'basicConstraints=critical,CA:true',
+    '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+  ], { stdio: 'ignore' });
+  execFileSync('openssl', ['genrsa', '-out', intermediateKey, '2048'], { stdio: 'ignore' });
+  execFileSync('openssl', [
+    'req', '-new', '-key', intermediateKey,
+    '-subj', '/C=CN/O=Aliyun/OU=Aliyun TPM Endorsement Key Manufacture CA/CN=Aliyun TPM EKMF CA',
+    '-out', intermediateCsr,
+  ], { stdio: 'ignore' });
+  execFileSync('openssl', [
+    'x509', '-req', '-in', intermediateCsr, '-CA', rootPem, '-CAkey', rootKey, '-CAcreateserial',
+    '-out', intermediatePem, '-days', '3650', '-sha384', '-extfile', caExt, '-extensions', 'v3_ca',
+  ], { stdio: 'ignore' });
+  execFileSync('openssl', ['genrsa', '-out', leafKey, '2048'], { stdio: 'ignore' });
+  execFileSync('openssl', [
+    'req', '-new', '-key', leafKey,
+    '-subj', `/C=CN/O=Aliyun/OU=Aliyun TPM Signing EK/CN=${cn}`,
+    '-out', leafCsr,
+  ], { stdio: 'ignore' });
+  execFileSync('openssl', [
+    'x509', '-req', '-in', leafCsr, '-CA', intermediatePem, '-CAkey', intermediateKey, '-CAcreateserial',
+    '-out', leafPem, '-days', '365', '-sha256', '-extfile', leafExt, '-extensions', 'v3_leaf',
+  ], { stdio: 'ignore' });
+
+  return {
+    rootPem: readFileSync(rootPem, 'utf8'),
+    intermediatePem: readFileSync(intermediatePem, 'utf8'),
+    leafPem: readFileSync(leafPem, 'utf8'),
+    leafKeyPem: readFileSync(leafKey, 'utf8'),
+  };
+}
+
+function certFingerprint(pem: string) {
+  return new X509Certificate(pem).fingerprint256.replace(/:/g, '').toLowerCase();
+}
+
+function aliyunTrust(expectedPcrs: Record<string, string>, overrides: Record<string, unknown> = {}) {
+  return {
+    profile: 'aliyun-vtpm',
+    expectedPcrs,
+    requirePlatformTrust: false,
+    allowSyntheticQuoteReportCertForTest: true,
+    ...overrides,
+  };
+}
+
+function buildSyntheticTpmQuoteMessage(extraData: Buffer, pcrDigest: Buffer): Buffer {
+  return Buffer.concat([
+    u32(0xff544347), // TPM_GENERATED_VALUE
+    u16(0x8018), // TPM_ST_ATTEST_QUOTE
+    tpm2b(Buffer.alloc(0)), // qualifiedSigner
+    tpm2b(extraData),
+    Buffer.alloc(17), // TPMS_CLOCK_INFO
+    Buffer.alloc(8), // firmwareVersion
+    u32(1), // TPML_PCR_SELECTION count
+    u16(0x000b), // TPM_ALG_SHA256
+    Buffer.from([3, 0x00, 0x0b, 0x00]), // sizeofSelect=3, PCR 8/9/11
+    tpm2b(pcrDigest),
+  ]);
+}
+
+function buildSyntheticPcrSelection(): Buffer {
+  return Buffer.concat([
+    u32(1), // TPML_PCR_SELECTION count
+    u16(0x000b), // TPM_ALG_SHA256
+    Buffer.from([3, 0x00, 0x0b, 0x00]), // sizeofSelect=3, PCR 8/9/11
+  ]);
+}
+
+function buildSyntheticTpmlDigest(digests: Buffer[]): Buffer {
+  return Buffer.concat([
+    u32(digests.length),
+    ...digests.map(tpm2b),
+  ]);
+}
+
+function buildSyntheticTpmRsassaSignature(signature: Buffer): Buffer {
+  return Buffer.concat([
+    u16(0x0014), // TPM_ALG_RSASSA
+    u16(0x000b), // TPM_ALG_SHA256
+    tpm2b(signature),
+  ]);
+}
+
+function tpm2b(value: Buffer): Buffer {
+  return Buffer.concat([u16(value.length), value]);
+}
+
+function u16(value: number): Buffer {
+  const b = Buffer.alloc(2);
+  b.writeUInt16BE(value);
+  return b;
+}
+
+function u32(value: number): Buffer {
+  const b = Buffer.alloc(4);
+  b.writeUInt32BE(value);
+  return b;
 }

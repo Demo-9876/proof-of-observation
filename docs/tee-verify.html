@@ -2213,6 +2213,17 @@ async function runDataProcessing(options={}){
 async function runVerification(options={}){
   const animate=options.animate!==false, doScroll=options.scroll!==false, rerender=!!options.rerender;
   const myGen=++runGen;                                // 后发的运行作废先前未跑完的动画
+  const proofProfile=(working&&working.proof&&working.proof.profile)||'nitro';
+  if(proofProfile!=='nitro'){
+    showVerdictMessage(
+      'bad',
+      L('不支持的 Evidence profile','Unsupported Evidence profile'),
+      L('第一阶段浏览器 verifier 只支持 AWS Nitro profile。','The phase-1 browser verifier supports only the AWS Nitro profile.')
+        +' profile='+proofProfile
+        +L('；aliyun-vtpm 需要使用 Node/CLI verifier，或等待后续纯 TS/WASM quote/cert-chain 验证实现。','; aliyun-vtpm requires the Node/CLI verifier, or a later pure TS/WASM quote/cert-chain implementation.'),
+    );
+    return;
+  }
   const useTrust={awsRootPublicKeyPem:$('root').value,expectedPcr0:$('pcr0').value.trim()};
   if(!normalizePcr0(useTrust.expectedPcr0)){
     showVerdictMessage('warn',tt('missingPcrTitle'),tt('missingPcrBody'));

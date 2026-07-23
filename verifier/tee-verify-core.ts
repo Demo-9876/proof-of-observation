@@ -17,15 +17,16 @@
 // 两档:full(给了 requestBody)= 多一项请求绑定(答的就是你这条请求);response-only = 只验响应未篡改 + 读 host。
 
 import { createPublicKey, verify as edVerify } from 'node:crypto';
-import type { EvidenceProfileVerifier, EvidenceTrust, EvidenceVerdict } from './evidence-profile.ts';
+import { aliyunVtpmEvidenceVerifier } from './evidence-aliyun-vtpm.ts';
 import { createNitroEvidenceVerifier, nitroEvidenceVerifier } from './evidence-nitro.ts';
+import type { EvidenceProfileVerifier, EvidenceTrust } from './evidence-profile.ts';
 import { qingtianEvidenceVerifier } from './evidence-qingtian.ts';
 import { buildV2Statement, sha256 } from './signing.ts';
 
 // v2 proof 线格式(docs/tee-signing-v2-design.md §5)。前 9 字段(nonce…response_body_sha256)即签名载荷。
 export interface TeeProofWire {
   v?: number; // 2
-  profile?: string; // 缺省 nitro；qingtian 等新 profile 走 evidence layer
+  profile?: string; // 缺省 nitro；aliyun-vtpm/qingtian 等新 profile 走 evidence layer
   alg?: string;
   public_key: string; // base64 SPKI
   nonce: string; // base64
@@ -129,14 +130,24 @@ export function verifyTeeExchange(
   const full = input.requestBody !== undefined;
   const mode: TeeVerifyResult['mode'] = full ? 'full' : 'response-only';
   const checks: TeeCheck[] = [];
-
   const wireCheck = verifyWireEnvelope(t);
   checks.push(wireCheck);
   if (!wireCheck.ok) return failedWireResult(t, mode, checks);
 
-  // ① profile-aware evidence:当前内置 Nitro;非 Nitro profile 必须显式 trust config 并由对应 verifier 实现。
-  const evidence = verifyEvidence(input, deps);
-  checks.push(...evidence.checks);
+  const profile = configuredProfile(input.trust, t);
+  const trust: EvidenceTrust = {
+    ...(input.trust ?? {}),
+    profile,
+    expectedPcr0: input.trust?.expectedPcr0 ?? input.expectedPcr0,
+  };
+
+  const profileCheck = verifyConfiguredProfile(profile, t, !!input.trust?.profile);
+  checks.push(profileCheck);
+
+  const evidenceVerifier = profileCheck.ok ? resolveEvidenceVerifier(profile, deps) : undefined;
+  const evidence = evidenceVerifier?.verifyEvidence({ proof: t, trust, now: input.now });
+  if (evidence) checks.push(...evidence.checks);
+  else if (profileCheck.ok) checks.push({ name: '远程证明', ok: false, detail: `unsupported evidence profile: ${profile}` });
 
   if (input.expectedNonceB64) {
     const nonceOk = t.nonce === input.expectedNonceB64;
@@ -170,14 +181,14 @@ export function verifyTeeExchange(
     mode,
     checks,
     attestation: {
-      profile: evidence.profile,
-      moduleId: evidence.moduleId,
-      pcr0: evidence.pcr0,
-      pcr8: evidence.pcr8,
-      measurements: evidence.measurements,
-      publicKey: evidence.publicKey,
-      nonce: evidence.nonce,
-      platformTrust: evidence.platformTrust,
+      profile,
+      moduleId: evidence?.moduleId,
+      pcr0: evidence?.pcr0,
+      pcr8: evidence?.pcr8,
+      measurements: evidence?.measurements,
+      publicKey: evidence?.publicKey,
+      nonce: evidence?.nonce,
+      platformTrust: evidence?.platformTrust,
     },
     provenance: {
       upstreamHost: t.upstream_host,
@@ -189,33 +200,10 @@ export function verifyTeeExchange(
   };
 }
 
-function verifyEvidence(
-  input: TeeVerifyInput,
-  deps: {
-    verifyAttestationDoc?: AttestationVerifier;
-    evidenceVerifier?: EvidenceProfileVerifier;
-    evidenceVerifiers?: Record<string, EvidenceProfileVerifier>;
-  },
-): EvidenceVerdict {
-  const proofProfile = input.proof.profile;
-  const trust = input.trust ?? legacyNitroTrust(input.expectedPcr0);
-  const trustProfile = trust?.profile ?? 'nitro';
-  const effectiveProfile = trust ? trustProfile : (proofProfile ?? 'nitro');
-
-  if (!trust && effectiveProfile !== 'nitro') {
-    return failedEvidence(effectiveProfile, '远程证明', `profile=${effectiveProfile} 需要显式 trust config`);
-  }
-  if (!proofProfile && trust && trustProfile !== 'nitro') {
-    return failedEvidence(trustProfile, '远程证明', `profile=${trustProfile} 的 proof 必须显式携带 profile`);
-  }
-  if (proofProfile && trust && proofProfile !== trustProfile) {
-    return failedEvidence(trustProfile, '远程证明', `proof profile=${proofProfile} 与 trust profile=${trustProfile} 不一致`);
-  }
-  const verifier = resolveEvidenceVerifier(effectiveProfile, deps);
-  if (!verifier) {
-    return failedEvidence(effectiveProfile, '远程证明', `unsupported evidence profile: ${effectiveProfile}`);
-  }
-  return verifier.verifyEvidence({ proof: input.proof, trust: trust ?? { profile: 'nitro' }, now: input.now });
+function configuredProfile(trust: EvidenceTrust | undefined, proof: TeeProofWire): string {
+  if (trust?.profile) return trust.profile;
+  if (!proof.profile || proof.profile === 'nitro') return 'nitro';
+  return proof.profile;
 }
 
 function verifyWireEnvelope(proof: unknown): TeeCheck {
@@ -319,6 +307,35 @@ function numberField(value: unknown, field: string): number | undefined {
   return isRecord(value) && typeof value[field] === 'number' ? value[field] : undefined;
 }
 
+function verifyConfiguredProfile(profile: string, proof: TeeProofWire, hasConfiguredProfile: boolean): TeeCheck {
+  if (profile !== 'nitro' && !hasConfiguredProfile) {
+    return {
+      name: 'Evidence profile',
+      ok: false,
+      detail: `非 Nitro profile=${profile} 必须由本地 trust.profile 显式选择`,
+    };
+  }
+  if (proof.profile && proof.profile !== profile) {
+    return {
+      name: 'Evidence profile',
+      ok: false,
+      detail: `proof.profile=${proof.profile} 与 trust.profile=${profile} 不一致`,
+    };
+  }
+  if (profile !== 'nitro' && !proof.profile) {
+    return {
+      name: 'Evidence profile',
+      ok: false,
+      detail: `trust.profile=${profile} 但 proof 未声明同一 profile`,
+    };
+  }
+  return {
+    name: 'Evidence profile',
+    ok: true,
+    detail: proof.profile ? `profile=${profile}` : 'legacy Nitro proof defaults to profile=nitro',
+  };
+}
+
 function resolveEvidenceVerifier(
   profile: string,
   deps: {
@@ -329,26 +346,10 @@ function resolveEvidenceVerifier(
 ): EvidenceProfileVerifier | undefined {
   if (deps.evidenceVerifiers?.[profile]) return deps.evidenceVerifiers[profile];
   if (deps.evidenceVerifier?.profile === profile) return deps.evidenceVerifier;
-  if (profile === 'nitro') {
-    return deps.verifyAttestationDoc
-      ? createNitroEvidenceVerifier(deps.verifyAttestationDoc)
-      : nitroEvidenceVerifier;
-  }
+  if (profile === 'nitro') return deps.verifyAttestationDoc ? createNitroEvidenceVerifier(deps.verifyAttestationDoc) : nitroEvidenceVerifier;
+  if (profile === 'aliyun-vtpm') return aliyunVtpmEvidenceVerifier;
   if (profile === 'qingtian') return qingtianEvidenceVerifier;
   return undefined;
-}
-
-function legacyNitroTrust(expectedPcr0: string | undefined): EvidenceTrust | undefined {
-  if (!expectedPcr0) return undefined;
-  return { profile: 'nitro', expectedPcr0 };
-}
-
-function failedEvidence(profile: string, name: string, detail: string): EvidenceVerdict {
-  return {
-    ok: false,
-    profile,
-    checks: [{ name, ok: false, detail }],
-  };
 }
 
 // 重建 v2 声明(用 proof 自报的字段值)→ 用绑定公钥验签;再核对收到的字节哈希 == 签名覆盖的响应体哈希。

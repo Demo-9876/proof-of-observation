@@ -6,12 +6,15 @@ export interface EvidenceTrust {
   expectedPcr8?: string;
   expectedPcrs?: Record<string, string>;
   requirePlatformTrust?: boolean;
+  allowSyntheticQuoteReportCertForTest?: boolean;
   platformTrust?: {
     mode?: 'missing' | 'cert-chain';
     rootFingerprintsSha256?: string[];
     intermediateFingerprintsSha256?: string[];
     rootCertificatesPem?: string[];
     intermediateCertificatesPem?: string[];
+    enclaveSubjectCnPattern?: string;
+    acceptedPolicyOids?: string[];
     revocation?: {
       required?: boolean;
       method?: string;

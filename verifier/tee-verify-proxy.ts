@@ -9,7 +9,7 @@
 //      (= 飞地签名的上游原文)走 v2 response-only 验证:
 //      Evidence profile trust + 公钥绑定 + nonce/新鲜性 + 声明验签;并**读出签名覆盖的 upstream_host/path**。
 //   ③ 默认 fail-open:无论判定都把响应交给客户端,但把判定**大声打到本代理日志**(持续抽查/威慑)。
-//      `--enforce`:fail-closed —— 整段缓冲、验过才放行;有 proof 但验不过回 502(牺牲流式,换强阻断)。
+//      `--enforce`:fail-closed —— 整段缓冲、有 proof 且验过才放行;缺 proof 或验不过均回 502。
 //
 // response-only:能验真飞地跑审计镜像、签了你逐字收到的响应(未篡改),并**读出签名覆盖的 host/path**。
 // 不含**请求绑定**(代理看不到你发往上游的原始请求体)。要连「答的就是我这条请求」一并钉,
@@ -43,7 +43,7 @@ const DEFAULT_HOLDBACK = 64 * 1024; // 须 ≥ 最大 proof 体积(含 COSE atte
 export interface VerifyingProxyOptions {
   upstream: string; // 真实上游 base URL,如 https://api.example.com
   expectedPcr0?: string; // legacy Nitro shorthand
-  trust?: EvidenceTrust; // profile-aware trust config; required for non-Nitro
+  trust?: EvidenceTrust; // profile-aware trust config; required for Aliyun/QingTian 等 non-Nitro profiles
   nonceHeader?: string; // 可选:每请求生成 nonce 并用该 header 发给 relay,再强制 proof.nonce 匹配
   enforce?: boolean; // true=fail-closed(缓冲+阻断);默认 false=fail-open(流式+日志)
   holdback?: number; // 流式压住流末的字节数;默认 64KiB
@@ -100,7 +100,7 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
         const streaming = lowerCt.includes('text/event-stream');
         const multipart = lowerCt.includes('multipart/mixed');
 
-        // ── fail-closed:整段缓冲,有 proof 且验过才放行;缺 proof 或验不过 → 502。
+        // ── fail-closed:整段缓冲,必须有 proof 且验过才放行;缺 proof/验不过 → 502。
         if (opts.enforce) {
           const buf: Buffer[] = [];
           upRes.on('data', (c: Buffer) => buf.push(c));
@@ -265,7 +265,7 @@ function runCli(): void {
   server.listen(port, '127.0.0.1', () => {
     console.log('── 本地校验代理 ──');
     console.log(`  监听  http://127.0.0.1:${port}  →  上游 ${upstream}`);
-    console.log(`  Trust ${trustPath ? trustPath : `Nitro PCR0 ${pcr0}`}`);
+    console.log(`  trust ${trustPath ? trustPath : `legacy nitro pcr0=${pcr0}`}`);
     if (nonceHeader) console.log(`  nonce 每请求生成并通过 ${nonceHeader} 发送,返回 proof 必须匹配`);
     console.log(`  模式  ${enforce ? 'fail-closed(--enforce:缺 proof 或验不过 → 502)' : 'fail-open(放行 + 日志,持续抽查/威慑)'}`);
     console.log(`  用法  把你的 LLM 客户端 baseURL 改成上面的监听地址即可${nonceHeader ? '(会注入 nonce header)' : '(默认不注入额外头)'}。`);

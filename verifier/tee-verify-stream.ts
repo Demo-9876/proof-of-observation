@@ -5,10 +5,10 @@
 // 输入是你**实际收到的完整响应**:SSE(上游字节 + 末尾 event: tee.proof)或 multipart/mixed
 // (第一段 raw response bytes,第二段 proof)。本工具:① 剥出 proof;② 对其余字节
 // (= 飞地签名的上游原文)重算 H(respBody);
-// ③ 调共享核心 v2 验证(attestation 链 + PCR0 + 公钥绑定 + nonce 绑定 + 声明验签 + 读 host/path)。
+// ③ 调共享核心 v2 验证(Evidence profile trust + 公钥绑定 + nonce/新鲜性 + 声明验签 + 读 host/path)。
 //
 //   · --pcr0  Nitro legacy:审计公布、可由 reproducible-build 复算的镜像度量
-//   · --trust profile-aware trust config;QingTian 等非 Nitro profile 必填
+//   · --trust profile-aware trust config;Aliyun/QingTian 等非 Nitro profile 必填
 //   · --host  (可选)核对签名覆盖的 upstream_host(官方端点);不给则只展示,由你自行判断
 //   · --nonce-b64 (可选)核对用户本次挑战 nonce,防重放
 //

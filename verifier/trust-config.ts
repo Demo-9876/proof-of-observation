@@ -19,6 +19,6 @@ export function requirePcr0OrTrust(params: {
   if (params.pcr0 || params.trustPath) return;
   console.error(params.usage);
   console.error('  Nitro legacy: pass --pcr0 <hex>.');
-  console.error('  Evidence profiles such as qingtian: pass --trust <trust.json>.');
+  console.error('  Evidence profiles such as aliyun-vtpm or qingtian: pass --trust <trust.json>.');
   process.exit(2);
 }

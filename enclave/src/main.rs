@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use vsock::{VsockAddr, VsockListener, VsockStream};
 
+mod aliyun_helper;
 mod egress_boring;
 mod egress_openssl;
 mod egress_rustls_aws_lc;
@@ -206,6 +207,7 @@ const ADMIN_TIMEOUT: Duration = Duration::from_secs(2);
 const N_WORKERS: usize = 64;
 const QUEUE_CAP: usize = 256;
 const METRICS_PORT: u32 = 5006;
+const DEFAULT_ALIYUN_HELPER_SOCKET: &str = "/run/aliyun-proof-helper.sock";
 
 const REQ_HEAD: u8 = 0x01;
 const REQ_BODY: u8 = 0x02;
@@ -620,9 +622,7 @@ fn stream_plain<R: Read + ?Sized, F: FnMut(&[u8]) -> Result<(), String>>(
 #[allow(clippy::too_many_arguments)]
 fn write_attested_trailer(
     s: &mut VsockStream,
-    sk: &SigningKey,
-    spki: &[u8],
-    evidence_provider: &dyn EvidenceProvider,
+    backend: &ProofBackend,
     m: &Metrics,
     head: &ReqHead,
     nonce_bytes: &[u8],
@@ -637,26 +637,71 @@ fn write_attested_trailer(
     }
     let norm_host = head.upstream.host.to_lowercase();
     let norm_path = path_no_query(&head.upstream.path).to_string();
+    match backend {
+        ProofBackend::LocalEvidence(local) => write_local_attested_trailer(
+            s,
+            local,
+            m,
+            head,
+            nonce_bytes,
+            norm_method,
+            status,
+            content_type,
+            req_body_hex,
+            resp_body_hex,
+            &norm_host,
+            &norm_path,
+        ),
+        ProofBackend::AliyunVtpm(aliyun) => write_aliyun_vtpm_trailer(
+            s,
+            aliyun,
+            head,
+            norm_method,
+            status,
+            content_type,
+            req_body_hex,
+            resp_body_hex,
+            &norm_host,
+            &norm_path,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_local_attested_trailer(
+    s: &mut VsockStream,
+    local: &LocalEvidenceBackend,
+    m: &Metrics,
+    head: &ReqHead,
+    nonce_bytes: &[u8],
+    norm_method: &str,
+    status: u16,
+    content_type: &str,
+    req_body_hex: &str,
+    resp_body_hex: &str,
+    norm_host: &str,
+    norm_path: &str,
+) -> Result<(), String> {
     let statement = build_v2_statement(
         &head.nonce,
-        &norm_host,
-        &norm_path,
+        norm_host,
+        norm_path,
         norm_method,
         status,
         content_type,
         req_body_hex,
         resp_body_hex,
     );
-    let sig = sk.sign(&statement).to_bytes();
+    let sig = local.sk.sign(&statement).to_bytes();
     let t_nsm = Instant::now();
-    let evidence = evidence_provider.attest(spki, nonce_bytes)?;
+    let evidence = local.evidence_provider.attest(&local.spki, nonce_bytes)?;
     m.nsm_ns_total
         .fetch_add(t_nsm.elapsed().as_nanos() as u64, Ordering::Relaxed);
     m.nsm_calls.fetch_add(1, Ordering::Relaxed);
     let mut trailer = json!({
         "v": 2,
         "alg": "ed25519",
-        "public_key": B64.encode(spki),
+        "public_key": B64.encode(&local.spki),
         "nonce": head.nonce,
         "upstream_host": norm_host,
         "upstream_path": norm_path,
@@ -687,13 +732,34 @@ fn write_attested_trailer(
         .map_err(|e| format!("写 RESP_TRAILER: {e}"))
 }
 
-fn handle(
+#[allow(clippy::too_many_arguments)]
+fn write_aliyun_vtpm_trailer(
     s: &mut VsockStream,
-    sk: &SigningKey,
-    spki: &[u8],
-    evidence_provider: &dyn EvidenceProvider,
-    m: &Metrics,
+    aliyun: &AliyunBackend,
+    head: &ReqHead,
+    norm_method: &str,
+    status: u16,
+    content_type: &str,
+    req_body_hex: &str,
+    resp_body_hex: &str,
+    norm_host: &str,
+    norm_path: &str,
 ) -> Result<(), String> {
+    let req = aliyun_helper::ProofRequest::new(
+        &head.nonce,
+        norm_host,
+        norm_path,
+        norm_method,
+        status,
+        content_type,
+        req_body_hex,
+        resp_body_hex,
+    );
+    let proof = aliyun_helper::request_proof(&aliyun.socket_path, &req)?;
+    write_frame(s, RESP_TRAILER, &proof).map_err(|e| format!("写 RESP_TRAILER: {e}"))
+}
+
+fn handle(s: &mut VsockStream, backend: &ProofBackend, m: &Metrics) -> Result<(), String> {
     let (t1, head_buf) = read_frame(s, MAX_REQ_HEAD).map_err(|e| format!("读 HEAD 帧: {}", e))?;
     if t1 != REQ_HEAD {
         return Err(format!("期望 REQ_HEAD，收到 {:#x}", t1));
@@ -788,9 +854,7 @@ fn handle(
             .fetch_add(response.body_bytes as u64, Ordering::Relaxed);
         write_attested_trailer(
             s,
-            sk,
-            spki,
-            evidence_provider,
+            backend,
             m,
             &head,
             &nonce_bytes,
@@ -922,9 +986,7 @@ fn handle(
     let content_type = h.content_type.as_deref().unwrap_or("");
     write_attested_trailer(
         s,
-        sk,
-        spki,
-        evidence_provider,
+        backend,
         m,
         &head,
         &nonce_bytes,
@@ -1001,10 +1063,23 @@ fn bump_max(cur: usize, max: &AtomicUsize) {
 }
 
 struct Ctx {
-    sk: Arc<SigningKey>,
-    spki: Arc<Vec<u8>>,
-    evidence_provider: Arc<dyn EvidenceProvider>,
+    backend: ProofBackend,
     m: Metrics,
+}
+
+struct LocalEvidenceBackend {
+    sk: SigningKey,
+    spki: Vec<u8>,
+    evidence_provider: Arc<dyn EvidenceProvider>,
+}
+
+struct AliyunBackend {
+    socket_path: String,
+}
+
+enum ProofBackend {
+    LocalEvidence(LocalEvidenceBackend),
+    AliyunVtpm(AliyunBackend),
 }
 
 fn worker(rx: Arc<Mutex<Receiver<VsockStream>>>, ctx: Arc<Ctx>) {
@@ -1021,15 +1096,7 @@ fn worker(rx: Arc<Mutex<Receiver<VsockStream>>>, ctx: Arc<Ctx>) {
 
         s.set_read_timeout(Some(CONTROL_IO_TIMEOUT)).ok();
         s.set_write_timeout(Some(CONTROL_IO_TIMEOUT)).ok();
-        let res = catch_unwind(AssertUnwindSafe(|| {
-            handle(
-                &mut s,
-                &ctx.sk,
-                &ctx.spki,
-                ctx.evidence_provider.as_ref(),
-                &ctx.m,
-            )
-        }));
+        let res = catch_unwind(AssertUnwindSafe(|| handle(&mut s, &ctx.backend, &ctx.m)));
 
         ctx.m
             .handle_ns_total
@@ -1074,13 +1141,16 @@ fn serve_metrics(ctx: Arc<Ctx>) {
     }
 }
 
-fn build_evidence_provider() -> Arc<dyn EvidenceProvider> {
-    let profile = env::var("TEE_PROFILE")
+fn configured_tee_profile() -> String {
+    env::var("TEE_PROFILE")
         .or_else(|_| env::var("POO_EVIDENCE_PROFILE"))
         .unwrap_or_else(|_| "nitro".to_string())
-        .to_ascii_lowercase();
-    match profile.as_str() {
-        "nitro" => {
+        .to_ascii_lowercase()
+}
+
+fn build_evidence_provider(profile: &str) -> Arc<dyn EvidenceProvider> {
+    match profile {
+        "" | "nitro" => {
             #[cfg(feature = "nitro")]
             {
                 Arc::new(evidence_nitro::NitroEvidenceProvider::new())
@@ -1105,28 +1175,47 @@ fn build_evidence_provider() -> Arc<dyn EvidenceProvider> {
             }
         }
         other => {
-            panic!("unsupported TEE_PROFILE={other}; supported profiles: nitro, qingtian");
+            panic!(
+                "unsupported local evidence profile={other}; supported profiles: nitro, qingtian"
+            );
         }
     }
 }
 
-fn main() {
+fn build_local_evidence_backend(profile: &str) -> LocalEvidenceBackend {
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).unwrap();
-    let sk = Arc::new(SigningKey::from_bytes(&seed));
+    let sk = SigningKey::from_bytes(&seed);
     let vk = sk.verifying_key().to_bytes();
-    let mut spki_v = vec![
+    let mut spki = vec![
         0x30u8, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
     ];
-    spki_v.extend_from_slice(&vk);
-    let spki = Arc::new(spki_v);
-
-    let evidence_provider = build_evidence_provider();
+    spki.extend_from_slice(&vk);
+    let evidence_provider = build_evidence_provider(profile);
     elog!("evidence profile: {}", evidence_provider.profile());
-    let ctx = Arc::new(Ctx {
+    LocalEvidenceBackend {
         sk,
         spki,
         evidence_provider,
+    }
+}
+
+fn main() {
+    let profile = configured_tee_profile();
+    let backend = match profile.as_str() {
+        "" | "nitro" | "qingtian" => {
+            ProofBackend::LocalEvidence(build_local_evidence_backend(profile.as_str()))
+        }
+        "aliyun-vtpm" => ProofBackend::AliyunVtpm(AliyunBackend {
+            socket_path: std::env::var("ALIYUN_PROOF_HELPER_SOCKET")
+                .unwrap_or_else(|_| DEFAULT_ALIYUN_HELPER_SOCKET.to_string()),
+        }),
+        other => panic!(
+            "unsupported TEE_PROFILE={other}; supported profiles: nitro, qingtian, aliyun-vtpm"
+        ),
+    };
+    let ctx = Arc::new(Ctx {
+        backend,
         m: Metrics::default(),
     });
 
