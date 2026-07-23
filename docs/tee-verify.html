@@ -1176,6 +1176,8 @@ async function verifyCoseAttestation(docB64){
 // 计算底层检查项。
 async function runChecks(bundle, trust, nonceField){
   const t=bundle.proof, att=t.attestation;
+  const profile=t.profile||'nitro';
+  if(profile!=='nitro') throw new Error(profile==='qingtian'?tt('unsupportedQingTianProfile'):tt('unsupportedEvidenceProfile',profile));
 
   // 真 Nitro：proof.attestation 是 COSE 文档的 base64 串；mock：是带 _sig 的对象。
   const realCose = typeof att === 'string';
@@ -1549,6 +1551,8 @@ const I18N={
     missingPcrTitle:'⚠️ 缺少审计 PCR0', missingPcrBody:'请粘贴或上传包含 expectedPcr0 / pcr0 / proof.pcr0 的响应包或 trust 文件后再验证。',
     verifying1:'🔄 验证中 —— 正在你本地解析 attestation、核验证书链和签名…',
     verifyException:'❌ 验证过程异常', verifyExceptionBody:(msg)=>'浏览器可能不支持 Ed25519/P-384 WebCrypto，或证明材料格式异常：'+msg,
+    unsupportedQingTianProfile:'当前浏览器验证页尚未内置 QingTian evidence verifier；请使用 Node CLI verifier 并传入 QingTian trust config。',
+    unsupportedEvidenceProfile:(profile)=>'当前浏览器验证页不支持 evidence profile：'+profile,
     verifying2:'🔄 验证中 —— 已完成密码学核验，正在从信任锚逐段展开推导…',
     noInputLoad:'⚠️ 先把响应贴进上面的框、或把文件拖进来,再点「开始验证」',
     noMaterialTitle:'⚠️ 还没有响应材料', noMaterialBody:'先把 response.sse 或 response.multipart 贴进上面的框，再点「开始验证」。',
@@ -1643,6 +1647,8 @@ const I18N={
     missingPcrTitle:'⚠️ Missing audit PCR0', missingPcrBody:'Paste or upload a response package or trust file containing expectedPcr0 / pcr0 / proof.pcr0 before verifying.',
     verifying1:'🔄 Verifying — parsing attestation, certificate chain, and signatures locally…',
     verifyException:'❌ Verification error', verifyExceptionBody:(msg)=>'Your browser may not support Ed25519/P-384 WebCrypto, or the proof material is malformed: '+msg,
+    unsupportedQingTianProfile:'This browser verifier does not yet include the QingTian evidence verifier; use the Node CLI verifier with a QingTian trust config.',
+    unsupportedEvidenceProfile:(profile)=>'This browser verifier does not support evidence profile: '+profile,
     verifying2:'🔄 Verifying — cryptographic checks are done; building the trust-chain explanation…',
     noInputLoad:'⚠️ Paste the response above or drop a file before clicking Start verification',
     noMaterialTitle:'⚠️ No response material yet', noMaterialBody:'Paste response.sse or response.multipart above, then click Start verification.',

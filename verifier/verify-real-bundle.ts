@@ -3,7 +3,8 @@
 //
 //   npx tsx verify-real-bundle.ts <bundle.json> (--pcr0 <hex> | --trust <trust.json>) [--host <api.example.com>] [--nonce-b64 <b64>]
 //
-//   · --pcr0 / --trust  二选一:legacy Nitro PCR0 或 profile 化 trust bundle
+//   · --pcr0  Nitro legacy:审计公布、且可由 docs/tee-reproducible-build.md 复算的镜像度量
+//   · --trust profile-aware trust config;Aliyun/QingTian 等非 Nitro profile 必填
 //   · --host  (可选)核对签名覆盖的 upstream_host;不给则只展示由你判断
 //   · --nonce-b64 (可选)核对用户本次挑战 nonce,防重放
 //
@@ -29,16 +30,17 @@ const pcr0 = flag('--pcr0');
 const trustPath = flag('--trust');
 const expectedHost = flag('--host');
 const expectedNonceB64 = flag('--nonce-b64');
+const usage = '用法: tsx verify-real-bundle.ts <bundle.json> (--pcr0 <hex> | --trust <trust.json>) [--host <api.example.com>] [--nonce-b64 <b64>]';
 if (!bundlePath) {
-  console.error('用法: tsx verify-real-bundle.ts <bundle.json> (--pcr0 <hex> | --trust <trust.json>) [--host <api.example.com>] [--nonce-b64 <b64>]');
+  console.error(usage);
   process.exit(2);
 }
-requirePcr0OrTrust({
-  pcr0,
-  trustPath,
-  usage: '用法: tsx verify-real-bundle.ts <bundle.json> (--pcr0 <hex> | --trust <trust.json>) [--host <api.example.com>] [--nonce-b64 <b64>]',
-});
+requirePcr0OrTrust({ pcr0, trustPath, usage });
 const trust = loadTrustConfig(trustPath, pcr0);
+if (!trust) {
+  console.error(usage);
+  process.exit(2);
+}
 
 const bundle = JSON.parse(readFileSync(bundlePath, 'utf8'));
 const b = (s: string | undefined) => Buffer.from(s ?? '', 'base64');

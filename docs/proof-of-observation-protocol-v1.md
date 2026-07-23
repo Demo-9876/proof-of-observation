@@ -215,10 +215,11 @@ A v1 Statement MUST NOT include, and a Verifier MUST NOT expect:
 Evidence is the TEE attestation that binds the Statement-signing key to attested
 hardware. The verification procedure (§8.3) is **profile-independent**; the
 concrete envelope, signature algorithm, and root of trust are supplied by an
-**Evidence profile**. v1 defines exactly one profile, **`nitro`** (§6.2); the
-in-effect profile is identified out of band (by the deployment's published
-Reference Value and pinned root). A Verifier MUST reject Evidence whose profile it
-does not implement (§9).
+**Evidence profile**. v1 defines **`nitro`** as the only normative profile (§6.2).
+Other profiles MAY be carried by the same proof wire only when their profile
+identifier is explicit and the Verifier has an out-of-band trust configuration
+for that profile. A Verifier MUST reject Evidence whose profile it does not
+implement (§9).
 
 ### 6.1 Profile-independent requirements (Normative)
 
@@ -289,6 +290,25 @@ and `nonce`, which feed §8.
 A hardened decoder SHOULD bound CBOR nesting depth, container item counts, and
 string lengths against malicious Evidence.
 
+### 6.2.1 The `qingtian` profile (Experimental, non-normative)
+
+The `qingtian` Evidence profile is intended for Huawei Cloud QingTian Enclave
+QTSM attestation. It uses the same application Statement (§5), Ed25519 SPKI
+public key binding, nonce binding, and response/request hash binding as `nitro`,
+but the `attestation` bytes are a QingTian QTSM COSE/CBOR document rather than an
+AWS Nitro attestation document.
+
+A `qingtian` proof MUST carry `"profile": "qingtian"` in the proof envelope (§7).
+A Verifier MUST NOT enter the `qingtian` trust path solely because the proof says
+so; it also needs an explicit trust configuration containing QingTian measurement
+allowlists (at least PCR0 and production PCR8) and pinned Huawei QingTian
+attestation trust anchors. Until the QingTian root/intermediate certificates,
+COSE protected header algorithm, payload field names, chain order, and production
+fixtures are specified in a release profile document, production deployments
+MUST fail closed unless an explicit `qingtian` trust configuration is supplied.
+The reference Node verifier includes an experimental `qingtian` verifier guarded
+by this explicit trust configuration.
+
 ### 6.3 Defining a new Evidence profile (Normative for profiles)
 
 To extend Proof-of-Observation to another TEE, a new profile MUST specify, against
@@ -347,26 +367,31 @@ response stream) as a JSON object:
   "request_body_sha256": "<lowercase hex>",
   "response_body_sha256": "<lowercase hex>",
   "signature": "<base64 Ed25519 signature over the §5 Statement>",
-  "attestation": "<base64 COSE_Sign1 Evidence, §6>",
+  "attestation": "<base64 profile-specific Evidence, §6>",
   "evidence": "<optional profile-specific structured Evidence>",
-  "pcr0": "<lowercase hex; advisory copy, see §8.4>"
+  "pcr0": "<lowercase hex; advisory copy, see §8.5>",
+  "pcr8": "<lowercase hex; advisory copy, see §8.5>"
 }
 ```
 
 - `v` MUST be `2` for this version. A Verifier MUST reject envelopes whose `v` it
   does not implement.
-- `profile` is OPTIONAL for legacy Nitro proofs and defaults to `nitro`. A
-  Verifier MUST reject a non-default profile it does not implement. Profile-
-  specific extensions MAY use `evidence` while preserving the signed Statement
-  fields in §5.
+- `profile` identifies the Evidence profile for `attestation`. Historical Nitro
+  proofs MAY omit this field; a Verifier MAY treat a missing `profile` as
+  `nitro` for legacy compatibility. Any non-`nitro` profile MUST be explicit and
+  MUST be matched against the Verifier's out-of-band trust configuration before
+  appraising Evidence.
+- Profile-specific extensions MAY use `evidence` while preserving the signed
+  Statement fields in §5.
 - The fields `nonce`, `upstream_host`, `upstream_path`, `http_method`,
   `http_status`, `resp_content_type`, `request_body_sha256`,
   `response_body_sha256` are the **reconstruction inputs** for the §5 Statement,
   carried verbatim. The Verifier reassembles the Statement octets from these
   values (applying §5.2/§5.3) — it does NOT trust them until the signature
   verifies.
-- `pcr0` in the envelope is advisory only; the authoritative PCR0 is the one
-  extracted from verified Evidence (§6), not this field.
+- `pcr0`, `pcr8`, and any future measurement copy in the envelope are advisory
+  only; the authoritative measurement values are the ones extracted from verified
+  Evidence (§6), not these fields.
 
 ## 8. Verification Procedure (Normative)
 
@@ -407,11 +432,14 @@ Either mismatch → **fail** (the proof does not correspond to this exchange).
 
 ### 8.5 Verify the enclave measurement against a Reference Value
 
-9. The attested `pcr0` MUST equal a Reference Value the Verifier trusts. The
-   Reference Value is the PCR0 produced by a reproducible build of the **public
-   Attester source** at a published release. A Verifier SHOULD obtain it from the
-   reproducible-build procedure (independently reproducible by the Verifier or a
-   third party) rather than from the relay. On mismatch → **fail**.
+9. The attested profile-defined measurement MUST equal a Reference Value the
+   Verifier trusts. For `nitro`, this is PCR0 produced by a reproducible build of
+   the **public Attester source** at a published release. For profiles that define
+   additional production-signing measurements, such as QingTian PCR8, every
+   required measurement in the profile trust configuration MUST match. A Verifier
+   SHOULD obtain Reference Values from the reproducible-build/release procedure
+   (independently reproducible by the Verifier or a third party) rather than from
+   the relay. On mismatch → **fail**.
 
 ### 8.6 Model attribution (informative)
 

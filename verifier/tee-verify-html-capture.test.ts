@@ -108,7 +108,10 @@ describe('docs/tee-verify.html capture parser preserves signed response bytes', 
     expect(html).not.toContain('✓ 成立');
   });
 
-  it('reports aliyun-vtpm as unsupported in the phase-1 browser verifier', () => {
+  it('fails closed instead of treating non-Nitro evidence as Nitro in the browser verifier', () => {
+    expect(html).toContain("const profile=t.profile||'nitro';");
+    expect(html).toContain("if(profile!=='nitro') throw new Error(profile==='qingtian'?tt('unsupportedQingTianProfile'):tt('unsupportedEvidenceProfile',profile));");
+    expect(html).toContain('unsupportedQingTianProfile');
     expect(html).toContain("const proofProfile=(working&&working.proof&&working.proof.profile)||'nitro'");
     expect(html).toContain("if(proofProfile!=='nitro')");
     expect(html).toContain("L('不支持的 Evidence profile','Unsupported Evidence profile')");

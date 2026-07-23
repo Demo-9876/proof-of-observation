@@ -7,7 +7,8 @@
 // (= 飞地签名的上游原文)重算 H(respBody);
 // ③ 调共享核心 v2 验证(Evidence profile trust + 公钥绑定 + nonce/新鲜性 + 声明验签 + 读 host/path)。
 //
-//   · --pcr0 / --trust  二选一:legacy Nitro PCR0 或 profile 化 trust bundle
+//   · --pcr0  Nitro legacy:审计公布、可由 reproducible-build 复算的镜像度量
+//   · --trust profile-aware trust config;Aliyun/QingTian 等非 Nitro profile 必填
 //   · --host  (可选)核对签名覆盖的 upstream_host(官方端点);不给则只展示,由你自行判断
 //   · --nonce-b64 (可选)核对用户本次挑战 nonce,防重放
 //
@@ -30,16 +31,17 @@ const pcr0 = flag('--pcr0');
 const trustPath = flag('--trust');
 const expectedHost = flag('--host');
 const expectedNonceB64 = flag('--nonce-b64');
+const usage = '用法: tsx tee-verify-stream.ts <captured-response> (--pcr0 <hex> | --trust <trust.json>) [--host <api.example.com>] [--nonce-b64 <b64>]';
 if (!capturePath) {
-  console.error('用法: tsx tee-verify-stream.ts <captured-response> (--pcr0 <hex> | --trust <trust.json>) [--host <api.example.com>] [--nonce-b64 <b64>]');
+  console.error(usage);
   process.exit(2);
 }
-requirePcr0OrTrust({
-  pcr0,
-  trustPath,
-  usage: '用法: tsx tee-verify-stream.ts <captured-response> (--pcr0 <hex> | --trust <trust.json>) [--host <api.example.com>] [--nonce-b64 <b64>]',
-});
+requirePcr0OrTrust({ pcr0, trustPath, usage });
 const trust = loadTrustConfig(trustPath, pcr0);
+if (!trust) {
+  console.error(usage);
+  process.exit(2);
+}
 
 const streamBytes = readFileSync(capturePath);
 const { body, proof } = parseTeeProofCapture(streamBytes);

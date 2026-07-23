@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use aws_nitro_enclaves_nsm_api::api::{Request, Response};
-use aws_nitro_enclaves_nsm_api::driver::{nsm_init, nsm_process_request};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use serde::Deserialize;
-use serde_bytes::ByteBuf;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::env;
+use std::fmt;
 use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
@@ -24,18 +24,175 @@ mod aliyun_helper;
 mod egress_boring;
 mod egress_openssl;
 mod egress_rustls_aws_lc;
+mod evidence;
+#[cfg(feature = "nitro")]
+mod evidence_nitro;
+#[cfg(feature = "qingtian")]
+mod evidence_qingtian;
 mod h2_client;
+use crate::evidence::EvidenceProvider;
 use attest::tls_profile;
 
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write + ?Sized> ReadWrite for T {}
 
+enum EgressStream {
+    DirectVsock(VsockStream),
+    QProxyTcp(TcpStream),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EgressMode {
+    DirectVsock,
+    QProxyTcp,
+}
+
+impl Read for EgressStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::DirectVsock(s) => s.read(buf),
+            Self::QProxyTcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for EgressStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::DirectVsock(s) => s.write(buf),
+            Self::QProxyTcp(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::DirectVsock(s) => s.flush(),
+            Self::QProxyTcp(s) => s.flush(),
+        }
+    }
+}
+
+fn log_stderr(args: fmt::Arguments<'_>) {
+    let _ = writeln!(std::io::stderr(), "{args}");
+}
+
+macro_rules! elog {
+    ($($arg:tt)*) => {
+        log_stderr(format_args!($($arg)*))
+    };
+}
+
 fn decode_profile(head: &ReqHead) -> Option<tls_profile::TlsProfile> {
     tls_profile::decode(&B64.decode(head.tls_spec.as_deref()?).ok()?).ok()
 }
 
+fn parse_parent_cid_candidates(raw: Option<&str>) -> Result<Vec<u32>, String> {
+    let Some(raw) = raw else {
+        return Ok(vec![DEFAULT_PARENT_CID]);
+    };
+    let mut cids = Vec::new();
+    for part in raw.split(',') {
+        let item = part.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let cid = item
+            .parse::<u32>()
+            .map_err(|e| format!("invalid parent CID `{item}` in POO_PARENT_CIDS: {e}"))?;
+        if !cids.contains(&cid) {
+            cids.push(cid);
+        }
+    }
+    if cids.is_empty() {
+        return Err("POO_PARENT_CIDS/POO_PARENT_CID did not contain any CID".into());
+    }
+    Ok(cids)
+}
+
+fn parent_cid_candidates() -> Result<Vec<u32>, String> {
+    let raw = env::var("POO_PARENT_CIDS")
+        .ok()
+        .or_else(|| env::var("POO_PARENT_CID").ok());
+    parse_parent_cid_candidates(raw.as_deref())
+}
+
+fn connect_parent_vsock(port: u32) -> Result<VsockStream, String> {
+    let cids = parent_cid_candidates()?;
+    let mut errors = Vec::new();
+    for cid in &cids {
+        match VsockStream::connect(&VsockAddr::new(*cid, port)) {
+            Ok(sock) => return Ok(sock),
+            Err(e) => errors.push(format!("{cid}: {e}")),
+        }
+    }
+    Err(format!(
+        "连 vsock-proxy 失败: tried parent CID(s) [{}] on port {port}; {}",
+        cids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        errors.join("; ")
+    ))
+}
+
+fn qproxy_host() -> String {
+    env::var("POO_QPROXY_HOST")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+fn connect_qproxy_tcp(port: u32) -> Result<TcpStream, String> {
+    let port: u16 = port
+        .try_into()
+        .map_err(|_| format!("qproxy local TCP port out of range: {port}"))?;
+    let addr = (qproxy_host(), port);
+    TcpStream::connect(addr.clone())
+        .map_err(|e| format!("连 qproxy enclave 失败: {}:{}; {e}", addr.0, addr.1))
+}
+
+fn parse_egress_mode(raw: Option<&str>) -> Result<EgressMode, String> {
+    match raw
+        .unwrap_or("direct-vsock")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "qproxy" | "qproxy-tcp" => Ok(EgressMode::QProxyTcp),
+        "direct-vsock" | "vsock" | "" => Ok(EgressMode::DirectVsock),
+        other => Err(format!(
+            "unsupported POO_EGRESS_MODE={other}; supported: direct-vsock, qproxy"
+        )),
+    }
+}
+
+fn egress_mode() -> Result<EgressMode, String> {
+    let raw = env::var("POO_EGRESS_MODE").ok();
+    parse_egress_mode(raw.as_deref())
+}
+
+fn connect_egress(port: u32) -> Result<EgressStream, String> {
+    match egress_mode()? {
+        EgressMode::QProxyTcp => connect_qproxy_tcp(port).map(EgressStream::QProxyTcp),
+        EgressMode::DirectVsock => connect_parent_vsock(port).map(EgressStream::DirectVsock),
+    }
+}
+
+fn set_egress_timeouts(sock: &EgressStream, timeout: Duration) {
+    match sock {
+        EgressStream::DirectVsock(s) => {
+            s.set_read_timeout(Some(timeout)).ok();
+            s.set_write_timeout(Some(timeout)).ok();
+        }
+        EgressStream::QProxyTcp(s) => {
+            s.set_read_timeout(Some(timeout)).ok();
+            s.set_write_timeout(Some(timeout)).ok();
+        }
+    }
+}
+
 const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
-const PARENT_CID: u32 = 3;
+const DEFAULT_PARENT_CID: u32 = 3;
 const PORT: u32 = 5005;
 const DOMAIN_V2: &str = "tee-exchange-v2";
 
@@ -462,21 +619,6 @@ fn stream_plain<R: Read + ?Sized, F: FnMut(&[u8]) -> Result<(), String>>(
     Ok(())
 }
 
-fn attest(fd: i32, lock: &Mutex<()>, spki: &[u8], nonce: &[u8]) -> Result<Vec<u8>, String> {
-    let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
-    match nsm_process_request(
-        fd,
-        Request::Attestation {
-            user_data: None,
-            nonce: Some(ByteBuf::from(nonce.to_vec())),
-            public_key: Some(ByteBuf::from(spki.to_vec())),
-        },
-    ) {
-        Response::Attestation { document } => Ok(document),
-        other => Err(format!("nsm: {:?}", other)),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn write_attested_trailer(
     s: &mut VsockStream,
@@ -496,9 +638,9 @@ fn write_attested_trailer(
     let norm_host = head.upstream.host.to_lowercase();
     let norm_path = path_no_query(&head.upstream.path).to_string();
     match backend {
-        ProofBackend::Nitro(nitro) => write_nitro_attested_trailer(
+        ProofBackend::LocalEvidence(local) => write_local_attested_trailer(
             s,
-            nitro,
+            local,
             m,
             head,
             nonce_bytes,
@@ -526,9 +668,9 @@ fn write_attested_trailer(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_nitro_attested_trailer(
+fn write_local_attested_trailer(
     s: &mut VsockStream,
-    nitro: &NitroBackend,
+    local: &LocalEvidenceBackend,
     m: &Metrics,
     head: &ReqHead,
     nonce_bytes: &[u8],
@@ -550,16 +692,16 @@ fn write_nitro_attested_trailer(
         req_body_hex,
         resp_body_hex,
     );
-    let sig = nitro.sk.sign(&statement).to_bytes();
+    let sig = local.sk.sign(&statement).to_bytes();
     let t_nsm = Instant::now();
-    let doc = attest(nitro.nsm_fd, &nitro.nsm_lock, &nitro.spki, nonce_bytes)?;
+    let evidence = local.evidence_provider.attest(&local.spki, nonce_bytes)?;
     m.nsm_ns_total
         .fetch_add(t_nsm.elapsed().as_nanos() as u64, Ordering::Relaxed);
     m.nsm_calls.fetch_add(1, Ordering::Relaxed);
-    let trailer = json!({
+    let mut trailer = json!({
         "v": 2,
         "alg": "ed25519",
-        "public_key": B64.encode(&nitro.spki),
+        "public_key": B64.encode(&local.spki),
         "nonce": head.nonce,
         "upstream_host": norm_host,
         "upstream_path": norm_path,
@@ -569,8 +711,23 @@ fn write_nitro_attested_trailer(
         "request_body_sha256": req_body_hex,
         "response_body_sha256": resp_body_hex,
         "signature": B64.encode(sig),
-        "attestation": B64.encode(&doc),
+        "attestation": B64.encode(&evidence.attestation),
     });
+    let trailer_obj = trailer
+        .as_object_mut()
+        .expect("proof trailer is a JSON object");
+    if evidence.profile != "nitro" {
+        trailer_obj.insert("profile".into(), json!(evidence.profile));
+    }
+    if let Some(pcr0) = evidence.pcr0 {
+        trailer_obj.insert("pcr0".into(), json!(pcr0));
+    }
+    if let Some(pcr8) = evidence.pcr8 {
+        trailer_obj.insert("pcr8".into(), json!(pcr8));
+    }
+    if !evidence.measurements.is_empty() {
+        trailer_obj.insert("measurements".into(), json!(evidence.measurements));
+    }
     write_frame(s, RESP_TRAILER, trailer.to_string().as_bytes())
         .map_err(|e| format!("写 RESP_TRAILER: {e}"))
 }
@@ -642,10 +799,8 @@ fn handle(s: &mut VsockStream, backend: &ProofBackend, m: &Metrics) -> Result<()
 
     let profile = decode_profile(&head);
     let seed = head.tls_seed.as_deref().and_then(|s| B64.decode(s).ok());
-    let sock = VsockStream::connect(&VsockAddr::new(PARENT_CID, head.egress_port))
-        .map_err(|e| format!("连 vsock-proxy 失败: {}", e))?;
-    sock.set_read_timeout(Some(UPSTREAM_IO_TIMEOUT)).ok();
-    sock.set_write_timeout(Some(UPSTREAM_IO_TIMEOUT)).ok();
+    let sock = connect_egress(head.egress_port)?;
+    set_egress_timeouts(&sock, UPSTREAM_IO_TIMEOUT);
     let norm_method = head.upstream.method.to_uppercase();
     if profile.as_ref().map(|p| p.stack) == Some(tls_profile::Stack::RustlsAwsLc) {
         let profile = profile.as_ref().unwrap();
@@ -662,9 +817,7 @@ fn handle(s: &mut VsockStream, backend: &ProofBackend, m: &Metrics) -> Result<()
                 tls.conn.alpn_protocol()
             ));
         }
-        tls.sock
-            .set_read_timeout(Some(Duration::from_millis(250)))
-            .ok();
+        set_egress_timeouts(&tls.sock, Duration::from_millis(250));
         let h2 = profile
             .h2
             .as_ref()
@@ -914,11 +1067,10 @@ struct Ctx {
     m: Metrics,
 }
 
-struct NitroBackend {
+struct LocalEvidenceBackend {
     sk: SigningKey,
     spki: Vec<u8>,
-    nsm_fd: i32,
-    nsm_lock: Mutex<()>,
+    evidence_provider: Arc<dyn EvidenceProvider>,
 }
 
 struct AliyunBackend {
@@ -926,7 +1078,7 @@ struct AliyunBackend {
 }
 
 enum ProofBackend {
-    Nitro(NitroBackend),
+    LocalEvidence(LocalEvidenceBackend),
     AliyunVtpm(AliyunBackend),
 }
 
@@ -956,7 +1108,7 @@ fn worker(rx: Arc<Mutex<Receiver<VsockStream>>>, ctx: Arc<Ctx>) {
             }
             Ok(Err(e)) => {
                 ctx.m.failed.fetch_add(1, Ordering::Relaxed);
-                eprintln!("handle error: {}", e);
+                elog!("handle error: {}", e);
                 let _ = write_frame(
                     &mut s,
                     ERR,
@@ -967,7 +1119,7 @@ fn worker(rx: Arc<Mutex<Receiver<VsockStream>>>, ctx: Arc<Ctx>) {
             }
             Err(_) => {
                 ctx.m.panicked.fetch_add(1, Ordering::Relaxed);
-                eprintln!("handle panicked (caught)");
+                elog!("handle panicked (caught)");
             }
         }
     }
@@ -977,7 +1129,7 @@ fn serve_metrics(ctx: Arc<Ctx>) {
     let l = match VsockListener::bind(&VsockAddr::new(VMADDR_CID_ANY, METRICS_PORT)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("metrics bind 失败: {}", e);
+            elog!("metrics bind 失败: {}", e);
             return;
         }
     };
@@ -989,32 +1141,78 @@ fn serve_metrics(ctx: Arc<Ctx>) {
     }
 }
 
-fn main() {
-    let backend = match std::env::var("TEE_PROFILE")
+fn configured_tee_profile() -> String {
+    env::var("TEE_PROFILE")
+        .or_else(|_| env::var("POO_EVIDENCE_PROFILE"))
         .unwrap_or_else(|_| "nitro".to_string())
-        .as_str()
-    {
+        .to_ascii_lowercase()
+}
+
+fn build_evidence_provider(profile: &str) -> Arc<dyn EvidenceProvider> {
+    match profile {
         "" | "nitro" => {
-            let mut seed = [0u8; 32];
-            getrandom::getrandom(&mut seed).unwrap();
-            let sk = SigningKey::from_bytes(&seed);
-            let vk = sk.verifying_key().to_bytes();
-            let mut spki = vec![
-                0x30u8, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-            ];
-            spki.extend_from_slice(&vk);
-            ProofBackend::Nitro(NitroBackend {
-                sk,
-                spki,
-                nsm_fd: nsm_init(),
-                nsm_lock: Mutex::new(()),
-            })
+            #[cfg(feature = "nitro")]
+            {
+                Arc::new(evidence_nitro::NitroEvidenceProvider::new())
+            }
+            #[cfg(not(feature = "nitro"))]
+            {
+                panic!("TEE_PROFILE=nitro but binary was built without the nitro feature");
+            }
+        }
+        "qingtian" => {
+            #[cfg(feature = "qingtian")]
+            {
+                Arc::new(
+                    evidence_qingtian::QingTianEvidenceProvider::new().unwrap_or_else(|e| {
+                        panic!("failed to initialize QingTian QTSM provider: {e}")
+                    }),
+                )
+            }
+            #[cfg(not(feature = "qingtian"))]
+            {
+                panic!("TEE_PROFILE=qingtian but binary was built without the qingtian feature");
+            }
+        }
+        other => {
+            panic!(
+                "unsupported local evidence profile={other}; supported profiles: nitro, qingtian"
+            );
+        }
+    }
+}
+
+fn build_local_evidence_backend(profile: &str) -> LocalEvidenceBackend {
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).unwrap();
+    let sk = SigningKey::from_bytes(&seed);
+    let vk = sk.verifying_key().to_bytes();
+    let mut spki = vec![
+        0x30u8, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    spki.extend_from_slice(&vk);
+    let evidence_provider = build_evidence_provider(profile);
+    elog!("evidence profile: {}", evidence_provider.profile());
+    LocalEvidenceBackend {
+        sk,
+        spki,
+        evidence_provider,
+    }
+}
+
+fn main() {
+    let profile = configured_tee_profile();
+    let backend = match profile.as_str() {
+        "" | "nitro" | "qingtian" => {
+            ProofBackend::LocalEvidence(build_local_evidence_backend(profile.as_str()))
         }
         "aliyun-vtpm" => ProofBackend::AliyunVtpm(AliyunBackend {
             socket_path: std::env::var("ALIYUN_PROOF_HELPER_SOCKET")
                 .unwrap_or_else(|_| DEFAULT_ALIYUN_HELPER_SOCKET.to_string()),
         }),
-        other => panic!("unsupported TEE_PROFILE={}", other),
+        other => panic!(
+            "unsupported TEE_PROFILE={other}; supported profiles: nitro, qingtian, aliyun-vtpm"
+        ),
     };
     let ctx = Arc::new(Ctx {
         backend,
@@ -1032,7 +1230,7 @@ fn main() {
             .spawn(move || worker(rx, ctx))
         {
             Ok(_) => spawned += 1,
-            Err(e) => eprintln!("起 worker {} 失败（非致命）: {}", i, e),
+            Err(e) => elog!("起 worker {} 失败（非致命）: {}", i, e),
         }
     }
 
@@ -1042,14 +1240,18 @@ fn main() {
             .name("metrics".into())
             .spawn(move || serve_metrics(ctx))
         {
-            eprintln!("起 metrics 线程失败（非致命）: {}", e);
+            elog!("起 metrics 线程失败（非致命）: {}", e);
         }
     }
 
     let listener = VsockListener::bind(&VsockAddr::new(VMADDR_CID_ANY, PORT)).expect("bind vsock");
-    eprintln!(
+    elog!(
         "listening on vsock :{} (workers={}/{}, queue={}), metrics :{}",
-        PORT, spawned, N_WORKERS, QUEUE_CAP, METRICS_PORT
+        PORT,
+        spawned,
+        N_WORKERS,
+        QUEUE_CAP,
+        METRICS_PORT
     );
 
     for stream in listener.incoming() {
@@ -1080,6 +1282,59 @@ fn main() {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod parent_cid_tests {
+    use super::*;
+
+    #[test]
+    fn parent_cid_candidates_default_to_nitro_compatible_parent() {
+        assert_eq!(
+            parse_parent_cid_candidates(None).unwrap(),
+            vec![DEFAULT_PARENT_CID]
+        );
+    }
+
+    #[test]
+    fn parent_cid_candidates_parse_lists_trim_and_deduplicate() {
+        assert_eq!(
+            parse_parent_cid_candidates(Some(" 3, 2,3, 4 ")).unwrap(),
+            vec![3, 2, 4]
+        );
+    }
+
+    #[test]
+    fn parent_cid_candidates_reject_empty_or_invalid_values() {
+        assert!(parse_parent_cid_candidates(Some(" , ")).is_err());
+        assert!(parse_parent_cid_candidates(Some("3,nope")).is_err());
+    }
+
+    #[test]
+    fn egress_mode_defaults_to_direct_vsock() {
+        assert_eq!(parse_egress_mode(None).unwrap(), EgressMode::DirectVsock);
+        assert_eq!(
+            parse_egress_mode(Some(" vsock ")).unwrap(),
+            EgressMode::DirectVsock
+        );
+    }
+
+    #[test]
+    fn egress_mode_accepts_qproxy_aliases() {
+        assert_eq!(
+            parse_egress_mode(Some("qproxy")).unwrap(),
+            EgressMode::QProxyTcp
+        );
+        assert_eq!(
+            parse_egress_mode(Some("QPROXY-TCP")).unwrap(),
+            EgressMode::QProxyTcp
+        );
+    }
+
+    #[test]
+    fn egress_mode_rejects_unknown_values() {
+        assert!(parse_egress_mode(Some("http-proxy")).is_err());
     }
 }
 

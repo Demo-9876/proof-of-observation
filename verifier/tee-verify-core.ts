@@ -20,12 +20,13 @@ import { createPublicKey, verify as edVerify } from 'node:crypto';
 import { aliyunVtpmEvidenceVerifier } from './evidence-aliyun-vtpm.ts';
 import { createNitroEvidenceVerifier, nitroEvidenceVerifier } from './evidence-nitro.ts';
 import type { EvidenceProfileVerifier, EvidenceTrust } from './evidence-profile.ts';
+import { qingtianEvidenceVerifier } from './evidence-qingtian.ts';
 import { buildV2Statement, sha256 } from './signing.ts';
 
 // v2 proof 线格式(docs/tee-signing-v2-design.md §5)。前 9 字段(nonce…response_body_sha256)即签名载荷。
 export interface TeeProofWire {
   v?: number; // 2
-  profile?: string; // 缺省 nitro；aliyun-vtpm 等新 profile 走 evidence layer
+  profile?: string; // 缺省 nitro；aliyun-vtpm/qingtian 等新 profile 走 evidence layer
   alg?: string;
   public_key: string; // base64 SPKI
   nonce: string; // base64
@@ -40,6 +41,7 @@ export interface TeeProofWire {
   attestation: string; // base64 COSE_Sign1 文档
   evidence?: unknown; // profile-specific structured evidence；Nitro 旧 proof 可为空
   pcr0?: string;
+  pcr8?: string;
 }
 
 // verify-attestation-cose.mjs verifyAttestationDoc 的返回形状(只取核验用得到的字段)。
@@ -61,7 +63,7 @@ export interface AttestationVerdict {
 export type AttestationVerifier = (doc: Buffer, opts?: { now?: number }) => AttestationVerdict;
 
 export interface TeeVerifyInput {
-  expectedPcr0?: string; // legacy Nitro path: hex,审计公布、可由 reproducible-build 复算
+  expectedPcr0?: string; // legacy Nitro shorthand: hex,审计公布、可由 reproducible-build 复算
   trust?: EvidenceTrust; // 新 profile 化 trust bundle；缺省从 expectedPcr0 推导 Nitro
   responseBody: Buffer; // 你实际收到的完整响应体(已剥掉 tee.proof 流末事件)
   proof: TeeProofWire;
@@ -88,6 +90,7 @@ export interface TeeVerifyResult {
     profile?: string;
     moduleId?: string;
     pcr0?: string | null;
+    pcr8?: string | null;
     measurements?: Record<string, string>;
     publicKey?: string | null;
     nonce?: string | null;
@@ -109,6 +112,7 @@ export interface TeeVerifyResult {
 }
 
 const b64 = (s: string): Buffer => Buffer.from(s, 'base64');
+const MAX_PROOF_STRING_BYTES = 1024 * 1024;
 
 /**
  * 纯核验:无 I/O、无 console、无 process.exit。`deps.verifyAttestationDoc` 默认走真
@@ -116,12 +120,20 @@ const b64 = (s: string): Buffer => Buffer.from(s, 'base64');
  */
 export function verifyTeeExchange(
   input: TeeVerifyInput,
-  deps: { verifyAttestationDoc?: AttestationVerifier; evidenceVerifiers?: Record<string, EvidenceProfileVerifier> } = {},
+  deps: {
+    verifyAttestationDoc?: AttestationVerifier;
+    evidenceVerifier?: EvidenceProfileVerifier; // legacy single-profile injection kept for existing tests/callers
+    evidenceVerifiers?: Record<string, EvidenceProfileVerifier>;
+  } = {},
 ): TeeVerifyResult {
   const t = input.proof;
   const full = input.requestBody !== undefined;
   const mode: TeeVerifyResult['mode'] = full ? 'full' : 'response-only';
   const checks: TeeCheck[] = [];
+  const wireCheck = verifyWireEnvelope(t);
+  checks.push(wireCheck);
+  if (!wireCheck.ok) return failedWireResult(t, mode, checks);
+
   const profile = configuredProfile(input.trust, t);
   const trust: EvidenceTrust = {
     ...(input.trust ?? {}),
@@ -129,15 +141,13 @@ export function verifyTeeExchange(
     expectedPcr0: input.trust?.expectedPcr0 ?? input.expectedPcr0,
   };
 
-  checks.push(verifyWireEnvelope(t));
-
   const profileCheck = verifyConfiguredProfile(profile, t, !!input.trust?.profile);
   checks.push(profileCheck);
 
   const evidenceVerifier = profileCheck.ok ? resolveEvidenceVerifier(profile, deps) : undefined;
   const evidence = evidenceVerifier?.verifyEvidence({ proof: t, trust, now: input.now });
   if (evidence) checks.push(...evidence.checks);
-  else if (profileCheck.ok) checks.push({ name: '远程证明', ok: false, detail: `未知 Evidence profile: ${profile}` });
+  else if (profileCheck.ok) checks.push({ name: '远程证明', ok: false, detail: `unsupported evidence profile: ${profile}` });
 
   if (input.expectedNonceB64) {
     const nonceOk = t.nonce === input.expectedNonceB64;
@@ -174,6 +184,7 @@ export function verifyTeeExchange(
       profile,
       moduleId: evidence?.moduleId,
       pcr0: evidence?.pcr0,
+      pcr8: evidence?.pcr8,
       measurements: evidence?.measurements,
       publicKey: evidence?.publicKey,
       nonce: evidence?.nonce,
@@ -195,19 +206,55 @@ function configuredProfile(trust: EvidenceTrust | undefined, proof: TeeProofWire
   return proof.profile;
 }
 
-function verifyWireEnvelope(proof: TeeProofWire): TeeCheck {
-  if (proof.v !== 2) {
+function verifyWireEnvelope(proof: unknown): TeeCheck {
+  if (!isRecord(proof)) {
     return {
       name: 'proof wire',
       ok: false,
-      detail: `unsupported proof.v: ${String(proof.v)}; expected 2`,
+      detail: 'proof must be a JSON object',
     };
   }
+
+  const errors: string[] = [];
+  if (proof.v !== 2) {
+    errors.push(`unsupported proof.v: ${String(proof.v)}; expected 2`);
+  }
   if (proof.alg !== 'ed25519') {
+    errors.push(`unsupported proof.alg: ${String(proof.alg)}; expected ed25519`);
+  }
+
+  for (const field of REQUIRED_PROOF_STRING_FIELDS) {
+    const value = proof[field];
+    if (typeof value !== 'string') {
+      errors.push(`${field} must be string`);
+      continue;
+    }
+    if (Buffer.byteLength(value, 'utf8') > MAX_PROOF_STRING_BYTES) {
+      errors.push(`${field} exceeds ${MAX_PROOF_STRING_BYTES} bytes`);
+    }
+  }
+
+  if (typeof proof.http_status !== 'number' || !Number.isInteger(proof.http_status) || proof.http_status < 100 || proof.http_status > 599) {
+    errors.push('http_status must be an integer HTTP status code');
+  }
+  if (proof.profile !== undefined && typeof proof.profile !== 'string') {
+    errors.push('profile must be string when present');
+  }
+  if (proof.evidence !== undefined && !isRecord(proof.evidence)) {
+    errors.push('evidence must be an object when present');
+  }
+  if (typeof proof.request_body_sha256 === 'string' && !/^[0-9a-f]{64}$/.test(proof.request_body_sha256)) {
+    errors.push('request_body_sha256 must be lowercase hex sha256');
+  }
+  if (typeof proof.response_body_sha256 === 'string' && !/^[0-9a-f]{64}$/.test(proof.response_body_sha256)) {
+    errors.push('response_body_sha256 must be lowercase hex sha256');
+  }
+
+  if (errors.length > 0) {
     return {
       name: 'proof wire',
       ok: false,
-      detail: `unsupported proof.alg: ${String(proof.alg)}; expected ed25519`,
+      detail: errors.join('; '),
     };
   }
   return {
@@ -215,6 +262,49 @@ function verifyWireEnvelope(proof: TeeProofWire): TeeCheck {
     ok: true,
     detail: 'proof.v == 2 且 proof.alg == ed25519',
   };
+}
+
+const REQUIRED_PROOF_STRING_FIELDS = [
+  'public_key',
+  'nonce',
+  'upstream_host',
+  'upstream_path',
+  'http_method',
+  'resp_content_type',
+  'request_body_sha256',
+  'response_body_sha256',
+  'signature',
+  'attestation',
+] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function failedWireResult(proof: unknown, mode: TeeVerifyResult['mode'], checks: TeeCheck[]): TeeVerifyResult {
+  return {
+    ok: false,
+    mode,
+    checks,
+    attestation: {
+      profile: stringField(proof, 'profile'),
+    },
+    provenance: {
+      upstreamHost: stringField(proof, 'upstream_host') ?? '',
+      upstreamPath: stringField(proof, 'upstream_path') ?? '',
+      httpMethod: stringField(proof, 'http_method') ?? '',
+      httpStatus: numberField(proof, 'http_status') ?? 0,
+      respContentType: stringField(proof, 'resp_content_type') ?? '',
+    },
+  };
+}
+
+function stringField(value: unknown, field: string): string | undefined {
+  return isRecord(value) && typeof value[field] === 'string' ? value[field] : undefined;
+}
+
+function numberField(value: unknown, field: string): number | undefined {
+  return isRecord(value) && typeof value[field] === 'number' ? value[field] : undefined;
 }
 
 function verifyConfiguredProfile(profile: string, proof: TeeProofWire, hasConfiguredProfile: boolean): TeeCheck {
@@ -248,11 +338,17 @@ function verifyConfiguredProfile(profile: string, proof: TeeProofWire, hasConfig
 
 function resolveEvidenceVerifier(
   profile: string,
-  deps: { verifyAttestationDoc?: AttestationVerifier; evidenceVerifiers?: Record<string, EvidenceProfileVerifier> },
+  deps: {
+    verifyAttestationDoc?: AttestationVerifier;
+    evidenceVerifier?: EvidenceProfileVerifier;
+    evidenceVerifiers?: Record<string, EvidenceProfileVerifier>;
+  },
 ): EvidenceProfileVerifier | undefined {
   if (deps.evidenceVerifiers?.[profile]) return deps.evidenceVerifiers[profile];
+  if (deps.evidenceVerifier?.profile === profile) return deps.evidenceVerifier;
   if (profile === 'nitro') return deps.verifyAttestationDoc ? createNitroEvidenceVerifier(deps.verifyAttestationDoc) : nitroEvidenceVerifier;
   if (profile === 'aliyun-vtpm') return aliyunVtpmEvidenceVerifier;
+  if (profile === 'qingtian') return qingtianEvidenceVerifier;
   return undefined;
 }
 
@@ -291,6 +387,7 @@ export const TEE_PROOF_EVENT = 'tee.proof';
 export interface ParsedTeeProofStream {
   body: Buffer; // 上游原文(飞地签名的字节)
   proof?: TeeProofWire; // 末尾 tee.proof 事件(无则 undefined)
+  bodyContentType?: string; // multipart 第一段的原始 Content-Type
   ignoredLeadingBlankBytes?: number; // 粘贴 body+proof 尾段时用户手动多加的开头空行,经 proof hash 证明后忽略
 }
 
@@ -358,7 +455,7 @@ export function parseTeeProofMultipartResponse(
   } catch {
     proof = undefined;
   }
-  return { body: responsePart.body, proof };
+  return { body: responsePart.body, proof, bodyContentType: multipartContentType(responsePart.headers) };
 }
 
 function parseTeeProofMultipartTailCapture(bytes: Buffer, boundaryBytes: Buffer, boundaryOffset: number): ParsedTeeProofStream | undefined {
@@ -484,6 +581,14 @@ function multipartContentLength(headers: string): number | undefined {
     if (!match) continue;
     const value = Number.parseInt(match[1], 10);
     return Number.isFinite(value) && value >= 0 ? value : undefined;
+  }
+  return undefined;
+}
+
+function multipartContentType(headers: string): string | undefined {
+  for (const line of headers.split(/\r?\n/)) {
+    const match = line.match(/^content-type:\s*(.+?)\s*$/i);
+    if (match) return match[1];
   }
   return undefined;
 }

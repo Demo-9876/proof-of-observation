@@ -3,6 +3,7 @@ import type { TeeCheck, TeeProofWire } from './tee-verify-core.ts';
 export interface EvidenceTrust {
   profile?: string;
   expectedPcr0?: string;
+  expectedPcr8?: string;
   expectedPcrs?: Record<string, string>;
   requirePlatformTrust?: boolean;
   allowSyntheticQuoteReportCertForTest?: boolean;
@@ -28,6 +29,7 @@ export interface EvidenceVerdict {
   checks: TeeCheck[];
   moduleId?: string;
   pcr0?: string | null;
+  pcr8?: string | null;
   measurements?: Record<string, string>;
   publicKey?: string | null;
   nonce?: string | null;

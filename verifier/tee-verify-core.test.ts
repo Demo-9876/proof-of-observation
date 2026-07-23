@@ -20,6 +20,7 @@ import {
   type TeeProofWire,
   type AttestationVerifier,
 } from './tee-verify-core.ts';
+import type { EvidenceProfileVerifier } from './evidence-profile.ts';
 import { computeV2SigningMaterial, sha256 } from './signing.ts';
 
 const NONCE = Buffer.from('a-fresh-16b-nonce').toString('base64');
@@ -164,6 +165,34 @@ describe('verifyTeeExchange v2 (response-only mode)', () => {
     expect(r.checks.find((c) => c.name === 'proof wire')?.detail).toContain('proof.alg');
   });
 
+  it('fails closed instead of throwing when proof fields are malformed', () => {
+    const { proof, responseBody } = makeSigned();
+    (proof as any).upstream_host = 123;
+    (proof as any).request_body_sha256 = 'not-hex';
+    const r = verifyTeeExchange({
+      expectedPcr0: PCR0,
+      expectedHost: HOST,
+      responseBody,
+      proof,
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'proof wire')?.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'proof wire')?.detail).toContain('upstream_host must be string');
+    expect(r.provenance.upstreamHost).toBe('');
+  });
+
+  it('fails closed instead of throwing when proof is not an object', () => {
+    const r = verifyTeeExchange({
+      expectedPcr0: PCR0,
+      responseBody: RESPONSE_BODY,
+      proof: null as any,
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'proof wire')?.detail).toContain('JSON object');
+  });
+
   it('rejects a wrong-image PCR0', () => {
     const { proof, pubB64, responseBody } = makeSigned();
     const r = verifyTeeExchange(
@@ -224,6 +253,104 @@ describe('verifyTeeExchange v2 (response-only mode)', () => {
     );
     expect(r.ok).toBe(false);
     expect(r.checks.find((c) => c.name === '远程证明')?.ok).toBe(false);
+  });
+
+  it('requires explicit trust config for non-Nitro profiles', () => {
+    const { proof, responseBody } = makeSigned();
+    proof.profile = 'qingtian';
+    const r = verifyTeeExchange({ responseBody, proof });
+
+    expect(r.ok).toBe(false);
+    expect(r.attestation.profile).toBe('qingtian');
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.detail).toContain('必须由本地 trust.profile 显式选择');
+  });
+
+  it('fails closed when proof profile and trust profile differ', () => {
+    const { proof, responseBody } = makeSigned();
+    proof.profile = 'qingtian';
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: { profile: 'nitro', expectedPcr0: PCR0 },
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.detail).toContain('不一致');
+  });
+
+  it('fails closed when a non-Nitro trust profile is used without an explicit proof profile', () => {
+    const { proof, responseBody } = makeSigned();
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: {
+        profile: 'qingtian',
+        expectedPcrs: { 'sha384:0': PCR0, 'sha384:8': '00' },
+        platformTrust: { mode: 'cert-chain' },
+      },
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.attestation.profile).toBe('qingtian');
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.detail).toContain('proof 未声明同一 profile');
+  });
+
+  it('fails closed for a trusted but unsupported evidence profile', () => {
+    const { proof, responseBody } = makeSigned();
+    proof.profile = 'made-up-tee';
+    const r = verifyTeeExchange({
+      responseBody,
+      proof,
+      trust: {
+        profile: 'made-up-tee',
+        expectedPcrs: { 'sha384:0': PCR0, 'sha384:8': '00' },
+        platformTrust: { mode: 'cert-chain' },
+      },
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.attestation.profile).toBe('made-up-tee');
+    expect(r.checks.find((c) => c.name === '远程证明')?.detail).toContain('unsupported evidence profile');
+  });
+
+  it('routes non-Nitro profiles through the evidence verifier registry', () => {
+    const { proof, pubB64, responseBody } = makeSigned();
+    proof.profile = 'qingtian';
+    const qingtianVerifier: EvidenceProfileVerifier = {
+      profile: 'qingtian',
+      verifyEvidence({ proof }) {
+        return {
+          ok: true,
+          profile: 'qingtian',
+          checks: [{ name: 'QingTian evidence', ok: true, detail: 'mock qtsm evidence accepted' }],
+          pcr0: PCR0,
+          pcr8: '11'.repeat(48),
+          measurements: { 'sha384:0': PCR0, 'sha384:8': '11'.repeat(48) },
+          publicKey: proof.public_key,
+          nonce: proof.nonce,
+          platformTrust: { ok: true, mode: 'cert-chain', status: 'ok', detail: 'mock platform trust' },
+        };
+      },
+    };
+
+    const r = verifyTeeExchange(
+      {
+        responseBody,
+        proof,
+        trust: {
+          profile: 'qingtian',
+          expectedPcrs: { 'sha384:0': PCR0, 'sha384:8': '11'.repeat(48) },
+          platformTrust: { mode: 'cert-chain' },
+        },
+      },
+      { evidenceVerifiers: { qingtian: qingtianVerifier } },
+    );
+
+    expect(r.ok, JSON.stringify(r.checks)).toBe(true);
+    expect(r.attestation.profile).toBe('qingtian');
+    expect(r.attestation.publicKey).toBe(pubB64);
+    expect(r.attestation.pcr8).toBe('11'.repeat(48));
+    expect(r.attestation.platformTrust?.ok).toBe(true);
   });
 });
 

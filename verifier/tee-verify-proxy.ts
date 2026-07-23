@@ -5,7 +5,8 @@
 // 把你的 LLM 客户端 baseURL 改指向本代理(http://127.0.0.1:8788),其余照常调用。代理对每次请求:
 //   ① 原样转发到真实上游(relay),逐字节回传给你的客户端 —— 流式不破(holdback 只压住流末)。
 //      默认不注入 nonce；若配置 --nonce-header,代理每请求生成 nonce 并要求 proof.nonce 匹配。
-//   ② 流末剥掉带外 `event: tee.proof`,对其余字节(= 飞地签名的上游原文)走 v2 response-only 验证:
+//   ② 剥掉带外 proof(SSE 末尾 `event: tee.proof` 或 multipart proof part),对其余字节
+//      (= 飞地签名的上游原文)走 v2 response-only 验证:
 //      Evidence profile trust + 公钥绑定 + nonce/新鲜性 + 声明验签;并**读出签名覆盖的 upstream_host/path**。
 //   ③ 默认 fail-open:无论判定都把响应交给客户端,但把判定**大声打到本代理日志**(持续抽查/威慑)。
 //      `--enforce`:fail-closed —— 整段缓冲、有 proof 且验过才放行;缺 proof 或验不过均回 502。
@@ -24,6 +25,7 @@ import { fileURLToPath, URL } from 'node:url';
 import {
   verifyTeeExchange,
   parseTeeProofEvent,
+  parseTeeProofCapture,
   type AttestationVerifier,
   type TeeVerifyResult,
 } from './tee-verify-core.ts';
@@ -40,8 +42,8 @@ const DEFAULT_HOLDBACK = 64 * 1024; // 须 ≥ 最大 proof 体积(含 COSE atte
 
 export interface VerifyingProxyOptions {
   upstream: string; // 真实上游 base URL,如 https://api.example.com
-  expectedPcr0?: string; // legacy Nitro 审计公布的镜像度量
-  trust?: EvidenceTrust; // aliyun-vtpm 等 profile 的本地 trust bundle
+  expectedPcr0?: string; // legacy Nitro shorthand
+  trust?: EvidenceTrust; // profile-aware trust config; required for Aliyun/QingTian 等 non-Nitro profiles
   nonceHeader?: string; // 可选:每请求生成 nonce 并用该 header 发给 relay,再强制 proof.nonce 匹配
   enforce?: boolean; // true=fail-closed(缓冲+阻断);默认 false=fail-open(流式+日志)
   holdback?: number; // 流式压住流末的字节数;默认 64KiB
@@ -80,19 +82,13 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
       if (reqBody.length) headers['content-length'] = String(reqBody.length);
       if (opts.nonceHeader && expectedNonceB64) headers[opts.nonceHeader] = expectedNonceB64;
 
-      // 默认 nonce 可由 relay 端生成、随 proof 回;若配置 nonceHeader,这里生成并注入,
+      // 默认 nonce 可由 relay 端生成、随 proof 回；若配置 nonceHeader,这里生成并注入,
       // 核心会强制 proof.nonce 与注入值一致。ctx.nonce 取自已验证 proof,仅供日志展示。
       const report = (verdict: TeeVerifyResult | null, attested: boolean, nonce = '') =>
         opts.onVerdict?.(verdict, { method: clientReq.method || 'GET', path: clientReq.url || '/', nonce, attested });
       const runVerify = (body: Buffer, proof: any): TeeVerifyResult =>
         verifyTeeExchange(
-          {
-            expectedPcr0: opts.expectedPcr0,
-            trust: opts.trust,
-            expectedNonceB64,
-            responseBody: body,
-            proof,
-          },
+          { expectedPcr0: opts.expectedPcr0, trust: opts.trust, expectedNonceB64, responseBody: body, proof },
           { verifyAttestationDoc: opts.verifyAttestationDoc },
         );
 
@@ -100,7 +96,9 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
       const up = transport.request(target, { method: clientReq.method, headers }, (upRes) => {
         upResRef = upRes;
         const ct = String(upRes.headers['content-type'] || '');
-        const streaming = ct.includes('text/event-stream');
+        const lowerCt = ct.toLowerCase();
+        const streaming = lowerCt.includes('text/event-stream');
+        const multipart = lowerCt.includes('multipart/mixed');
 
         // ── fail-closed:整段缓冲,必须有 proof 且验过才放行;缺 proof/验不过 → 502。
         if (opts.enforce) {
@@ -108,7 +106,7 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
           upRes.on('data', (c: Buffer) => buf.push(c));
           upRes.on('end', () => {
             const whole = Buffer.concat(buf);
-            const { body, proof } = parseTeeProofEvent(whole.toString('utf8'));
+            const { body, proof } = parseTeeProofCapture(whole, ct);
             const verdict = proof ? runVerify(body, proof) : null;
             report(verdict, Boolean(proof), proof?.nonce ?? '');
             if (!proof) {
@@ -121,8 +119,30 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
               clientRes.end(JSON.stringify({ error: 'tee_verification_failed', checks: verdict?.checks ?? null }));
               return;
             }
-            copyHeaders(upRes, clientRes, Boolean(proof));
-            clientRes.end(proof ? body : whole);
+            copyHeaders(upRes, clientRes, true, proof.resp_content_type);
+            clientRes.end(body);
+          });
+          upRes.on('error', () => endError(clientRes));
+          return;
+        }
+
+        // ── fail-open · multipart proof:缓冲剥 proof,验过/验不过都把 raw response bytes 交给客户端并记录判定。
+        if (multipart) {
+          const buf: Buffer[] = [];
+          upRes.on('data', (c: Buffer) => buf.push(c));
+          upRes.on('end', () => {
+            const whole = Buffer.concat(buf);
+            const parsed = parseTeeProofCapture(whole, ct);
+            const { body, proof } = parsed;
+            const verdict = proof ? runVerify(body, proof) : null;
+            report(verdict, Boolean(proof), proof?.nonce ?? '');
+            if (!proof && !parsed.bodyContentType) {
+              copyHeaders(upRes, clientRes, false);
+              clientRes.end(whole);
+              return;
+            }
+            copyHeaders(upRes, clientRes, true, verdict?.ok ? proof?.resp_content_type : parsed.bodyContentType);
+            clientRes.end(body);
           });
           upRes.on('error', () => endError(clientRes));
           return;
@@ -184,7 +204,7 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
   });
 }
 
-function copyHeaders(upRes: http.IncomingMessage, clientRes: http.ServerResponse, stripLength: boolean): void {
+function copyHeaders(upRes: http.IncomingMessage, clientRes: http.ServerResponse, stripLength: boolean, contentTypeOverride?: string): void {
   const out: Record<string, string | string[]> = {};
   for (const [k, v] of Object.entries(upRes.headers)) {
     if (v == null) continue;
@@ -193,6 +213,7 @@ function copyHeaders(upRes: http.IncomingMessage, clientRes: http.ServerResponse
     if (stripLength && lk === 'content-length') continue; // 剥了 proof → 长度变了,交给 Node 重设
     out[k] = v as string | string[];
   }
+  if (contentTypeOverride) out['content-type'] = contentTypeOverride;
   clientRes.writeHead(upRes.statusCode || 200, out);
 }
 
@@ -214,16 +235,17 @@ function runCli(): void {
   const nonceHeader = flag('--nonce-header');
   const port = Number(flag('--port') ?? process.env.TEE_PROXY_PORT ?? 8788);
   const enforce = has('--enforce');
+  const usage = '用法: tsx tee-verify-proxy.ts --upstream <url> (--pcr0 <hex> | --trust <trust.json>) [--port 8788] [--enforce] [--nonce-header x-tee-nonce]';
   if (!upstream) {
-    console.error('用法: tsx tee-verify-proxy.ts --upstream <url> (--pcr0 <hex> | --trust <trust.json>) [--port 8788] [--enforce] [--nonce-header x-tee-nonce]');
+    console.error(usage);
     process.exit(2);
   }
-  requirePcr0OrTrust({
-    pcr0,
-    trustPath,
-    usage: '用法: tsx tee-verify-proxy.ts --upstream <url> (--pcr0 <hex> | --trust <trust.json>) [--port 8788] [--enforce] [--nonce-header x-tee-nonce]',
-  });
+  requirePcr0OrTrust({ pcr0, trustPath, usage });
   const trust = loadTrustConfig(trustPath, pcr0);
+  if (!trust) {
+    console.error(usage);
+    process.exit(2);
+  }
 
   const server = createVerifyingProxy({
     upstream,
