@@ -4,6 +4,8 @@
 # Required input: Huawei QingTian SDK checked out at QTSM_SDK_DIR, defaulting to
 # third_party/qingtian-sdk. The directory must contain enclave/qtsm/lib/Makefile
 # and qingtian-tools/qproxy plus the Rust QTSM SDK crates under enclave/.
+# The runtime defaults to direct-vsock, but the current image build still
+# bundles qproxy and therefore expects the full SDK checkout.
 #
 # Example:
 #   docker build --no-cache \
@@ -75,8 +77,8 @@ FROM debian:bookworm-slim
 
 ARG APT_MIRROR=
 ARG POO_PARENT_CIDS=3
-ARG POO_EGRESS_MODE=qproxy
-ARG POO_QPROXY_ENABLED=1
+ARG POO_EGRESS_MODE=direct-vsock
+ARG POO_QPROXY_ENABLED=0
 ARG POO_QPROXY_PARENT_CID=3
 ARG POO_QPROXY_EGRESS_PORTS=8444,8445
 

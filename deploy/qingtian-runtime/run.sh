@@ -18,8 +18,8 @@ fi
 : "${QINGTIAN_CPUS:=2}"
 : "${QINGTIAN_MEM:=1024}"
 : "${QINGTIAN_PARENT_CIDS:=3}"
-: "${QINGTIAN_EGRESS_MODE:=qproxy}"
-: "${QINGTIAN_QPROXY_ENABLED:=1}"
+: "${QINGTIAN_EGRESS_MODE:=direct-vsock}"
+: "${QINGTIAN_QPROXY_ENABLED:=0}"
 : "${QINGTIAN_QPROXY_PARENT_CID:=${QINGTIAN_PARENT_CIDS%%,*}}"
 : "${QINGTIAN_QPROXY_EGRESS_PORTS:=8444,8445}"
 : "${QTSM_SDK_DIR:=third_party/qingtian-sdk}"
@@ -48,6 +48,8 @@ if [ ! -f "$QTSM_SDK_DIR/enclave/qtsm/lib/Makefile" ]; then
 fi
 if [ ! -d "$QTSM_SDK_DIR/qingtian-tools/qproxy" ] || [ ! -d "$QTSM_SDK_DIR/enclave/qtsm-sdk-rs" ] || [ ! -d "$QTSM_SDK_DIR/enclave/qtsm-sdk-sys" ]; then
   echo "missing qproxy or Rust QTSM SDK crates under $QTSM_SDK_DIR" >&2
+  echo "the current runtime image build still requires the full QingTian SDK checkout," >&2
+  echo "even when QINGTIAN_EGRESS_MODE=direct-vsock and QINGTIAN_QPROXY_ENABLED=0" >&2
   echo "required: qingtian-tools/qproxy, enclave/qtsm-sdk-rs, enclave/qtsm-sdk-sys" >&2
   exit 2
 fi
