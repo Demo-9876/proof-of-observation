@@ -117,8 +117,8 @@ QINGTIAN_CID=4
 QINGTIAN_CPUS=2
 QINGTIAN_MEM=4096
 QINGTIAN_PARENT_CIDS=3
-QINGTIAN_EGRESS_MODE=qproxy
-QINGTIAN_QPROXY_ENABLED=1
+QINGTIAN_EGRESS_MODE=direct-vsock
+QINGTIAN_QPROXY_ENABLED=0
 QINGTIAN_QPROXY_PARENT_CID=3
 QINGTIAN_QPROXY_EGRESS_PORTS=8444,8445
 QTSM_SDK_DIR=third_party/qingtian-sdk
@@ -132,7 +132,7 @@ EOF
 
 `QINGTIAN_PARENT_CIDS` 会被写入 EIF 环境变量并影响 `PCR0`。生产发布时必须固定并记录。
 
-`QINGTIAN_EGRESS_MODE=qproxy` 是 QingTian 正式出网模式。运行镜像会先启动 Huawei 官方 `qproxy enclave`，再启动 `/attest`。父 VM 必须同时启动 `qproxy host`，并为每个上游端口启动 parent-local TCP mapper；详细步骤见 [`qingtian-new-api-parent-relay-deployment.md`](qingtian-new-api-parent-relay-deployment.md) 第 4 节。
+这里的默认配置使用 `QINGTIAN_EGRESS_MODE=direct-vsock`。运行镜像会直接由 `/attest` 连接父 VM 暴露的 egress vsock 端口；如果现场需要改走 qproxy，再显式修改 `qingtian.env`。需要注意的是，当前构建流程仍然要求完整的 QingTian SDK checkout，包含 `qingtian-tools/qproxy` 和 Rust QTSM crates。
 
 `APT_MIRROR` 建议在 QingTian ECS 上使用 HTTP。`debian:bookworm-slim` 初始没有 CA 证书，若第一轮 `apt-get update` 使用 HTTPS 镜像，可能出现 `No system certificates available` / `Certificate verification failed`，导致 `ca-certificates` 自身也安装不上。APT 仍会校验 Debian Release 签名。
 
@@ -207,7 +207,39 @@ openssl x509 -in root.pem -noout -subject -issuer -dates -fingerprint -sha256
 
 ## 8. 启动现有父虚机 Relay
 
-父 VM relay 如果使用 `ai-platform-newapi`，详细部署步骤见 [`qingtian-new-api-parent-relay-deployment.md`](qingtian-new-api-parent-relay-deployment.md)。核心是启用 new-api 现有 `TEE_PROOF_*` 配置，并连接 QingTian enclave CID `4` / control port `5005`：
+默认 `direct-vsock` 模式下，父 VM 需要先启动 egress vsock proxy，再启动现有 relay。下面示例使用 `socat-vsock`；如果现场已有等价实现，也可以替换成同等功能的 vsock 字节转发器。
+
+先确认父 VM 上有可用的 `socat-vsock`：
+
+```bash
+find ~ -name socat-vsock -type f 2>/dev/null
+export SOCAT_VSOCK=/path/to/socat-vsock
+test -x "$SOCAT_VSOCK"
+```
+
+启动父 VM egress proxy。每个上游 host 使用一个独立的 vsock 端口：
+
+```bash
+mkdir -p ~/proof-of-observation/logs
+
+sudo "$SOCAT_VSOCK" -d -d \
+  vsock-listen:8444,reuseaddr,fork \
+  TCP:dashscope.aliyuncs.com:443 \
+  > ~/proof-of-observation/logs/egress-dashscope-8444.log 2>&1 &
+
+echo $! | tee ~/proof-of-observation/logs/egress-dashscope-8444.pid
+
+sudo "$SOCAT_VSOCK" -d -d \
+  vsock-listen:8445,reuseaddr,fork \
+  TCP:api.openai.com:443 \
+  > ~/proof-of-observation/logs/egress-openai-8445.log 2>&1 &
+
+echo $! | tee ~/proof-of-observation/logs/egress-openai-8445.pid
+
+ps -ef | grep socat-vsock | grep -E '8444|8445'
+```
+
+然后启动现有 relay。父 VM relay 如果使用 `ai-platform-newapi`，核心是启用现有 `TEE_PROOF_*` 配置，并连接 QingTian enclave CID `4` / control port `5005`：
 
 ```bash
 export TEE_PROOF_ENABLED=true
@@ -222,7 +254,7 @@ export TEE_PROOF_MAX_BODY_BYTES=67108864
 export TEE_PROOF_STORE=memory
 ```
 
-qproxy 模式下，relay 仍然只把 `egress_port` 写入 request head；enclave 内 `/attest` 会连接本地 `127.0.0.1:<egress_port>`，由 `qproxy enclave` 转到父 VM 的 `qproxy host`。接入过 Nitro 的中转站不需要改变 proof wire 协议，只需要把 host 到 egress port 的映射配置为 QingTian 现场使用的端口。
+direct-vsock 默认模式下，relay 仍然只把 `egress_port` 写入 request head；enclave 内 `/attest` 会直接连接父 VM 的该 vsock 端口。接入过 Nitro 的中转站不需要改变 proof wire 协议，只需要把 host 到 egress port 的映射配置为 QingTian 现场使用的端口。
 
 ## 9. 发真实业务请求并保存完整响应
 
