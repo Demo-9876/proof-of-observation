@@ -21,6 +21,7 @@ import { aliyunVtpmEvidenceVerifier } from './evidence-aliyun-vtpm.ts';
 import { createNitroEvidenceVerifier, nitroEvidenceVerifier } from './evidence-nitro.ts';
 import type { EvidenceProfileVerifier, EvidenceTrust } from './evidence-profile.ts';
 import { qingtianEvidenceVerifier } from './evidence-qingtian.ts';
+import { verifyFieldClaims, type FieldClaims } from './field-proof.ts';
 import { buildV2Statement, sha256 } from './signing.ts';
 
 // v2 proof 线格式(docs/tee-signing-v2-design.md §5)。前 9 字段(nonce…response_body_sha256)即签名载荷。
@@ -40,6 +41,7 @@ export interface TeeProofWire {
   signature: string; // base64 Ed25519(覆盖重建声明)
   attestation: string; // base64 COSE_Sign1 文档
   evidence?: unknown; // profile-specific structured evidence；Nitro 旧 proof 可为空
+  field_claims?: FieldClaims;
   pcr0?: string;
   pcr8?: string;
 }
@@ -73,6 +75,8 @@ export interface TeeVerifyInput {
   expectedHost?: string;
   // 可选:由 verifier/requester 预先生成的 nonce。给了就强制 proof.nonce 完全一致,防重放。
   expectedNonceB64?: string;
+  // 新版生产验证要求字段级 proof。测试旧向量时可显式关闭。
+  requireFieldClaims?: boolean;
   now?: number; // 证书有效期判定基准(测试可注)
 }
 
@@ -80,6 +84,7 @@ export interface TeeCheck {
   name: string;
   ok: boolean;
   detail: string;
+  skipped?: boolean;
 }
 
 export interface TeeVerifyResult {
@@ -141,7 +146,7 @@ export function verifyTeeExchange(
     expectedPcr0: input.trust?.expectedPcr0 ?? input.expectedPcr0,
   };
 
-  const profileCheck = verifyConfiguredProfile(profile, t, !!input.trust?.profile);
+  const profileCheck = verifyConfiguredProfile(profile, t);
   checks.push(profileCheck);
 
   const evidenceVerifier = profileCheck.ok ? resolveEvidenceVerifier(profile, deps) : undefined;
@@ -166,13 +171,34 @@ export function verifyTeeExchange(
     checks.push({ name: '上游 host', ok: true, detail: `签名覆盖的上游 host = ${t.upstream_host}(path ${t.upstream_path};请自行核对是否官方端点)` });
   }
 
-  // ⑤ 响应签名:对「重建声明」验签 + 收到字节哈希核对。
-  checks.push(verifySignatureCheck(t, input.responseBody));
+  const fieldMode = !!t.field_claims;
+  if (input.requireFieldClaims === true && !fieldMode) {
+    checks.push({
+      name: '字段级 proof',
+      ok: false,
+      detail: '缺少 field_claims；新版生产验证要求字段级 proof',
+    });
+  }
 
-  // ⑥ 请求绑定(full 档):你发的 body 哈希 == 签名覆盖的 request_body_sha256。
+  // ⑤ 响应签名:对「重建声明」验签。字段级 proof 下 body hash 只作为 advisory 单独提示。
+  checks.push(verifySignatureCheck(t, input.responseBody, fieldMode));
+
+  if (fieldMode) {
+    checks.push(...verifyFieldClaimChecks(t, input.requestBody, input.responseBody));
+  }
+
+  // ⑥ 请求绑定(full 档):旧 proof 仍硬校验 body hash；字段级 proof 下只做 advisory。
   if (full) {
     const reqOk = sha256(input.requestBody!).toString('hex') === t.request_body_sha256;
-    checks.push({ name: '请求绑定', ok: reqOk, detail: reqOk ? '你发的请求体哈希 == 签名覆盖值(答的就是你这条请求)' : '你的请求体哈希 ≠ 签名覆盖值(请求被改 / 不是这条)' });
+    checks.push({
+      name: fieldMode ? '请求 body hash(advisory)' : '请求绑定',
+      ok: fieldMode ? true : reqOk,
+      detail: reqOk
+        ? '你发的请求体哈希 == 签名覆盖值'
+        : fieldMode
+          ? 'WARN: 你的请求体哈希 != 签名覆盖值；字段级 proof 以关键字段哈希为主判定'
+          : '你的请求体哈希 ≠ 签名覆盖值(请求被改 / 不是这条)',
+    });
   }
 
   const ok = checks.length > 0 && checks.every((c) => c.ok);
@@ -243,6 +269,9 @@ function verifyWireEnvelope(proof: unknown): TeeCheck {
   if (proof.evidence !== undefined && !isRecord(proof.evidence)) {
     errors.push('evidence must be an object when present');
   }
+  if (proof.field_claims !== undefined && !isRecord(proof.field_claims)) {
+    errors.push('field_claims must be an object when present');
+  }
   if (typeof proof.request_body_sha256 === 'string' && !/^[0-9a-f]{64}$/.test(proof.request_body_sha256)) {
     errors.push('request_body_sha256 must be lowercase hex sha256');
   }
@@ -307,14 +336,7 @@ function numberField(value: unknown, field: string): number | undefined {
   return isRecord(value) && typeof value[field] === 'number' ? value[field] : undefined;
 }
 
-function verifyConfiguredProfile(profile: string, proof: TeeProofWire, hasConfiguredProfile: boolean): TeeCheck {
-  if (profile !== 'nitro' && !hasConfiguredProfile) {
-    return {
-      name: 'Evidence profile',
-      ok: false,
-      detail: `非 Nitro profile=${profile} 必须由本地 trust.profile 显式选择`,
-    };
-  }
+function verifyConfiguredProfile(profile: string, proof: TeeProofWire): TeeCheck {
   if (proof.profile && proof.profile !== profile) {
     return {
       name: 'Evidence profile',
@@ -322,17 +344,10 @@ function verifyConfiguredProfile(profile: string, proof: TeeProofWire, hasConfig
       detail: `proof.profile=${proof.profile} 与 trust.profile=${profile} 不一致`,
     };
   }
-  if (profile !== 'nitro' && !proof.profile) {
-    return {
-      name: 'Evidence profile',
-      ok: false,
-      detail: `trust.profile=${profile} 但 proof 未声明同一 profile`,
-    };
-  }
   return {
     name: 'Evidence profile',
     ok: true,
-    detail: proof.profile ? `profile=${profile}` : 'legacy Nitro proof defaults to profile=nitro',
+    detail: proof.profile ? `profile=${profile}` : `profile=${profile} auto-selected by trust/verifier`,
   };
 }
 
@@ -352,8 +367,8 @@ function resolveEvidenceVerifier(
   return undefined;
 }
 
-// 重建 v2 声明(用 proof 自报的字段值)→ 用绑定公钥验签;再核对收到的字节哈希 == 签名覆盖的响应体哈希。
-function verifySignatureCheck(t: TeeProofWire, responseBody: Buffer): TeeCheck {
+// 重建 v2 声明(用 proof 自报的字段值)→ 用绑定公钥验签;字段级 proof 下 body hash 作为 advisory。
+function verifySignatureCheck(t: TeeProofWire, responseBody: Buffer, advisoryBodyHash = false): TeeCheck {
   try {
     const statement = buildV2Statement({
       nonceB64: t.nonce,
@@ -364,17 +379,72 @@ function verifySignatureCheck(t: TeeProofWire, responseBody: Buffer): TeeCheck {
       respContentType: t.resp_content_type,
       requestBodySha256Hex: t.request_body_sha256,
       responseBodySha256Hex: t.response_body_sha256,
+      fieldClaims: t.field_claims,
     });
     const pub = createPublicKey({ key: b64(t.public_key), format: 'der', type: 'spki' });
     const sigOk = edVerify(null, statement, pub, b64(t.signature));
     if (!sigOk) return { name: '响应签名', ok: false, detail: '验签失败:声明与签名不符(被改过)' };
     const bodyOk = sha256(responseBody).toString('hex') === t.response_body_sha256;
     if (!bodyOk) {
-      return { name: '响应签名', ok: false, detail: '签名有效但你收到的响应体哈希 ≠ 签名覆盖值(响应被改过)' };
+      return {
+        name: advisoryBodyHash ? '响应 body hash(advisory)' : '响应签名',
+        ok: advisoryBodyHash,
+        detail: advisoryBodyHash
+          ? 'WARN: 签名有效但你收到的响应体哈希 != 签名覆盖值；字段级 proof 以关键字段哈希为主判定'
+          : '签名有效但你收到的响应体哈希 ≠ 签名覆盖值(响应被改过)',
+      };
     }
-    return { name: '响应签名', ok: true, detail: '声明验签通过,且你收到的响应体哈希吻合' };
+    return {
+      name: advisoryBodyHash ? '响应 body hash(advisory)' : '响应签名',
+      ok: true,
+      detail: advisoryBodyHash ? '声明验签通过,且响应体哈希吻合' : '声明验签通过,且你收到的响应体哈希吻合',
+    };
   } catch (err) {
     return { name: '响应签名', ok: false, detail: `验签异常:${(err as Error).message}` };
+  }
+}
+
+function verifyFieldClaimChecks(t: TeeProofWire, requestBody: Buffer | undefined, responseBody: Buffer): TeeCheck[] {
+  try {
+    const r = verifyFieldClaims(
+      t.field_claims,
+      requestBody,
+      responseBody,
+      {
+        nonce: t.nonce,
+        upstream_host: t.upstream_host,
+        upstream_path: t.upstream_path,
+        http_method: t.http_method,
+        http_status: t.http_status,
+        resp_content_type: t.resp_content_type,
+      },
+    );
+    return [
+      {
+        name: '字段级协议',
+        ok: true,
+        detail: `protocol_family=${r.protocolFamily}`,
+      },
+      {
+        name: '请求字段绑定',
+        ok: r.requestChecked ? r.requestOk : true,
+        skipped: !r.requestChecked,
+        detail: !r.requestChecked
+          ? 'response-only 模式未提供请求体；请求字段未检查'
+          : r.requestOk
+            ? '用户请求关键字段哈希 == Enclave 上游请求字段哈希'
+            : `用户请求关键字段哈希不符: ${r.requestHash?.slice(0, 12)}...`,
+      },
+      {
+        name: '响应字段绑定',
+        ok: r.responseOk,
+        detail: r.responseOk
+          ? '用户收到响应关键字段哈希 == Enclave 上游响应字段哈希'
+          : `用户收到响应关键字段哈希不符: ${r.responseHash.slice(0, 12)}...`,
+      },
+    ];
+  } catch (err) {
+    return [{ name: '字段级 proof', ok: false, detail: (err as Error).message }];
   }
 }
 
@@ -383,12 +453,15 @@ function verifySignatureCheck(t: TeeProofWire, responseBody: Buffer): TeeCheck {
 // 验证方必须先剥掉这条末尾事件,再对**其余字节**(= 飞地签名的上游原文)重算 H(respBody)。
 // 从末尾定位(proof 永远是最后一条事件),避免上游内容里偶现同名字串。
 export const TEE_PROOF_EVENT = 'tee.proof';
+export const WOKEY_SSE_TRANSPORT_KEEPALIVE_V1 = ': wokey-transport-keepalive-v1\n\n';
 
 export interface ParsedTeeProofStream {
   body: Buffer; // 上游原文(飞地签名的字节)
   proof?: TeeProofWire; // 末尾 tee.proof 事件(无则 undefined)
   bodyContentType?: string; // multipart 第一段的原始 Content-Type
   ignoredLeadingBlankBytes?: number; // 粘贴 body+proof 尾段时用户手动多加的开头空行,经 proof hash 证明后忽略
+  ignoredTransportKeepaliveBytes?: number; // relay 传输层保活注释,仅在 proof hash 证明后剥离
+  ignoredTransportKeepaliveCount?: number;
 }
 
 type MultipartPart = {
@@ -410,16 +483,18 @@ export function parseTeeProofEvent(stream: string | Buffer | Uint8Array): Parsed
   if (!match) return { body: bytes };
   try {
     const proof = JSON.parse(match[1]) as TeeProofWire;
-    return { body: bytes.subarray(0, idx), proof };
+    const normalized = removeLeadingTransportKeepalivesIfSignedHashMatches(bytes.subarray(0, idx), proof);
+    return { body: normalized.body, proof, ...normalized.meta };
   } catch {
     return { body: bytes };
   }
 }
 
 export function parseTeeProofCapture(stream: string | Buffer | Uint8Array, contentType?: string): ParsedTeeProofStream {
-  const parsedSse = parseTeeProofEvent(stream);
-  if (parsedSse.proof) return parsedSse;
-  return parseTeeProofMultipartResponse(stream, contentType) ?? parsedSse;
+  const capture = stripHttpResponseEnvelope(teeCaptureBytes(stream), contentType);
+  const parsedSse = parseTeeProofEvent(capture.body);
+  if (parsedSse.proof) return { ...parsedSse, bodyContentType: parsedSse.bodyContentType ?? capture.contentType };
+  return parseTeeProofMultipartResponse(capture.body, capture.contentType) ?? parsedSse;
 }
 
 export function parseTeeProofMultipartResponse(
@@ -488,6 +563,67 @@ function teeCaptureBytes(stream: string | Buffer | Uint8Array): Buffer {
     : Buffer.isBuffer(stream)
       ? stream
       : Buffer.from(stream);
+}
+
+function stripHttpResponseEnvelope(bytes: Buffer, explicitContentType?: string): { body: Buffer; contentType?: string } {
+  const header = readHttpResponseHeader(bytes);
+  if (!header) return { body: bytes, contentType: explicitContentType };
+  let body = bytes.subarray(header.bodyStart);
+  let contentType = explicitContentType ?? httpHeaderValue(header.headers, 'content-type');
+  let current = header;
+  for (let i = 0; i < 4 && shouldSkipToNextHttpResponseHeader(current, contentType); i++) {
+    const next = readHttpResponseHeader(body, false);
+    if (!next) break;
+    body = body.subarray(next.bodyStart);
+    contentType = explicitContentType ?? httpHeaderValue(next.headers, 'content-type') ?? contentType;
+    current = next;
+  }
+  return { body, contentType };
+}
+
+function readHttpResponseHeader(bytes: Buffer, allowPrefix = true): { headers: string; bodyStart: number; statusCode: number; reason: string } | undefined {
+  const start = findHttpStatusLine(bytes, allowPrefix);
+  if (start < 0) return undefined;
+  const crlf = bytes.indexOf(Buffer.from('\r\n\r\n', 'utf8'), start);
+  const lf = bytes.indexOf(Buffer.from('\n\n', 'utf8'), start);
+  if (crlf < 0 && lf < 0) return undefined;
+  const headerEnd = crlf >= 0 && (lf < 0 || crlf < lf) ? crlf : lf;
+  const bodyStart = headerEnd === crlf ? crlf + 4 : lf + 2;
+  const headers = bytes.subarray(start, headerEnd).toString('utf8');
+  const status = headers.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})(?:\s+([^\r\n]*))?/i);
+  return {
+    headers,
+    bodyStart,
+    statusCode: status ? Number.parseInt(status[1], 10) : 0,
+    reason: status?.[2]?.trim().toLowerCase() ?? '',
+  };
+}
+
+function findHttpStatusLine(bytes: Buffer, allowPrefix: boolean): number {
+  const text = bytes.subarray(0, Math.min(bytes.length, 8192)).toString('latin1');
+  const match = allowPrefix
+    ? text.match(/(^|\n)HTTP\/\d(?:\.\d)?\s+\d{3}\b/)
+    : text.match(/^HTTP\/\d(?:\.\d)?\s+\d{3}\b/);
+  if (!match || match.index === undefined) return -1;
+  return match.index + (match[1] ? match[1].length : 0);
+}
+
+function shouldSkipToNextHttpResponseHeader(header: { statusCode: number; reason: string }, contentType?: string): boolean {
+  if (header.statusCode >= 100 && header.statusCode < 200) return true;
+  if (!contentType && header.reason.includes('connection established')) return true;
+  return false;
+}
+
+function httpHeaderValue(headers: string, name: string): string | undefined {
+  const wanted = name.toLowerCase();
+  for (const line of headers.split(/\r?\n/).slice(1)) {
+    const colon = line.indexOf(':');
+    if (colon < 0) continue;
+    if (line.slice(0, colon).trim().toLowerCase() === wanted) {
+      return line.slice(colon + 1).trim();
+    }
+  }
+  return undefined;
 }
 
 function multipartBoundary(bytes: Buffer, contentType?: string, first = firstMultipartBoundary(bytes)): string | undefined {
@@ -634,6 +770,36 @@ function removeLeadingBlankLinesIfSignedHashMatches(
       return { body: candidate, ignoredLeadingBlankBytes: offset };
     }
   }
+}
+
+function removeLeadingTransportKeepalivesIfSignedHashMatches(
+  body: Buffer,
+  proof?: TeeProofWire,
+): { body: Buffer; meta: Pick<ParsedTeeProofStream, 'ignoredTransportKeepaliveBytes' | 'ignoredTransportKeepaliveCount'> } {
+  const expected = typeof proof?.response_body_sha256 === 'string'
+    ? proof.response_body_sha256.toLowerCase()
+    : '';
+  if (!/^[a-f0-9]{64}$/.test(expected)) return { body, meta: {} };
+  if (sha256(body).toString('hex') === expected) return { body, meta: {} };
+
+  const marker = Buffer.from(WOKEY_SSE_TRANSPORT_KEEPALIVE_V1, 'utf8');
+  let offset = 0;
+  let count = 0;
+  while (body.subarray(offset, offset + marker.length).equals(marker)) {
+    offset += marker.length;
+    count++;
+    const candidate = Buffer.from(body.subarray(offset));
+    if (sha256(candidate).toString('hex') === expected) {
+      return {
+        body: candidate,
+        meta: {
+          ignoredTransportKeepaliveBytes: offset,
+          ignoredTransportKeepaliveCount: count,
+        },
+      };
+    }
+  }
+  return { body, meta: {} };
 }
 
 function consumeLeadingBlankLine(bytes: Buffer, offset: number): number {

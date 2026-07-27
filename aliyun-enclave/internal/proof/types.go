@@ -1,5 +1,7 @@
 package proof
 
+import "encoding/json"
+
 type TeeProof struct {
 	Version           int              `json:"v"`
 	Profile           string           `json:"profile"`
@@ -13,6 +15,7 @@ type TeeProof struct {
 	ResponseType      string           `json:"resp_content_type"`
 	RequestSHA256Hex  string           `json:"request_body_sha256"`
 	ResponseSHA256Hex string           `json:"response_body_sha256"`
+	FieldClaims       json.RawMessage  `json:"field_claims,omitempty"`
 	Signature         string           `json:"signature"`
 	Attestation       string           `json:"attestation"`
 	Evidence          EvidenceEnvelope `json:"evidence"`
@@ -27,6 +30,7 @@ type StatementFacts struct {
 	ResponseContentType   string
 	RequestBodySHA256Hex  string
 	ResponseBodySHA256Hex string
+	FieldClaims           json.RawMessage
 }
 
 type ChallengeFacts struct {
@@ -40,6 +44,7 @@ type ChallengeFacts struct {
 	HTTPMethod               string
 	HTTPStatus               int
 	ResponseContentType      string
+	FieldClaims              json.RawMessage
 }
 
 type EvidenceEnvelope struct {

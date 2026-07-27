@@ -3,6 +3,7 @@ package proof
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -21,6 +22,21 @@ func PathWithoutQuery(path string) string {
 	return path
 }
 
+func FieldClaimsSHA256Hex(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 {
+		return "", nil
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("field_claims JSON: %w", err)
+	}
+	canonical, err := CanonicalJSON(value)
+	if err != nil {
+		return "", err
+	}
+	return SHA256Hex(canonical), nil
+}
+
 func BuildV2Statement(f StatementFacts) []byte {
 	lines := []string{
 		SigningDomainV2,
@@ -32,6 +48,9 @@ func BuildV2Statement(f StatementFacts) []byte {
 		"resp-content-type=" + f.ResponseContentType,
 		"request-body-sha256=" + strings.ToLower(f.RequestBodySHA256Hex),
 		"response-body-sha256=" + strings.ToLower(f.ResponseBodySHA256Hex),
+	}
+	if h, err := FieldClaimsSHA256Hex(f.FieldClaims); err == nil && h != "" {
+		lines = append(lines, "field-claims-sha256="+h)
 	}
 	return []byte(strings.Join(lines, "\n") + "\n")
 }

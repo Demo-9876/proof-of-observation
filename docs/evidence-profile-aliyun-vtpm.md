@@ -103,10 +103,12 @@ Alibaba Cloud proofs set:
 The structured `evidence` field is preferred. `attestation` may carry the same
 JSON envelope as base64 for transport compatibility.
 
-The verifier must choose the evidence profile from local trust configuration.
+The verifier auto-detects the evidence profile from the proof and trust bundle.
 `proof.profile` is only an on-wire consistency field. If `proof.profile` is
-present and differs from `trust.profile`, verification must fail closed. Only
-legacy Nitro verification may default missing profile information to `nitro`.
+present and differs from `trust.profile`, verification must fail closed. If
+`trust.profile` is omitted, the unified verifier may derive it from the
+detected platform. Only legacy Nitro verification may default missing profile
+information to `nitro`.
 
 `attester.sdk`, `attester.sdk_commit`, and `attester.quote_handle` are diagnostic
 metadata supplied by the proof. They are not trusted inputs and must not directly

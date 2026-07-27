@@ -16,9 +16,12 @@
 //   resp-content-type=<原值>\n
 //   request-body-sha256=<hex>\n
 //   response-body-sha256=<hex>\n
+// 字段级 proof 会继续追加:
+//   field-claims-sha256=<hex>\n
 // Ed25519 直接对整块字节签。
 
 import { createHash } from 'node:crypto';
+import { fieldClaimsSha256Hex } from './field-proof.ts';
 
 export function sha256(data: Buffer): Buffer {
   return createHash('sha256').update(data).digest();
@@ -44,6 +47,7 @@ export interface V2StatementFields {
   respContentType: string;
   requestBodySha256Hex: string;
   responseBodySha256Hex: string;
+  fieldClaims?: unknown;
 }
 
 // 承重墙:从字段值重建待签声明字节。**所有可还原值禁含 CR/LF**(飞地入站已拒;调用方保证)。
@@ -59,6 +63,7 @@ export function buildV2Statement(f: V2StatementFields): Buffer {
     `request-body-sha256=${f.requestBodySha256Hex}`,
     `response-body-sha256=${f.responseBodySha256Hex}`,
   ];
+  if (f.fieldClaims !== undefined) lines.push(`field-claims-sha256=${fieldClaimsSha256Hex(f.fieldClaims)}`);
   return Buffer.from(lines.map((l) => `${l}\n`).join(''), 'utf8');
 }
 
@@ -72,6 +77,7 @@ export function computeV2SigningMaterial(input: {
   respContentType: string;
   requestBody: Buffer;
   responseBody: Buffer;
+  fieldClaims?: unknown;
 }): {
   statement: Buffer;
   digests: { requestBody: Buffer; responseBody: Buffer };
@@ -87,6 +93,7 @@ export function computeV2SigningMaterial(input: {
     respContentType: input.respContentType,
     requestBodySha256Hex: requestBody.toString('hex'),
     responseBodySha256Hex: responseBody.toString('hex'),
+    fieldClaims: input.fieldClaims,
   });
   return { statement, digests: { requestBody, responseBody } };
 }

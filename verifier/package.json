@@ -6,6 +6,7 @@
   "description": "Client-side verifier for proof-of-observation TEE exchange proofs (v2 field-decomposition + Nitro attestation).",
   "license": "MIT OR Apache-2.0",
   "scripts": {
+    "verify:unified": "tsx verify-unified-proof.ts",
     "test": "vitest run"
   },
   "devDependencies": {

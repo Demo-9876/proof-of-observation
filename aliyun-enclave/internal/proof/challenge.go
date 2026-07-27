@@ -12,7 +12,15 @@ import (
 func BuildAliyunVTPMChallengePayload(f ChallengeFacts) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteByte('{')
-	writeJSONPair(&buf, "http_method", f.HTTPMethod, false)
+	hasFieldClaims := len(f.FieldClaims) > 0
+	if hasFieldClaims {
+		h, err := FieldClaimsSHA256Hex(f.FieldClaims)
+		if err != nil {
+			return nil, err
+		}
+		writeJSONPair(&buf, "field_claims_sha256", h, false)
+	}
+	writeJSONPair(&buf, "http_method", f.HTTPMethod, hasFieldClaims)
 	buf.WriteByte(',')
 	buf.WriteString(`"http_status":`)
 	buf.WriteString(fmt.Sprintf("%d", f.HTTPStatus))

@@ -21,6 +21,9 @@ afterEach(async () => {
 });
 
 function track<T extends http.Server>(s: T): T { servers.push(s); return s; }
+function createTestProxy(opts: Parameters<typeof createVerifyingProxy>[0]): http.Server {
+  return track(createVerifyingProxy({ requireFieldClaims: false, ...opts }));
+}
 function listen(s: http.Server): Promise<number> {
   return new Promise((resolve) => s.listen(0, '127.0.0.1', () => resolve((s.address() as any).port)));
 }
@@ -151,12 +154,12 @@ describe('createVerifyingProxy (fail-open)', () => {
     const upPort = await listen(upstream);
 
     const verdicts: any[] = [];
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
       onVerdict: (v, ctx) => verdicts.push({ v, ctx }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
@@ -184,12 +187,12 @@ describe('createVerifyingProxy (fail-open)', () => {
     const upPort = await listen(upstream);
 
     const verdicts: any[] = [];
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
       onVerdict: (v, ctx) => verdicts.push({ v, ctx }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
@@ -206,12 +209,12 @@ describe('createVerifyingProxy (fail-open)', () => {
     const upPort = await listen(upstream);
 
     const verdicts: any[] = [];
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       verifyAttestationDoc: stubAtt({ publicKey: 'x', nonce: () => '' }),
       onVerdict: (v, ctx) => verdicts.push({ v, ctx }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
@@ -244,12 +247,12 @@ describe('createVerifyingProxy (fail-open)', () => {
     const upPort = await listen(upstream);
 
     const verdicts: any[] = [];
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
       onVerdict: (v, ctx) => verdicts.push({ v, ctx }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
@@ -287,12 +290,12 @@ describe('createVerifyingProxy (fail-open)', () => {
     const upPort = await listen(upstream);
 
     const verdicts: any[] = [];
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
       onVerdict: (v, ctx) => verdicts.push({ v, ctx }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
@@ -321,13 +324,13 @@ describe('createVerifyingProxy (fail-open)', () => {
     const upPort = await listen(upstream);
 
     const verdicts: any[] = [];
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       holdback: 1024,
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
       onVerdict: (v) => verdicts.push(v),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
@@ -351,14 +354,14 @@ describe('createVerifyingProxy (fail-open)', () => {
 
     const warnings: string[] = [];
     const verdicts: any[] = [];
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       holdback: 8, // 远小于 proof 体积 → 部分 proof 会被误转
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
       onWarning: (m) => warnings.push(m),
       onVerdict: (v) => verdicts.push(v),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     await postThrough(proxyPort, '/v1/messages', '{"x":1}');
@@ -378,12 +381,12 @@ describe('createVerifyingProxy (fail-open)', () => {
     }));
     const upPort = await listen(upstream);
 
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       holdback: 0, // 立即转发,客户端才收得到首片并断开
       verifyAttestationDoc: stubAtt({ publicKey: 'x', nonce: () => '' }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     await new Promise<void>((resolve) => {
@@ -399,6 +402,33 @@ describe('createVerifyingProxy (fail-open)', () => {
 });
 
 describe('createVerifyingProxy (--enforce / fail-closed)', () => {
+  it('blocks legacy proofs without field_claims by default', async () => {
+    const { privateKey, pubB64 } = newKey();
+    const upstreamBody = Buffer.from('event: message_stop\ndata: {"ok":1}\n\n', 'utf8');
+    let relayNonce = '';
+    const upstream = track(http.createServer((_req, res) => {
+      relayNonce = randomBytes(16).toString('base64');
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(upstreamBody);
+      res.write(signProof({ nonce: relayNonce, body: upstreamBody, privateKey, pubB64 }));
+      res.end();
+    }));
+    const upPort = await listen(upstream);
+
+    const proxy = track(createVerifyingProxy({
+      upstream: `http://127.0.0.1:${upPort}`,
+      expectedPcr0: PCR0,
+      enforce: true,
+      verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
+    }));
+    const proxyPort = await listen(proxy);
+
+    const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
+    expect(res.status).toBe(502);
+    expect(res.body).toContain('tee_verification_failed');
+    expect(res.body).toContain('field_claims');
+  });
+
   it('blocks a tampered attested response with 502', async () => {
     const { privateKey, pubB64 } = newKey();
     const original = Buffer.from('event: message_stop\ndata: {"ok":1}\n\n', 'utf8');
@@ -413,12 +443,12 @@ describe('createVerifyingProxy (--enforce / fail-closed)', () => {
     }));
     const upPort = await listen(upstream);
 
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       enforce: true,
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
@@ -440,12 +470,12 @@ describe('createVerifyingProxy (--enforce / fail-closed)', () => {
     }));
     const upPort = await listen(upstream);
 
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       enforce: true,
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
@@ -477,12 +507,12 @@ describe('createVerifyingProxy (--enforce / fail-closed)', () => {
     }));
     const upPort = await listen(upstream);
 
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       enforce: true,
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
@@ -499,12 +529,12 @@ describe('createVerifyingProxy (--enforce / fail-closed)', () => {
     }));
     const upPort = await listen(upstream);
 
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       enforce: true,
       verifyAttestationDoc: stubAtt({ publicKey: 'x', nonce: () => '' }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
@@ -526,13 +556,13 @@ describe('createVerifyingProxy (--enforce / fail-closed)', () => {
     }));
     const upPort = await listen(upstream);
 
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       nonceHeader: 'x-tee-nonce',
       enforce: true,
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => injectedNonce }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');
@@ -555,13 +585,13 @@ describe('createVerifyingProxy (--enforce / fail-closed)', () => {
     }));
     const upPort = await listen(upstream);
 
-    const proxy = track(createVerifyingProxy({
+    const proxy = createTestProxy({
       upstream: `http://127.0.0.1:${upPort}`,
       expectedPcr0: PCR0,
       nonceHeader: 'x-tee-nonce',
       enforce: true,
       verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => injectedNonce }),
-    }));
+    });
     const proxyPort = await listen(proxy);
 
     const res = await postThrough(proxyPort, '/v1/messages', '{"x":1}');

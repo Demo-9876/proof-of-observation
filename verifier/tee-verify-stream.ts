@@ -8,7 +8,7 @@
 // ③ 调共享核心 v2 验证(Evidence profile trust + 公钥绑定 + nonce/新鲜性 + 声明验签 + 读 host/path)。
 //
 //   · --pcr0  Nitro legacy:审计公布、可由 reproducible-build 复算的镜像度量
-//   · --trust profile-aware trust config;Aliyun/QingTian 等非 Nitro profile 必填
+//   · --trust profile-aware trust config;Aliyun/QingTian 等非 Nitro 通常用它提供 PCR allowlist / 平台证书 pin,profile 可由 proof 自动识别
 //   · --host  (可选)核对签名覆盖的 upstream_host(官方端点);不给则只展示,由你自行判断
 //   · --nonce-b64 (可选)核对用户本次挑战 nonce,防重放
 //
@@ -44,7 +44,8 @@ if (!trust) {
 }
 
 const streamBytes = readFileSync(capturePath);
-const { body, proof } = parseTeeProofCapture(streamBytes);
+const parsedCapture = parseTeeProofCapture(streamBytes);
+const { body, proof } = parsedCapture;
 if (!proof) {
   console.error('❌ 未在响应中找到可验证的 tee.proof —— 该响应未自证(可能走了降级/transform 路径,或 proof 被中间层吞掉)。');
   process.exit(1);
@@ -57,6 +58,7 @@ const result = verifyTeeExchange({
   proof,
   expectedHost,
   expectedNonceB64,
+  requireFieldClaims: true,
 });
 
 console.log('── 客户端流式抽查 · response-only (v2) ──');
@@ -66,6 +68,9 @@ console.log('绑定公钥  :', result.attestation.publicKey);
 console.log('上游 host :', result.provenance.upstreamHost, result.provenance.upstreamPath);
 console.log('状态/类型 :', `${result.provenance.httpStatus} · ${result.provenance.respContentType}`);
 console.log('响应字节  :', `${body.byteLength} B(已剥离流末 tee.proof)`);
+if (parsedCapture.ignoredTransportKeepaliveBytes) {
+  console.log('传输保活  :', `已按签名哈希剥离 ${parsedCapture.ignoredTransportKeepaliveCount} 条 / ${parsedCapture.ignoredTransportKeepaliveBytes} B`);
+}
 console.log('──');
 for (const c of result.checks) console.log(`  ${c.ok ? '✅' : '❌'} ${String(c.name).padEnd(6, '　')} ${c.detail}`);
 console.log(`  判定: ${result.ok ? '✅ 全过——真飞地跑审计镜像、签了你收到的这段响应(未篡改),host 已签名覆盖' : '❌ 校验失败'}`);

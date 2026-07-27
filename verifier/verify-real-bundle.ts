@@ -4,7 +4,7 @@
 //   npx tsx verify-real-bundle.ts <bundle.json> (--pcr0 <hex> | --trust <trust.json>) [--host <api.example.com>] [--nonce-b64 <b64>]
 //
 //   · --pcr0  Nitro legacy:审计公布、且可由 docs/tee-reproducible-build.md 复算的镜像度量
-//   · --trust profile-aware trust config;Aliyun/QingTian 等非 Nitro profile 必填
+//   · --trust profile-aware trust config;Aliyun/QingTian 等非 Nitro 通常用它提供 PCR allowlist / 平台证书 pin,profile 可由 proof 自动识别
 //   · --host  (可选)核对签名覆盖的 upstream_host;不给则只展示由你判断
 //   · --nonce-b64 (可选)核对用户本次挑战 nonce,防重放
 //
@@ -53,6 +53,7 @@ const result = verifyTeeExchange({
   requestBody: b(bundle.requestBody_b64),
   responseBody: b(bundle.responseBody_b64),
   proof: bundle.proof,
+  requireFieldClaims: true,
 });
 
 console.log('── 真硬件 · 完整产品离线验证 (v2) ──');

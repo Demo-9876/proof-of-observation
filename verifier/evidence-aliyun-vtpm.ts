@@ -1,6 +1,7 @@
 import { constants, createHash, createPublicKey, verify as nodeVerify, X509Certificate } from 'node:crypto';
 import type { TeeProofWire } from './tee-verify-core.ts';
 import type { EvidenceProfileVerifier, EvidenceTrust } from './evidence-profile.ts';
+import { fieldClaimsSha256Hex } from './field-proof.ts';
 
 const MAX_FIELD_BYTES = 256 * 1024;
 const TPM_GENERATED_VALUE = 0xff544347;
@@ -71,6 +72,7 @@ export function buildAliyunVtpmChallengePayload(proof: TeeProofWire): string {
     statement_public_key_sha256: publicKeySha256,
     upstream_host: proof.upstream_host,
     upstream_path: proof.upstream_path,
+    ...(proof.field_claims ? { field_claims_sha256: fieldClaimsSha256Hex(proof.field_claims) } : {}),
   });
 }
 
