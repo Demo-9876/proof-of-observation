@@ -28,7 +28,7 @@
 ## 验证(客户端)
 
 ```bash
-# 抓一段完整响应(SSE 或 multipart/mixed)→ 验
+# 抓一段完整响应(SSE / multipart/mixed / 顶层 proof JSON)→ 验
 npx tsx tee-verify-stream.ts captured-response --pcr0 <规范 PCR0>
 #   → 链到 AWS 根 + PCR0==公布值 + 公钥绑定 + nonce 绑定 + 声明验签 + 读出签名覆盖的 host
 
@@ -42,11 +42,12 @@ npx tsx tee-verify-stream.ts captured-response --trust aliyun-vtpm-trust.json --
 npx tsx verify-unified-proof.ts --response captured-response --trust trust.json --host dashscope.aliyuncs.com
 npx tsx verify-unified-proof.ts --response captured-response --proof proof.json --request request.json --trust trust.json
 ```
-支持两种 capture:
+支持三种 capture:
 
 - 流式 SSE:保存完整上游 SSE 字节,末尾包含 `event: tee.proof`。
 - 非流式 proof mode:保存完整 `multipart/mixed` body,第一段是 raw response bytes,第二段是 proof；也支持终端保存的 raw body + proof 尾段。
-- `curl -i` 或调试工具保存的完整 HTTP 响应头也可以直接传入；verifier 会先剥离 HTTP headers,再解析 SSE / multipart body。
+- 非流式 JSON envelope:保存原始 `application/json` 响应；verifier 会从顶层 `proof` 字段取出证明,并用剥掉 `proof` 后的 JSON 响应做字段级验证。
+- `curl -i` 或调试工具保存的完整 HTTP 响应头也可以直接传入；verifier 会先剥离 HTTP headers,再解析 SSE / multipart / JSON envelope body。
 
 如果需要 full 档验证(额外核对“答的就是我这条请求”),必须保存实际发送的请求体字节,再生成 bundle：
 
@@ -55,9 +56,9 @@ npx tsx make-real-bundle.ts request.json captured-response real-bundle.json
 npx tsx verify-real-bundle.ts real-bundle.json --trust qingtian-trust.json --host dashscope.aliyuncs.com
 ```
 
-`make-real-bundle.ts` 只负责剥离 capture 中的 `tee.proof` 并保存 `{ requestBody_b64, responseBody_b64, proof }`；真正的 attestation、PCR、公钥绑定、nonce、响应签名和请求绑定验证仍由 `verify-real-bundle.ts` 完成。
+`make-real-bundle.ts` 只负责剥离 capture 中的 `tee.proof` / multipart proof part / 顶层 `proof` 字段并保存 `{ requestBody_b64, responseBody_b64, proof }`；真正的 attestation、PCR、公钥绑定、nonce、响应签名和请求绑定验证仍由 `verify-real-bundle.ts` 完成。
 
-或浏览器:开 [`../docs/tee-verify.html`](../docs/tee-verify.html) 贴流式 SSE 或非流式 proof 响应；终端保存的 body+proof 尾段也兼容。规范 PCR0 见
+或浏览器:开 [`../docs/tee-verify.html`](../docs/tee-verify.html) 贴流式 SSE、非流式 multipart proof 响应或顶层 `proof` JSON；终端保存的 body+proof 尾段也兼容。规范 PCR0 见
 [`../docs/tee-reproducible-build.md`](../docs/tee-reproducible-build.md)。
 
 ## Evidence profiles
@@ -70,7 +71,7 @@ npx tsx verify-real-bundle.ts real-bundle.json --trust qingtian-trust.json --hos
 - `--trust <trust.json>`: profile 化 trust bundle,用于提供 `aliyun-vtpm`、`qingtian` 等 non-Nitro 的 PCR allowlist / 平台证书 pin;profile 本身可自动识别。
 - `--nonce-b64 <b64>`: 离线/抓包验证时强制 proof nonce 等于用户本次挑战 nonce。
 - `tee-verify-proxy.ts --nonce-header <header>`: 代理每请求生成 nonce,通过该 header 发给 relay,并要求返回 proof 使用同一个 nonce；需要 relay/Enclave 侧配合读取该 header。
-- `tee-verify-proxy.ts --enforce`: fail closed；缺少 proof 或 proof 验证失败都会返回 502。该模式支持流式 SSE 和非流式 multipart proof。
+- `tee-verify-proxy.ts --enforce`: fail closed；缺少 proof 或 proof 验证失败都会返回 502。该模式支持流式 SSE、非流式 multipart proof 和非流式顶层 `proof` JSON。
 
 本目录还包含实验性 `aliyun-vtpm` profile。它用于阿里云 Enclave vTPM 接入,可以验证 `QuoteReport` quote 签名、JCS challenge 绑定、PCR digest、PCR8/PCR9/PCR11 allowlist,以及本地配置的 `QuoteReport.Cert` root/intermediate 证书链和 Enclave EK CN 规则。CRL 检查目前需要外部完成；若配置 `revocation.required=true` 但没有声明 `checkedExternally=true`,verifier 会 fail closed。第一阶段浏览器 verifier 不支持该 profile。详见 [`../docs/evidence-profile-aliyun-vtpm.md`](../docs/evidence-profile-aliyun-vtpm.md)。
 

@@ -30,12 +30,12 @@ const detachedProof = proofPath ? readProofFile(proofPath) : undefined;
 const responseCapture = readFileSync(responsePath);
 const parsedCapture = parseTeeProofCapture(responseCapture);
 if (detachedProof && parsedCapture.proof && stableJson(detachedProof) !== stableJson(parsedCapture.proof)) {
-  console.error('ERROR detached proof does not match tee.proof embedded in response capture');
+  console.error('ERROR detached proof does not match proof embedded in response capture');
   process.exit(1);
 }
 const proof = detachedProof ?? (parsedCapture.proof as UnifiedProofWire | undefined);
 if (!proof) {
-  console.error('ERROR no proof provided: pass --proof <proof.json>, or provide a response capture containing tee.proof');
+  console.error('ERROR no proof provided: pass --proof <proof.json>, or provide a response capture containing tee.proof/multipart proof/top-level proof');
   process.exit(1);
 }
 const responseBody = parsedCapture.body;

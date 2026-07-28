@@ -42,6 +42,34 @@ function postThrough(port: number, path: string, body: string, headers: Record<s
   });
 }
 
+function postThroughFirstChunk(
+  port: number,
+  path: string,
+  body: string,
+): Promise<{ firstChunk: string; body: string; firstChunkAtMs: number }> {
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let firstChunkAtMs = -1;
+    const req = http.request(
+      { host: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json' } },
+      (res) => {
+        res.on('data', (c) => {
+          if (firstChunkAtMs < 0) firstChunkAtMs = Date.now() - started;
+          chunks.push(c as Buffer);
+        });
+        res.on('end', () => resolve({
+          firstChunk: chunks[0]?.toString('utf8') ?? '',
+          body: Buffer.concat(chunks).toString('utf8'),
+          firstChunkAtMs,
+        }));
+      },
+    );
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
 // 用真 Ed25519 + 真 v2 声明对给定 nonce/响应体造一个签名合法的 proof。
 function makeProof(args: {
   nonce: string;
@@ -306,6 +334,69 @@ describe('createVerifyingProxy (fail-open)', () => {
     expect(verdicts[0].v.ok).toBe(false);
     expect(verdicts[0].v.checks.find((c: any) => c.name === '响应签名')?.ok).toBe(false);
     expect(verdicts[0].ctx.attested).toBe(true);
+  });
+
+  it('verifies and strips a non-streaming JSON envelope proof response', async () => {
+    const { privateKey, pubB64 } = newKey();
+    const raw = { choices: [{ message: { role: 'assistant', content: 'hi' } }] };
+    const rawBody = Buffer.from(JSON.stringify(raw), 'utf8');
+    let relayNonce = '';
+    const upstream = track(http.createServer((_req, res) => {
+      relayNonce = randomBytes(16).toString('base64');
+      const proof = makeProof({
+        nonce: relayNonce,
+        body: rawBody,
+        privateKey,
+        pubB64,
+        respContentType: 'application/json',
+      });
+      res.writeHead(200, { 'content-type': 'application/json', 'x-tee-proof-version': '2' });
+      res.end(JSON.stringify({ ...raw, proof }));
+    }));
+    const upPort = await listen(upstream);
+
+    const verdicts: any[] = [];
+    const proxy = createTestProxy({
+      upstream: `http://127.0.0.1:${upPort}`,
+      expectedPcr0: PCR0,
+      verifyAttestationDoc: stubAtt({ publicKey: pubB64, nonce: () => relayNonce }),
+      onVerdict: (v, ctx) => verdicts.push({ v, ctx }),
+    });
+    const proxyPort = await listen(proxy);
+
+    const res = await postThrough(proxyPort, '/v1/chat/completions', '{"x":1}');
+    expect(res.status).toBe(200);
+    expect(res.body).toBe(rawBody.toString('utf8'));
+    expect(res.headers['content-type']).toBe('application/json');
+    expect(res.body).not.toContain('"proof"');
+    expect(verdicts).toHaveLength(1);
+    expect(verdicts[0].v.ok, JSON.stringify(verdicts[0].v.checks)).toBe(true);
+    expect(verdicts[0].ctx.attested).toBe(true);
+  });
+
+  it('streams ordinary JSON responses without proof headers instead of buffering for envelope parsing', async () => {
+    const upstream = track(http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write('{"choices":[');
+      setTimeout(() => res.end('{"message":{"content":"hi"}}]}'), 120);
+    }));
+    const upPort = await listen(upstream);
+
+    const verdicts: any[] = [];
+    const proxy = createTestProxy({
+      upstream: `http://127.0.0.1:${upPort}`,
+      expectedPcr0: PCR0,
+      onVerdict: (v, ctx) => verdicts.push({ v, ctx }),
+    });
+    const proxyPort = await listen(proxy);
+
+    const res = await postThroughFirstChunk(proxyPort, '/v1/chat/completions', '{"x":1}');
+    expect(res.firstChunk).toBe('{"choices":[');
+    expect(res.body).toBe('{"choices":[{"message":{"content":"hi"}}]}');
+    expect(res.firstChunkAtMs).toBeGreaterThanOrEqual(0);
+    expect(res.firstChunkAtMs).toBeLessThan(100);
+    expect(verdicts[0].v).toBeNull();
+    expect(verdicts[0].ctx.attested).toBe(false);
   });
 
   it('preserves byte-exactness across the holdback boundary (body ≫ holdback)', async () => {

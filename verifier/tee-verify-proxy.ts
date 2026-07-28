@@ -107,6 +107,7 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
         const lowerCt = ct.toLowerCase();
         const streaming = lowerCt.includes('text/event-stream');
         const multipart = lowerCt.includes('multipart/mixed');
+        const jsonEnvelope = lowerCt.includes('json') && hasTeeProofSignal(upRes.headers);
 
         // ── fail-closed:整段缓冲,必须有 proof 且验过才放行;缺 proof/验不过 → 502。
         if (opts.enforce) {
@@ -150,6 +151,29 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
               return;
             }
             copyHeaders(upRes, clientRes, true, verdict?.ok ? proof?.resp_content_type : parsed.bodyContentType);
+            clientRes.end(body);
+          });
+          upRes.on('error', () => endError(clientRes));
+          return;
+        }
+
+        // ── fail-open · JSON envelope proof:非流式响应可能在顶层 `proof` 字段携带证明。
+        // 只有响应头明确带 proof 信号时才缓冲 JSON；普通 JSON 仍走下方逐字节透传。
+        if (jsonEnvelope) {
+          const buf: Buffer[] = [];
+          upRes.on('data', (c: Buffer) => buf.push(c));
+          upRes.on('end', () => {
+            const whole = Buffer.concat(buf);
+            const parsed = parseTeeProofCapture(whole, ct);
+            const { body, proof } = parsed;
+            const verdict = proof ? runVerify(body, proof) : null;
+            report(verdict, Boolean(proof), proof?.nonce ?? '');
+            if (!proof && !parsed.bodyContentType) {
+              copyHeaders(upRes, clientRes, false);
+              clientRes.end(whole);
+              return;
+            }
+            copyHeaders(upRes, clientRes, true, parsed.bodyContentType ?? 'application/json');
             clientRes.end(body);
           });
           upRes.on('error', () => endError(clientRes));
@@ -223,6 +247,10 @@ function copyHeaders(upRes: http.IncomingMessage, clientRes: http.ServerResponse
   }
   if (contentTypeOverride) out['content-type'] = contentTypeOverride;
   clientRes.writeHead(upRes.statusCode || 200, out);
+}
+
+function hasTeeProofSignal(headers: http.IncomingHttpHeaders): boolean {
+  return Object.keys(headers).some((k) => k.toLowerCase().startsWith('x-tee-proof-'));
 }
 
 function endError(clientRes: http.ServerResponse): void {

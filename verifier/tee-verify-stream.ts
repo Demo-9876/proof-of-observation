@@ -2,8 +2,8 @@
 //
 //   npx tsx tee-verify-stream.ts <captured-response> (--pcr0 <hex> | --trust <trust.json>) [--host <api.example.com>] [--nonce-b64 <b64>]
 //
-// 输入是你**实际收到的完整响应**:SSE(上游字节 + 末尾 event: tee.proof)或 multipart/mixed
-// (第一段 raw response bytes,第二段 proof)。本工具:① 剥出 proof;② 对其余字节
+// 输入是你**实际收到的完整响应**:SSE(上游字节 + 末尾 event: tee.proof)、multipart/mixed
+// (第一段 raw response bytes,第二段 proof),或非流式 JSON 顶层 proof 字段。本工具:① 剥出 proof;② 对其余字节
 // (= 飞地签名的上游原文)重算 H(respBody);
 // ③ 调共享核心 v2 验证(Evidence profile trust + 公钥绑定 + nonce/新鲜性 + 声明验签 + 读 host/path)。
 //
@@ -47,7 +47,7 @@ const streamBytes = readFileSync(capturePath);
 const parsedCapture = parseTeeProofCapture(streamBytes);
 const { body, proof } = parsedCapture;
 if (!proof) {
-  console.error('❌ 未在响应中找到可验证的 tee.proof —— 该响应未自证(可能走了降级/transform 路径,或 proof 被中间层吞掉)。');
+  console.error('❌ 未在响应中找到可验证的 proof —— 该响应未自证(可能走了降级/transform 路径,或 proof 被中间层吞掉)。');
   process.exit(1);
 }
 

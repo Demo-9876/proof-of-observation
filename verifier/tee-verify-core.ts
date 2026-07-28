@@ -454,9 +454,10 @@ function verifyFieldClaimChecks(t: TeeProofWire, requestBody: Buffer | undefined
 // 从末尾定位(proof 永远是最后一条事件),避免上游内容里偶现同名字串。
 export const TEE_PROOF_EVENT = 'tee.proof';
 export const WOKEY_SSE_TRANSPORT_KEEPALIVE_V1 = ': wokey-transport-keepalive-v1\n\n';
+const JSON_PROOF_FIELD = Buffer.from('"proof"', 'utf8');
 
 export interface ParsedTeeProofStream {
-  body: Buffer; // 上游原文(飞地签名的字节)
+  body: Buffer; // 上游原文/已剥 proof 的响应体(飞地签名或字段级校验使用的字节视图)
   proof?: TeeProofWire; // 末尾 tee.proof 事件(无则 undefined)
   bodyContentType?: string; // multipart 第一段的原始 Content-Type
   ignoredLeadingBlankBytes?: number; // 粘贴 body+proof 尾段时用户手动多加的开头空行,经 proof hash 证明后忽略
@@ -494,7 +495,18 @@ export function parseTeeProofCapture(stream: string | Buffer | Uint8Array, conte
   const capture = stripHttpResponseEnvelope(teeCaptureBytes(stream), contentType);
   const parsedSse = parseTeeProofEvent(capture.body);
   if (parsedSse.proof) return { ...parsedSse, bodyContentType: parsedSse.bodyContentType ?? capture.contentType };
-  return parseTeeProofMultipartResponse(capture.body, capture.contentType) ?? parsedSse;
+  return parseTeeProofMultipartResponse(capture.body, capture.contentType)
+    ?? parseTeeProofJsonEnvelope(capture.body, capture.contentType)
+    ?? parsedSse;
+}
+
+export function parseTeeProofJsonEnvelope(
+  stream: string | Buffer | Uint8Array,
+  contentType?: string,
+): ParsedTeeProofStream | undefined {
+  if (contentType && !contentType.toLowerCase().includes('json')) return undefined;
+  const bytes = teeCaptureBytes(stream);
+  return parseTeeProofJsonEnvelopeBytes(bytes, contentType);
 }
 
 export function parseTeeProofMultipartResponse(
@@ -563,6 +575,105 @@ function teeCaptureBytes(stream: string | Buffer | Uint8Array): Buffer {
     : Buffer.isBuffer(stream)
       ? stream
       : Buffer.from(stream);
+}
+
+function parseTeeProofJsonEnvelopeBytes(bytes: Buffer, contentType?: string): ParsedTeeProofStream | undefined {
+  const candidates: ParsedTeeProofStream[] = [];
+  for (const span of findJsonEnvelopeSpans(bytes)) {
+    const candidate = bytes.subarray(span.start, span.end);
+    if (candidate.indexOf(JSON_PROOF_FIELD) < 0) continue;
+    const parsed = parseTeeProofJsonEnvelopeObject(candidate, contentType);
+    if (parsed) candidates.push(parsed);
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+function findJsonEnvelopeSpans(bytes: Buffer): Array<{ start: number; end: number }> {
+  const spans: Array<{ start: number; end: number }> = [];
+  const stack: number[] = [];
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (inString) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (b === 0x5c) {
+        escape = true;
+        continue;
+      }
+      if (b === 0x22) inString = false;
+      continue;
+    }
+    if (b === 0x22) {
+      inString = true;
+      continue;
+    }
+    if (b === 0x7b) {
+      stack.push(i);
+      continue;
+    }
+    if (b === 0x7d && stack.length > 0) {
+      const start = stack.pop()!;
+      spans.push({ start, end: i + 1 });
+    }
+  }
+  return outermostJsonEnvelopeSpans(spans);
+}
+
+function outermostJsonEnvelopeSpans(spans: Array<{ start: number; end: number }>): Array<{ start: number; end: number }> {
+  const ordered = spans.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+  const outermost: Array<{ start: number; end: number }> = [];
+  let coveredEnd = -1;
+  for (const span of ordered) {
+    if (span.end <= coveredEnd) continue;
+    outermost.push(span);
+    coveredEnd = span.end;
+  }
+  return outermost;
+}
+
+function parseTeeProofJsonEnvelopeObject(bytes: Buffer, contentType?: string): ParsedTeeProofStream | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed) || !Object.prototype.hasOwnProperty.call(parsed, 'proof')) return undefined;
+  const proofValue = parsed.proof;
+  if (!isEmbeddedProofValue(proofValue)) return undefined;
+  const bodyObject = { ...parsed };
+  delete bodyObject.proof;
+  return {
+    body: Buffer.from(JSON.stringify(bodyObject), 'utf8'),
+    proof: isTeeProofWireLike(proofValue) ? proofValue as TeeProofWire : undefined,
+    bodyContentType: contentType ?? 'application/json',
+  };
+}
+
+function looksLikeJsonObject(bytes: Buffer): boolean {
+  for (const b of bytes) {
+    if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d) continue;
+    return b === 0x7b; // {
+  }
+  return false;
+}
+
+function isEmbeddedProofValue(value: unknown): boolean {
+  return isTeeProofWireLike(value) || (isRecord(value) && value.type === 'tee.proof_unavailable');
+}
+
+function isTeeProofWireLike(value: unknown): value is Partial<TeeProofWire> {
+  return isRecord(value)
+    && value.v === 2
+    && value.alg === 'ed25519'
+    && typeof value.public_key === 'string'
+    && typeof value.nonce === 'string'
+    && typeof value.signature === 'string'
+    && typeof value.attestation === 'string';
 }
 
 function stripHttpResponseEnvelope(bytes: Buffer, explicitContentType?: string): { body: Buffer; contentType?: string } {

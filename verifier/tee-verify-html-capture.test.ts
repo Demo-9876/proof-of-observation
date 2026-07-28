@@ -16,11 +16,12 @@ const end = js.indexOf('// v2 字段分解声明:与', start);
 if (start < 0 || end < 0) throw new Error('failed to locate tee-verify.html capture parser block');
 
 const parser = new Function(
-  js.slice(start, end) + '\nreturn { parseProofEventBytes, parseProofEventText, parseProofMultipartBytes, normalizePastedBodyBytes };',
+  js.slice(start, end) + '\nreturn { parseProofEventBytes, parseProofEventText, parseProofMultipartBytes, parseProofJsonEnvelopeBytes, normalizePastedBodyBytes };',
 )() as {
   parseProofEventBytes: (bytes: Uint8Array) => { bodyBytes: Uint8Array; proof: Record<string, unknown> } | null;
   parseProofEventText: (text: string) => { bodyBytes: Uint8Array; proof: Record<string, unknown> } | null;
   parseProofMultipartBytes: (bytes: Uint8Array) => { bodyBytes: Uint8Array; proof?: Record<string, unknown>; unavailable?: Record<string, unknown>; tail?: boolean } | null;
+  parseProofJsonEnvelopeBytes: (bytes: Uint8Array) => { bodyBytes: Uint8Array; proof?: Record<string, unknown>; unavailable?: Record<string, unknown> } | null;
   normalizePastedBodyBytes: (
     bodyBytes: Uint8Array,
     proof?: Record<string, unknown>,
@@ -342,6 +343,108 @@ describe('docs/tee-verify.html capture parser preserves signed response bytes', 
 
     expect(parsed?.proof).toMatchObject(proof);
     expect(Buffer.from(parsed!.bodyBytes)).toEqual(rawBody);
+  });
+
+  it('parses JSON envelope captures and strips the top-level proof field', () => {
+    const response = { model: 'qwen3.7-plus', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const capture = Buffer.from(JSON.stringify({ ...response, proof }), 'utf8');
+
+    const parsed = parser.parseProofJsonEnvelopeBytes(new Uint8Array(capture));
+
+    expect(parsed?.proof).toMatchObject(proof);
+    expect(Buffer.from(parsed!.bodyBytes)).toEqual(rawBody);
+  });
+
+  it('strips HTTP response headers before parsing JSON envelope captures', () => {
+    const response = { model: 'qwen3.7-plus', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const wrapped = Buffer.from(JSON.stringify({ ...response, proof }), 'utf8');
+    const capture = Buffer.concat([
+      Buffer.from([
+        'HTTP/1.1 200 OK',
+        'Content-Type: application/json',
+        `Content-Length: ${wrapped.byteLength}`,
+        '',
+        '',
+      ].join('\r\n'), 'utf8'),
+      wrapped,
+    ]);
+
+    const parsed = parser.parseProofJsonEnvelopeBytes(new Uint8Array(capture));
+
+    expect(parsed?.proof).toMatchObject(proof);
+    expect(Buffer.from(parsed!.bodyBytes)).toEqual(rawBody);
+  });
+
+  it('skips pasted command text before parsing JSON envelope captures', () => {
+    const response = { model: 'qwen3.7-plus', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const capture = Buffer.concat([
+      Buffer.from('curl -X POST https://api.example.com/v1/chat/completions\n', 'utf8'),
+      Buffer.from(JSON.stringify({ ...response, proof }), 'utf8'),
+    ]);
+
+    const parsed = parser.parseProofJsonEnvelopeBytes(new Uint8Array(capture));
+
+    expect(parsed?.proof).toMatchObject(proof);
+    expect(Buffer.from(parsed!.bodyBytes)).toEqual(rawBody);
+  });
+
+  it('parses JSON envelope captures when the pasted command prefix shares the same line', () => {
+    const response = { model: 'qwen3.7-plus', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const capture = Buffer.from(`curl -X POST https://api.example.com/v1/chat/completions ${JSON.stringify({ ...response, proof })}`, 'utf8');
+
+    const parsed = parser.parseProofJsonEnvelopeBytes(new Uint8Array(capture));
+
+    expect(parsed?.proof).toMatchObject(proof);
+    expect(Buffer.from(parsed!.bodyBytes)).toEqual(rawBody);
+  });
+
+  it('parses JSON envelope captures when the same line has trailing text after the JSON object', () => {
+    const response = { model: 'qwen3.7-plus', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const capture = Buffer.from(`curl -X POST https://api.example.com/v1/chat/completions ${JSON.stringify({ ...response, proof })} trailing prompt`, 'utf8');
+
+    const parsed = parser.parseProofJsonEnvelopeBytes(new Uint8Array(capture));
+
+    expect(parsed?.proof).toMatchObject(proof);
+    expect(Buffer.from(parsed!.bodyBytes)).toEqual(rawBody);
+  });
+
+  it('parses JSON envelope captures after an unmatched brace in pasted prefix text', () => {
+    const response = { model: 'qwen3.7-plus', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const capture = Buffer.from(`shell prompt { unfinished prefix ${JSON.stringify({ ...response, proof })}`, 'utf8');
+
+    const parsed = parser.parseProofJsonEnvelopeBytes(new Uint8Array(capture));
+
+    expect(parsed?.proof).toMatchObject(proof);
+    expect(Buffer.from(parsed!.bodyBytes)).toEqual(rawBody);
+  });
+
+  it('does not treat a nested proof field as a JSON envelope proof', () => {
+    const response = {
+      model: 'qwen3.7-plus',
+      choices: [{ message: { role: 'assistant', content: 'ok' } }],
+      debug: { proof },
+    };
+    const capture = Buffer.from(JSON.stringify(response), 'utf8');
+
+    const parsed = parser.parseProofJsonEnvelopeBytes(new Uint8Array(capture));
+
+    expect(parsed).toBeNull();
+  });
+
+  it('rejects ambiguous captures with multiple top-level JSON proof envelopes', () => {
+    const response1 = { model: 'qwen3.7-plus', choices: [{ message: { role: 'assistant', content: 'first' } }] };
+    const response2 = { model: 'qwen3.7-plus', choices: [{ message: { role: 'assistant', content: 'second' } }] };
+    const capture = Buffer.from(`${JSON.stringify({ ...response1, proof })}\n${JSON.stringify({ ...response2, proof })}`, 'utf8');
+
+    const parsed = parser.parseProofJsonEnvelopeBytes(new Uint8Array(capture));
+
+    expect(parsed).toBeNull();
   });
 
   it('ignores pasted leading blank lines for body+proof captures when the signed hash proves it', async () => {

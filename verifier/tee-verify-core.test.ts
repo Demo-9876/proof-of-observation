@@ -15,6 +15,7 @@ import {
   verifyTeeExchange,
   parseTeeProofCapture,
   parseTeeProofEvent,
+  parseTeeProofJsonEnvelope,
   parseTeeProofMultipartResponse,
   TEE_PROOF_EVENT,
   WOKEY_SSE_TRANSPORT_KEEPALIVE_V1,
@@ -874,6 +875,121 @@ describe('parseTeeProofEvent', () => {
 
     expect(parsed?.body).toEqual(rawBody);
     expect(parsed?.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+  });
+
+  it('parses non-streaming JSON envelopes with a top-level proof field', () => {
+    const response = { id: 'chatcmpl_1', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const wrapped = Buffer.from(JSON.stringify({ ...response, proof }), 'utf8');
+
+    const parsed = parseTeeProofJsonEnvelope(wrapped, 'application/json; charset=utf-8');
+
+    expect(parsed?.body).toEqual(rawBody);
+    expect(parsed?.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+    expect(parsed?.bodyContentType).toBe('application/json; charset=utf-8');
+  });
+
+  it('strips full HTTP response headers before parsing a JSON envelope proof', () => {
+    const response = { id: 'chatcmpl_1', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const wrapped = Buffer.from(JSON.stringify({ ...response, proof }), 'utf8');
+    const capture = Buffer.concat([
+      Buffer.from([
+        'HTTP/1.1 200 OK',
+        'Content-Type: application/json',
+        `Content-Length: ${wrapped.byteLength}`,
+        '',
+        '',
+      ].join('\r\n'), 'utf8'),
+      wrapped,
+    ]);
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+    expect(parsed.bodyContentType).toBe('application/json');
+  });
+
+  it('skips pasted command text before parsing a JSON envelope proof', () => {
+    const response = { id: 'chatcmpl_1', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const wrapped = Buffer.from(JSON.stringify({ ...response, proof }), 'utf8');
+    const capture = Buffer.concat([
+      Buffer.from('curl -X POST https://api.example.com/v1/chat/completions\n', 'utf8'),
+      wrapped,
+    ]);
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+  });
+
+  it('parses a JSON envelope proof even when the pasted command prefix shares the same line', () => {
+    const response = { id: 'chatcmpl_2', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const capture = Buffer.from(`curl -X POST https://api.example.com/v1/chat/completions ${JSON.stringify({ ...response, proof })}`, 'utf8');
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+  });
+
+  it('parses a JSON envelope proof even when the same line has trailing text after the JSON object', () => {
+    const response = { id: 'chatcmpl_3', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const capture = Buffer.from(`curl -X POST https://api.example.com/v1/chat/completions ${JSON.stringify({ ...response, proof })} trailing prompt`, 'utf8');
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+  });
+
+  it('parses a JSON envelope proof after an unmatched brace in pasted prefix text', () => {
+    const response = { id: 'chatcmpl_4', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const capture = Buffer.from(`shell prompt { unfinished prefix ${JSON.stringify({ ...response, proof })}`, 'utf8');
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+  });
+
+  it('does not treat a nested proof field as a JSON envelope proof', () => {
+    const response = {
+      id: 'chatcmpl_5',
+      choices: [{ message: { role: 'assistant', content: 'ok' } }],
+      debug: { proof: makeSigned().proof },
+    };
+    const capture = Buffer.from(JSON.stringify(response), 'utf8');
+
+    const parsed = parseTeeProofCapture(capture, 'application/json');
+
+    expect(parsed.body).toEqual(capture);
+    expect(parsed.proof).toBeUndefined();
+  });
+
+  it('rejects ambiguous captures with multiple top-level JSON proof envelopes', () => {
+    const response1 = { id: 'chatcmpl_6', choices: [{ message: { role: 'assistant', content: 'first' } }] };
+    const response2 = { id: 'chatcmpl_7', choices: [{ message: { role: 'assistant', content: 'second' } }] };
+    const { proof: proof1 } = makeSigned({ responseBody: Buffer.from(JSON.stringify(response1), 'utf8') });
+    const { proof: proof2 } = makeSigned({ responseBody: Buffer.from(JSON.stringify(response2), 'utf8') });
+    const capture = Buffer.from(`${JSON.stringify({ ...response1, proof: proof1 })}\n${JSON.stringify({ ...response2, proof: proof2 })}`, 'utf8');
+
+    const parsed = parseTeeProofCapture(capture, 'application/json');
+
+    expect(parsed.body).toEqual(capture);
+    expect(parsed.proof).toBeUndefined();
   });
 
   it('parses multipart captures by boundary when response Content-Length is stale', () => {

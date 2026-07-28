@@ -1,5 +1,6 @@
 // Build a full offline verification bundle from the exact request body and a
-// captured response that contains tee.proof (SSE tail event or multipart/mixed).
+// captured response that contains tee.proof (SSE tail event, multipart/mixed,
+// or a non-streaming JSON top-level proof field).
 //
 //   npx tsx make-real-bundle.ts <request.json> <captured-response> <bundle.json>
 //
