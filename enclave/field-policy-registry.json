@@ -1,12 +1,13 @@
 {
-  "default": "2026-07-27",
+  "policy": "core",
+  "default": "2026-07-29",
   "protocol_versions": {
-    "openai.chat_completions": "2026-07-27",
+    "openai.chat_completions": "2026-07-29",
     "openai.responses": "2026-07-29",
-    "anthropic.messages": "2026-07-27",
-    "google.gemini.generate_content": "2026-07-27",
-    "alibaba.dashscope.generation": "2026-07-27",
-    "aws.bedrock.converse": "2026-07-27",
-    "cohere.chat": "2026-07-27"
+    "anthropic.messages": "2026-07-29",
+    "google.gemini.generate_content": "2026-07-29",
+    "alibaba.dashscope.generation": "2026-07-29",
+    "aws.bedrock.converse": "2026-07-29",
+    "cohere.chat": "2026-07-29"
   }
 }

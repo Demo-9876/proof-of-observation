@@ -22,6 +22,7 @@ const SUPPORTED_PROTOCOLS: Exclude<ProtocolFamily, 'unknown'>[] = [
 ];
 
 interface FieldPolicyRegistry {
+  policy: string;
   default: string;
   protocol_versions: Record<Exclude<ProtocolFamily, 'unknown'>, string>;
 }
@@ -199,7 +200,7 @@ export function extractFieldView(protocol: ProtocolFamily, kind: 'request' | 're
   if (protocol === 'openai.chat_completions') return openaiChatView(kind, parsed);
   if (protocol === 'openai.responses') return openaiResponsesView(kind, parsed);
   if (protocol === 'anthropic.messages') return anthropicMessagesView(kind, parsed);
-  if (protocol === 'google.gemini.generate_content') return geminiGenerateContentView(kind, parsed);
+  if (protocol === 'google.gemini.generate_content') return geminiGenerateContentView(kind, parsed, upstreamPath);
   if (protocol === 'alibaba.dashscope.generation') return dashscopeGenerationView(kind, parsed);
   if (protocol === 'aws.bedrock.converse') return bedrockConverseView(kind, parsed, upstreamPath);
   if (protocol === 'cohere.chat') return cohereChatView(kind, parsed);
@@ -212,33 +213,12 @@ export function canonicalJson(value: unknown): string {
 
 function openaiChatView(kind: 'request' | 'response', parsed: unknown): unknown {
   if (kind === 'request') {
-    return pick(parsed, [
-      'model',
-      'messages',
-      'tools',
-      'tool_choice',
-      'response_format',
-      'temperature',
-      'top_p',
-      'max_tokens',
-      'max_completion_tokens',
-      'presence_penalty',
-      'frequency_penalty',
-      'parallel_tool_calls',
-      'stop',
-      'seed',
-      'stream',
-      'user',
-      'reasoning_effort',
-      'service_tier',
-      'modalities',
-      'audio',
-    ]);
+    return pick(parsed, ['model', 'messages']);
   }
   if (Array.isArray(parsed)) {
     return aggregateOpenAIChatStream(parsed);
   }
-  return pick(parsed, ['model', 'choices', 'usage', 'error', 'system_fingerprint', 'service_tier']);
+  return pick(parsed, ['model', 'choices', 'usage', 'error']);
 }
 
 function aggregateOpenAIChatStream(chunks: unknown[]): unknown {
@@ -270,26 +250,10 @@ function aggregateOpenAIChatStream(chunks: unknown[]): unknown {
 
 function openaiResponsesView(kind: 'request' | 'response', parsed: unknown): unknown {
   if (kind === 'request') {
-    return pick(parsed, [
-      'model',
-      'input',
-      'tools',
-      'tool_choice',
-      'temperature',
-      'top_p',
-      'max_output_tokens',
-      'stream',
-      'parallel_tool_calls',
-      'truncation',
-      'text',
-      'metadata',
-      'reasoning',
-      'store',
-      'include',
-    ]);
+    return pick(parsed, ['model', 'input']);
   }
   if (Array.isArray(parsed)) return aggregateOpenAIResponsesStream(parsed);
-  return pick(parsed, ['id', 'model', 'status', 'output', 'output_text', 'usage', 'error', 'incomplete_details', 'reasoning']);
+  return pick(parsed, ['model', 'status', 'output', 'output_text', 'usage', 'error']);
 }
 
 function aggregateOpenAIResponsesStream(events: unknown[]): unknown {
@@ -299,7 +263,7 @@ function aggregateOpenAIResponsesStream(events: unknown[]): unknown {
     if (!isRecord(event)) continue;
     const type = typeof event.type === 'string' ? event.type : '';
     if (isRecord(event.response)) {
-      mergeObject(out, pick(event.response, ['id', 'model', 'status', 'output', 'output_text', 'usage', 'error', 'incomplete_details', 'reasoning']) as Record<string, unknown>);
+      mergeObject(out, pick(event.response, ['model', 'status', 'output', 'output_text', 'usage', 'error']) as Record<string, unknown>);
     }
     if (type === 'response.output_item.added' || type === 'response.output_item.done') {
       const index = numberOrDefault(event.output_index, outputItems.size);
@@ -339,31 +303,15 @@ function aggregateOpenAIResponsesStream(events: unknown[]): unknown {
       .sort(([a], [b]) => a - b)
       .map(([, item]) => item);
   }
-  return pick(out, ['id', 'model', 'status', 'output', 'output_text', 'usage', 'error', 'incomplete_details', 'reasoning']);
+  return pick(out, ['model', 'status', 'output', 'output_text', 'usage', 'error']);
 }
 
 function anthropicMessagesView(kind: 'request' | 'response', parsed: unknown): unknown {
   if (kind === 'request') {
-    return pick(parsed, [
-      'model',
-      'messages',
-      'system',
-      'tools',
-      'tool_choice',
-      'max_tokens',
-      'temperature',
-      'top_p',
-      'top_k',
-      'stream',
-      'stop_sequences',
-      'thinking',
-      'metadata',
-      'container',
-      'mcp_servers',
-    ]);
+    return pick(parsed, ['model', 'messages', 'system']);
   }
   if (Array.isArray(parsed)) return aggregateAnthropicMessagesStream(parsed);
-  return pick(parsed, ['id', 'type', 'role', 'model', 'content', 'stop_reason', 'stop_sequence', 'usage', 'error', 'container']);
+  return pick(parsed, ['type', 'role', 'model', 'content', 'stop_reason', 'usage', 'error']);
 }
 
 function aggregateAnthropicMessagesStream(events: unknown[]): unknown {
@@ -373,7 +321,7 @@ function aggregateAnthropicMessagesStream(events: unknown[]): unknown {
     if (!isRecord(event)) continue;
     const type = typeof event.type === 'string' ? event.type : '';
     if (type === 'message_start' && isRecord(event.message)) {
-      mergeObject(out, pick(event.message, ['id', 'type', 'role', 'model', 'stop_reason', 'stop_sequence', 'usage', 'container']) as Record<string, unknown>);
+      mergeObject(out, pick(event.message, ['type', 'role', 'model', 'stop_reason', 'usage']) as Record<string, unknown>);
       seedAnthropicContentBlocks(contentBlocks, event.message.content);
     } else if (type === 'content_block_start' && isRecord(event.content_block)) {
       const index = typeof event.index === 'number' ? event.index : contentBlocks.size;
@@ -395,12 +343,17 @@ function aggregateAnthropicMessagesStream(events: unknown[]): unknown {
       .sort(([a], [b]) => a - b)
       .map(([, block]) => block);
   }
-  return pick(out, ['id', 'type', 'role', 'model', 'content', 'stop_reason', 'stop_sequence', 'usage', 'error', 'container']);
+  return pick(out, ['type', 'role', 'model', 'content', 'stop_reason', 'usage', 'error']);
 }
 
-function geminiGenerateContentView(kind: 'request' | 'response', parsed: unknown): unknown {
+function geminiGenerateContentView(kind: 'request' | 'response', parsed: unknown, upstreamPath?: string): unknown {
   if (kind === 'request') {
-    return pick(parsed, ['contents', 'systemInstruction', 'tools', 'toolConfig', 'generationConfig', 'safetySettings', 'model', 'cachedContent', 'labels', 'thinkingConfig']);
+    const view = pick(parsed, ['model', 'contents', 'systemInstruction']);
+    if (isRecord(view) && view.model === undefined) {
+      const model = geminiModelFromPath(upstreamPath);
+      if (model) view.model = model;
+    }
+    return view;
   }
   if (Array.isArray(parsed)) return aggregateGeminiGenerateContentStream(parsed);
   return pick(parsed, ['candidates', 'promptFeedback', 'usageMetadata', 'error', 'modelVersion']);
@@ -432,7 +385,7 @@ function aggregateGeminiGenerateContentStream(chunks: unknown[]): unknown {
 }
 
 function dashscopeGenerationView(kind: 'request' | 'response', parsed: unknown): unknown {
-  if (kind === 'request') return pick(parsed, ['model', 'input', 'parameters', 'system', 'messages', 'response_format', 'thinking_budget']);
+  if (kind === 'request') return pick(parsed, ['model', 'input', 'system', 'messages']);
   if (Array.isArray(parsed)) return aggregateDashscopeGenerationStream(parsed);
   return pick(parsed, ['output', 'usage', 'request_id', 'code', 'message']);
 }
@@ -683,9 +636,9 @@ function mergeNestedObject(target: Record<string, unknown>, field: string, value
 function bedrockConverseView(kind: 'request' | 'response', parsed: unknown, upstreamPath?: string): unknown {
   if (kind !== 'request') {
     if (Array.isArray(parsed)) return aggregateBedrockConverseStream(parsed);
-    return pick(parsed, ['output', 'stopReason', 'usage', 'metrics', 'additionalModelResponseFields', 'error']);
+    return pick(parsed, ['output', 'stopReason', 'usage', 'error']);
   }
-  const view = pick(parsed, ['modelId', 'messages', 'system', 'inferenceConfig', 'toolConfig', 'additionalModelRequestFields', 'promptVariables', 'guardrailConfig', 'additionalModelResponseFieldPaths']);
+  const view = pick(parsed, ['modelId', 'messages', 'system']);
   if (isRecord(view) && view.modelId === undefined) {
     const modelId = bedrockModelIdFromPath(upstreamPath);
     if (modelId) view.modelId = modelId;
@@ -722,9 +675,8 @@ function aggregateBedrockConverseStream(events: unknown[]): unknown {
     }
     if (isRecord(event.metadata)) {
       if (event.metadata.usage !== undefined) out.usage = event.metadata.usage;
-      if (event.metadata.metrics !== undefined) out.metrics = event.metadata.metrics;
     }
-    if (isRecord(event.output)) mergeObject(out, pick(event, ['output', 'stopReason', 'usage', 'metrics', 'additionalModelResponseFields', 'error']) as Record<string, unknown>);
+    if (isRecord(event.output)) mergeObject(out, pick(event, ['output', 'stopReason', 'usage', 'error']) as Record<string, unknown>);
     if (event.error !== undefined) out.error = event.error;
   }
   if (contentBlocks.size > 0) {
@@ -735,15 +687,15 @@ function aggregateBedrockConverseStream(events: unknown[]): unknown {
   if (Object.keys(message).length > 0 && out.output === undefined) {
     out.output = { message };
   }
-  return pick(out, ['output', 'stopReason', 'usage', 'metrics', 'additionalModelResponseFields', 'error']);
+  return pick(out, ['output', 'stopReason', 'usage', 'error']);
 }
 
 function cohereChatView(kind: 'request' | 'response', parsed: unknown): unknown {
   if (kind === 'request') {
-    return pick(parsed, ['model', 'messages', 'message', 'tools', 'tool_choice', 'temperature', 'p', 'k', 'max_tokens', 'stop_sequences', 'response_format', 'stream', 'documents', 'safety_mode', 'metadata']);
+    return pick(parsed, ['model', 'messages', 'message']);
   }
   if (Array.isArray(parsed)) return aggregateCohereChatStream(parsed);
-  return pick(parsed, ['id', 'message', 'text', 'finish_reason', 'usage', 'tool_calls', 'citations', 'error']);
+  return pick(parsed, ['message', 'text', 'finish_reason', 'usage', 'error']);
 }
 
 function aggregateCohereChatStream(events: unknown[]): unknown {
@@ -754,7 +706,7 @@ function aggregateCohereChatStream(events: unknown[]): unknown {
   for (const event of events) {
     if (!isRecord(event)) continue;
     const type = stringValue(event.type) ?? stringValue(event.event_type) ?? stringValue(event.eventType) ?? '';
-    if (isRecord(event.response)) mergeObject(out, pick(event.response, ['id', 'message', 'text', 'finish_reason', 'usage', 'tool_calls', 'citations', 'error']) as Record<string, unknown>);
+    if (isRecord(event.response)) mergeObject(out, pick(event.response, ['message', 'text', 'finish_reason', 'usage', 'error']) as Record<string, unknown>);
     const delta = isRecord(event.delta) ? event.delta : undefined;
     if (delta && isRecord(delta.message)) mergeCohereMessageDelta(message, contentBlocks, delta.message);
     if (type === 'text-generation' && typeof event.text === 'string') text += event.text;
@@ -780,7 +732,16 @@ function aggregateCohereChatStream(events: unknown[]): unknown {
     out.text = text;
   }
   if (Object.keys(message).length > 0 && out.message === undefined) out.message = message;
-  return pick(out, ['id', 'message', 'text', 'finish_reason', 'usage', 'tool_calls', 'citations', 'error']);
+  return pick(out, ['message', 'text', 'finish_reason', 'usage', 'error']);
+}
+
+function geminiModelFromPath(path?: string): string | undefined {
+  if (!path) return undefined;
+  const parts = pathWithoutQuery(path).split('/');
+  const modelIdx = parts.indexOf('models');
+  if (modelIdx < 0 || modelIdx + 1 >= parts.length) return undefined;
+  const raw = parts[modelIdx + 1] || undefined;
+  return raw?.split(':')[0];
 }
 
 function bedrockModelIdFromPath(path?: string): string | undefined {
@@ -807,11 +768,11 @@ function isErrorResponseView(protocol: ProtocolFamily, view: unknown): boolean {
 function requiredPresence(protocol: ProtocolFamily, kind: 'request' | 'response'): string[][] {
   if (protocol === 'openai.chat_completions') return kind === 'request' ? [['model'], ['messages']] : [['choices']];
   if (protocol === 'openai.responses') return kind === 'request' ? [['model'], ['input']] : [['output', 'status']];
-  if (protocol === 'anthropic.messages') return kind === 'request' ? [['model'], ['messages'], ['max_tokens']] : [['content'], ['stop_reason']];
-  if (protocol === 'google.gemini.generate_content') return kind === 'request' ? [['contents']] : [['candidates']];
+  if (protocol === 'anthropic.messages') return kind === 'request' ? [['model'], ['messages']] : [['content']];
+  if (protocol === 'google.gemini.generate_content') return kind === 'request' ? [['model'], ['contents']] : [['candidates', 'promptFeedback']];
   if (protocol === 'alibaba.dashscope.generation') return kind === 'request' ? [['model'], ['input']] : [['output']];
-  if (protocol === 'aws.bedrock.converse') return kind === 'request' ? [['modelId'], ['messages']] : [['output', 'stopReason']];
-  if (protocol === 'cohere.chat') return kind === 'request' ? [['model'], ['messages']] : [['message', 'finish_reason']];
+  if (protocol === 'aws.bedrock.converse') return kind === 'request' ? [['modelId'], ['messages']] : [['output']];
+  if (protocol === 'cohere.chat') return kind === 'request' ? [['model'], ['messages', 'message']] : [['message', 'text']];
   return [];
 }
 
@@ -958,12 +919,12 @@ function schemaVersion(protocol: ProtocolFamily): string {
 }
 
 function fieldPolicyId(protocol: ProtocolFamily): string {
-  if (protocol === 'unknown') return `${protocol}.default@unknown`;
+  if (protocol === 'unknown') return `${protocol}.${FIELD_POLICY_REGISTRY.policy}@unknown`;
   const version = FIELD_POLICY_REGISTRY.protocol_versions[protocol];
   if (typeof version !== 'string' || version.length === 0) {
     throw new Error(`missing field policy version for supported protocol: ${protocol}`);
   }
-  return `${protocol}.default@${version}`;
+  return `${protocol}.${FIELD_POLICY_REGISTRY.policy}@${version}`;
 }
 
 function pathWithoutQuery(path: string): string {
@@ -978,6 +939,9 @@ function sha256Hex(data: Buffer): string {
 function loadFieldPolicyRegistry(): FieldPolicyRegistry {
   const raw = readFileSync(new URL('../enclave/field-policy-registry.json', import.meta.url), 'utf8');
   const parsed = JSON.parse(raw) as Partial<FieldPolicyRegistry>;
+  if (typeof parsed.policy !== 'string' || parsed.policy.length === 0) {
+    throw new Error('field-policy-registry.policy must be a non-empty string');
+  }
   if (typeof parsed.default !== 'string') {
     throw new Error('field-policy-registry.default must be a string');
   }
@@ -991,6 +955,7 @@ function loadFieldPolicyRegistry(): FieldPolicyRegistry {
     }
   }
   return {
+    policy: parsed.policy,
     default: parsed.default,
     protocol_versions: parsed.protocol_versions as Record<Exclude<ProtocolFamily, 'unknown'>, string>,
   };

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { buildFieldClaims, hashFieldView, verifyFieldClaims } from './field-proof.ts';
+import { buildFieldClaims, extractFieldView, hashFieldView, verifyFieldClaims } from './field-proof.ts';
 
 const requestBody = Buffer.from(JSON.stringify({
   model: 'gpt-test',
@@ -196,6 +196,97 @@ describe('field-level proof extraction', () => {
       .toBe(hashFieldView('openai.responses', 'request', withoutInstructions));
   });
 
+  it('ignores relay default parameters when hashing core request fields', () => {
+    const cases = [
+      {
+        protocol: 'openai.chat_completions',
+        core: { model: 'gpt-test', messages: [{ role: 'user', content: 'hi' }] },
+        withDefaults: { model: 'gpt-test', messages: [{ role: 'user', content: 'hi' }], temperature: 0.2, top_p: 0.9, stream: false, metadata: { relay: 'default' } },
+      },
+      {
+        protocol: 'openai.responses',
+        core: { model: 'gpt-test', input: [{ role: 'user', content: 'hi' }] },
+        withDefaults: { model: 'gpt-test', input: [{ role: 'user', content: 'hi' }], instructions: 'relay-added compatibility text', temperature: 0.7, stream: false, store: true },
+      },
+      {
+        protocol: 'anthropic.messages',
+        core: { model: 'claude-test', system: 'be concise', messages: [{ role: 'user', content: 'hi' }] },
+        withDefaults: { model: 'claude-test', system: 'be concise', messages: [{ role: 'user', content: 'hi' }], max_tokens: 128, temperature: 0.5, tools: [], stream: false },
+      },
+      {
+        protocol: 'google.gemini.generate_content',
+        core: { model: 'gemini-test', contents: [{ role: 'user', parts: [{ text: 'hi' }] }], systemInstruction: { parts: [{ text: 'be concise' }] } },
+        withDefaults: { model: 'gemini-test', contents: [{ role: 'user', parts: [{ text: 'hi' }] }], systemInstruction: { parts: [{ text: 'be concise' }] }, generationConfig: { temperature: 0.7 }, tools: [], safetySettings: [] },
+      },
+      {
+        protocol: 'alibaba.dashscope.generation',
+        core: { model: 'qwen-test', input: { messages: [{ role: 'user', content: 'hi' }] }, system: 'be concise', messages: [{ role: 'user', content: 'hi' }] },
+        withDefaults: { model: 'qwen-test', input: { messages: [{ role: 'user', content: 'hi' }] }, system: 'be concise', messages: [{ role: 'user', content: 'hi' }], parameters: { temperature: 0.7, stream: false }, response_format: { type: 'text' }, thinking_budget: 0 },
+      },
+      {
+        protocol: 'aws.bedrock.converse',
+        core: { modelId: 'anthropic.claude-test', system: [{ text: 'be concise' }], messages: [{ role: 'user', content: [{ text: 'hi' }] }] },
+        withDefaults: { modelId: 'anthropic.claude-test', system: [{ text: 'be concise' }], messages: [{ role: 'user', content: [{ text: 'hi' }] }], inferenceConfig: { temperature: 0.7, maxTokens: 128 }, toolConfig: { tools: [] }, additionalModelRequestFields: {} },
+      },
+      {
+        protocol: 'cohere.chat',
+        core: { model: 'command-test', messages: [{ role: 'user', content: 'hi' }], message: 'hi' },
+        withDefaults: { model: 'command-test', messages: [{ role: 'user', content: 'hi' }], message: 'hi', temperature: 0.7, stream: false, tools: [], safety_mode: 'CONTEXTUAL' },
+      },
+    ] as const;
+
+    for (const item of cases) {
+      const core = Buffer.from(JSON.stringify(item.core), 'utf8');
+      const withDefaults = Buffer.from(JSON.stringify(item.withDefaults), 'utf8');
+      expect(hashFieldView(item.protocol, 'request', withDefaults))
+        .toBe(hashFieldView(item.protocol, 'request', core));
+    }
+  });
+
+  it('ignores relay response ids when hashing core response fields', () => {
+    const cases = [
+      {
+        protocol: 'openai.responses',
+        withId: { id: 'resp_relay', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }], usage: { total_tokens: 3 } },
+        withoutId: { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }], usage: { total_tokens: 3 } },
+      },
+      {
+        protocol: 'anthropic.messages',
+        withId: { id: 'msg_relay', type: 'message', role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { output_tokens: 1 } },
+        withoutId: { type: 'message', role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { output_tokens: 1 } },
+      },
+      {
+        protocol: 'cohere.chat',
+        withId: { id: 'chat_relay', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, finish_reason: 'COMPLETE', usage: { total_tokens: 3 } },
+        withoutId: { message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, finish_reason: 'COMPLETE', usage: { total_tokens: 3 } },
+      },
+    ] as const;
+
+    for (const item of cases) {
+      const withId = Buffer.from(JSON.stringify(item.withId), 'utf8');
+      const withoutId = Buffer.from(JSON.stringify(item.withoutId), 'utf8');
+      expect(hashFieldView(item.protocol, 'response', withId))
+        .toBe(hashFieldView(item.protocol, 'response', withoutId));
+    }
+  });
+
+  it('extracts Gemini request model from the upstream path for core field proof', () => {
+    const request = Buffer.from(JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+      generationConfig: { temperature: 0.7 },
+    }), 'utf8');
+
+    expect(extractFieldView(
+      'google.gemini.generate_content',
+      'request',
+      request,
+      '/v1beta/models/gemini-2.5-pro:generateContent',
+    )).toMatchObject({
+      model: 'gemini-2.5-pro',
+      contents: [{ role: 'user' }],
+    });
+  });
+
   it('uses protocol-specific field policy versions', () => {
     const openaiChat = buildFieldClaims({
       nonceB64: Buffer.from('nonce').toString('base64'),
@@ -225,8 +316,8 @@ describe('field-level proof extraction', () => {
       }), 'utf8'),
     });
 
-    expect(openaiChat?.claims.field_policy_id).toBe('openai.chat_completions.default@2026-07-27');
-    expect(responses?.claims.field_policy_id).toBe('openai.responses.default@2026-07-29');
+    expect(openaiChat?.claims.field_policy_id).toBe('openai.chat_completions.core@2026-07-29');
+    expect(responses?.claims.field_policy_id).toBe('openai.responses.core@2026-07-29');
   });
 
   it('requires explicit field policy versions for every supported protocol', () => {
@@ -372,7 +463,7 @@ describe('field-level proof extraction', () => {
     });
 
     expect(field).toBeTruthy();
-    field!.claims.field_policy_id = 'openai.chat_completions.default@2099-01-01';
+    field!.claims.field_policy_id = 'openai.chat_completions.core@2099-01-01';
     expect(() => verifyFieldClaims(field!.claims, requestBody, Buffer.from('{"choices":[{"message":{"content":"ok"}}]}', 'utf8')))
       .toThrow(/field_policy_id/);
   });

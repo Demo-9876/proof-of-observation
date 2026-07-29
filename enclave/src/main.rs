@@ -198,6 +198,7 @@ const DOMAIN_V2: &str = "tee-exchange-v2";
 
 #[derive(Debug, Deserialize)]
 struct FieldPolicyRegistry {
+    policy: String,
     #[serde(rename = "default")]
     _default_version: String,
     protocol_versions: BTreeMap<String, String>,
@@ -219,6 +220,10 @@ fn field_policy_registry() -> &'static FieldPolicyRegistry {
         let registry: FieldPolicyRegistry =
             serde_json::from_str(include_str!("../field-policy-registry.json"))
                 .expect("parse field policy registry");
+        assert!(
+            !registry.policy.is_empty(),
+            "field policy registry policy must be non-empty"
+        );
         for protocol in SUPPORTED_PROTOCOLS {
             let version = registry.protocol_versions.get(*protocol);
             assert!(
@@ -237,7 +242,9 @@ fn field_policy_version(protocol: &str) -> String {
         .protocol_versions
         .get(protocol)
         .cloned()
-        .unwrap_or_else(|| panic!("missing field policy version for supported protocol: {protocol}"))
+        .unwrap_or_else(|| {
+            panic!("missing field policy version for supported protocol: {protocol}")
+        })
 }
 
 const MAX_HEAD: usize = 64 * 1024;
@@ -537,100 +544,26 @@ fn field_view(protocol: &str, kind: &str, body: &[u8], upstream_path: Option<&st
         parse_json_body(body)
     };
     match (protocol, kind) {
-        ("openai.chat_completions", "request") => pick_value(
-            &parsed,
-            &[
-                "model",
-                "messages",
-                "tools",
-                "tool_choice",
-                "response_format",
-                "temperature",
-                "top_p",
-                "max_tokens",
-                "max_completion_tokens",
-                "presence_penalty",
-                "frequency_penalty",
-                "parallel_tool_calls",
-                "stop",
-                "seed",
-                "stream",
-                "user",
-                "reasoning_effort",
-                "service_tier",
-                "modalities",
-                "audio",
-            ],
-        ),
+        ("openai.chat_completions", "request") => pick_value(&parsed, &["model", "messages"]),
         ("openai.chat_completions", "response") => {
             if parsed.is_array() {
                 aggregate_openai_chat_stream(&parsed)
             } else {
-                pick_value(
-                    &parsed,
-                    &[
-                        "model",
-                        "choices",
-                        "usage",
-                        "error",
-                        "system_fingerprint",
-                        "service_tier",
-                    ],
-                )
+                pick_value(&parsed, &["model", "choices", "usage", "error"])
             }
         }
-        ("openai.responses", "request") => pick_value(
-            &parsed,
-            &[
-                "model",
-                "input",
-                "tools",
-                "tool_choice",
-                "temperature",
-                "top_p",
-                "max_output_tokens",
-                "stream",
-                "parallel_tool_calls",
-                "truncation",
-                "text",
-                "metadata",
-                "reasoning",
-                "store",
-                "include",
-            ],
-        ),
+        ("openai.responses", "request") => pick_value(&parsed, &["model", "input"]),
         ("openai.responses", "response") => openai_responses_view("response", &parsed),
         ("anthropic.messages", _) => anthropic_messages_view(kind, &parsed),
-        ("google.gemini.generate_content", "request") => pick_value(
-            &parsed,
-            &[
-                "contents",
-                "systemInstruction",
-                "tools",
-                "toolConfig",
-                "generationConfig",
-                "safetySettings",
-                "model",
-                "cachedContent",
-                "labels",
-                "thinkingConfig",
-            ],
-        ),
+        ("google.gemini.generate_content", "request") => {
+            gemini_generate_content_request_view(&parsed, upstream_path)
+        }
         ("google.gemini.generate_content", "response") => {
             gemini_generate_content_view("response", &parsed)
         }
-        ("alibaba.dashscope.generation", "request") => pick_value(
-            &parsed,
-            &[
-                "model",
-                "input",
-                "parameters",
-                "system",
-                "messages",
-                "response_format",
-                "thinking_budget",
-            ],
-        ),
+        ("alibaba.dashscope.generation", "request") => {
+            pick_value(&parsed, &["model", "input", "system", "messages"])
+        }
         ("alibaba.dashscope.generation", "response") => {
             dashscope_generation_view("response", &parsed)
         }
@@ -638,26 +571,7 @@ fn field_view(protocol: &str, kind: &str, body: &[u8], upstream_path: Option<&st
             bedrock_converse_request_view(&parsed, upstream_path)
         }
         ("aws.bedrock.converse", "response") => bedrock_converse_view("response", &parsed),
-        ("cohere.chat", "request") => pick_value(
-            &parsed,
-            &[
-                "model",
-                "messages",
-                "message",
-                "tools",
-                "tool_choice",
-                "temperature",
-                "p",
-                "k",
-                "max_tokens",
-                "stop_sequences",
-                "response_format",
-                "stream",
-                "documents",
-                "safety_mode",
-                "metadata",
-            ],
-        ),
+        ("cohere.chat", "request") => pick_value(&parsed, &["model", "messages", "message"]),
         ("cohere.chat", "response") => cohere_chat_view("response", &parsed),
         _ => parsed,
     }
@@ -733,7 +647,12 @@ fn build_field_claims_from_views(
         "upstream_path": path,
         "http_method": norm_method.to_ascii_uppercase(),
         "http_status": status,
-        "field_policy_id": format!("{}.default@{}", protocol, field_policy_version(protocol)),
+        "field_policy_id": format!(
+            "{}.{}@{}",
+            protocol,
+            field_policy_registry().policy.as_str(),
+            field_policy_version(protocol)
+        ),
         "upstream_request_fields_sha256": request_fields_hash,
         "upstream_response_fields_sha256": response_fields_hash,
         "request_body_sha256_severity": "advisory",
@@ -831,15 +750,16 @@ fn path_indicates_gemini_stream(path: &str) -> bool {
         || lower.contains("/streamgeneratecontent")
 }
 
-fn request_indicates_streaming(protocol: &str, req_view: &Value, upstream_path: &str) -> bool {
+fn request_indicates_streaming(protocol: &str, req_body: &[u8], upstream_path: &str) -> bool {
+    let parsed = parse_json_body(req_body);
     match protocol {
         "openai.chat_completions" | "openai.responses" | "anthropic.messages" | "cohere.chat" => {
-            req_view
+            parsed
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
         }
-        "alibaba.dashscope.generation" => req_view
+        "alibaba.dashscope.generation" => parsed
             .get("parameters")
             .and_then(Value::as_object)
             .and_then(|p| p.get("stream"))
@@ -902,7 +822,7 @@ impl FieldResponseCollector {
             return None;
         }
         let request_streaming =
-            request_indicates_streaming(protocol, &req_view, &head.upstream.path);
+            request_indicates_streaming(protocol, req_body, &head.upstream.path);
         let body = if is_sse_content_type(content_type) {
             FieldResponseBody::Streaming {
                 parser: SseEventParser::default(),
@@ -1330,43 +1250,14 @@ fn aggregate_openai_chat_stream(value: &Value) -> Value {
 
 fn openai_responses_view(kind: &str, parsed: &Value) -> Value {
     if kind == "request" {
-        return pick_value(
-            parsed,
-            &[
-                "model",
-                "input",
-                "tools",
-                "tool_choice",
-                "temperature",
-                "top_p",
-                "max_output_tokens",
-                "stream",
-                "parallel_tool_calls",
-                "truncation",
-                "text",
-                "metadata",
-                "reasoning",
-                "store",
-                "include",
-            ],
-        );
+        return pick_value(parsed, &["model", "input"]);
     }
     if parsed.is_array() {
         aggregate_openai_responses_stream(parsed)
     } else {
         pick_value(
             parsed,
-            &[
-                "id",
-                "model",
-                "status",
-                "output",
-                "output_text",
-                "usage",
-                "error",
-                "incomplete_details",
-                "reasoning",
-            ],
+            &["model", "status", "output", "output_text", "usage", "error"],
         )
     }
 }
@@ -1375,17 +1266,7 @@ fn aggregate_openai_responses_stream(value: &Value) -> Value {
     let Some(items) = value.as_array() else {
         return pick_value(
             value,
-            &[
-                "id",
-                "model",
-                "status",
-                "output",
-                "output_text",
-                "usage",
-                "error",
-                "incomplete_details",
-                "reasoning",
-            ],
+            &["model", "status", "output", "output_text", "usage", "error"],
         );
     };
     let mut out = serde_json::Map::new();
@@ -1400,17 +1281,7 @@ fn aggregate_openai_responses_stream(value: &Value) -> Value {
                 &mut out,
                 pick_value(
                     response,
-                    &[
-                        "id",
-                        "model",
-                        "status",
-                        "output",
-                        "output_text",
-                        "usage",
-                        "error",
-                        "incomplete_details",
-                        "reasoning",
-                    ],
+                    &["model", "status", "output", "output_text", "usage", "error"],
                 ),
             );
         }
@@ -1587,17 +1458,7 @@ fn aggregate_openai_responses_stream(value: &Value) -> Value {
     }
     pick_value(
         &Value::Object(out),
-        &[
-            "id",
-            "model",
-            "status",
-            "output",
-            "output_text",
-            "usage",
-            "error",
-            "incomplete_details",
-            "reasoning",
-        ],
+        &["model", "status", "output", "output_text", "usage", "error"],
     )
 }
 
@@ -1618,17 +1479,7 @@ impl OpenAiResponsesStreamState {
                 &mut self.out,
                 pick_value(
                     response,
-                    &[
-                        "id",
-                        "model",
-                        "status",
-                        "output",
-                        "output_text",
-                        "usage",
-                        "error",
-                        "incomplete_details",
-                        "reasoning",
-                    ],
+                    &["model", "status", "output", "output_text", "usage", "error"],
                 ),
             );
         }
@@ -1810,43 +1661,14 @@ impl OpenAiResponsesStreamState {
         }
         pick_value(
             &Value::Object(std::mem::take(&mut self.out)),
-            &[
-                "id",
-                "model",
-                "status",
-                "output",
-                "output_text",
-                "usage",
-                "error",
-                "incomplete_details",
-                "reasoning",
-            ],
+            &["model", "status", "output", "output_text", "usage", "error"],
         )
     }
 }
 
 fn anthropic_messages_view(kind: &str, parsed: &Value) -> Value {
     if kind == "request" {
-        return pick_value(
-            parsed,
-            &[
-                "model",
-                "messages",
-                "system",
-                "tools",
-                "tool_choice",
-                "max_tokens",
-                "temperature",
-                "top_p",
-                "top_k",
-                "stream",
-                "stop_sequences",
-                "thinking",
-                "metadata",
-                "container",
-                "mcp_servers",
-            ],
-        );
+        return pick_value(parsed, &["model", "messages", "system"]);
     }
     if parsed.is_array() {
         return aggregate_anthropic_messages_stream(parsed);
@@ -1854,16 +1676,13 @@ fn anthropic_messages_view(kind: &str, parsed: &Value) -> Value {
     pick_value(
         parsed,
         &[
-            "id",
             "type",
             "role",
             "model",
             "content",
             "stop_reason",
-            "stop_sequence",
             "usage",
             "error",
-            "container",
         ],
     )
 }
@@ -1873,13 +1692,11 @@ fn aggregate_anthropic_messages_stream(value: &Value) -> Value {
         return pick_value(
             value,
             &[
-                "id",
                 "type",
                 "role",
                 "model",
                 "content",
                 "stop_reason",
-                "stop_sequence",
                 "usage",
                 "error",
             ],
@@ -1897,19 +1714,7 @@ fn aggregate_anthropic_messages_stream(value: &Value) -> Value {
                 if let Some(message) = event.get("message") {
                     merge_value_object(
                         &mut out,
-                        pick_value(
-                            message,
-                            &[
-                                "id",
-                                "type",
-                                "role",
-                                "model",
-                                "stop_reason",
-                                "stop_sequence",
-                                "usage",
-                                "container",
-                            ],
-                        ),
+                        pick_value(message, &["type", "role", "model", "stop_reason", "usage"]),
                     );
                     seed_anthropic_content_blocks(&mut content_blocks, message.get("content"));
                 }
@@ -1937,10 +1742,7 @@ fn aggregate_anthropic_messages_stream(value: &Value) -> Value {
             }
             "message_delta" => {
                 if let Some(delta) = event.get("delta") {
-                    merge_value_object(
-                        &mut out,
-                        pick_value(delta, &["stop_reason", "stop_sequence"]),
-                    );
+                    merge_value_object(&mut out, pick_value(delta, &["stop_reason"]));
                 }
                 merge_nested_object(&mut out, "usage", event.get("usage"));
             }
@@ -1962,16 +1764,13 @@ fn aggregate_anthropic_messages_stream(value: &Value) -> Value {
     pick_value(
         &Value::Object(out),
         &[
-            "id",
             "type",
             "role",
             "model",
             "content",
             "stop_reason",
-            "stop_sequence",
             "usage",
             "error",
-            "container",
         ],
     )
 }
@@ -1993,18 +1792,7 @@ impl AnthropicMessagesStreamState {
                 if let Some(message) = event.get("message") {
                     merge_value_object(
                         &mut self.out,
-                        pick_value(
-                            message,
-                            &[
-                                "id",
-                                "type",
-                                "role",
-                                "model",
-                                "stop_reason",
-                                "stop_sequence",
-                                "usage",
-                            ],
-                        ),
+                        pick_value(message, &["type", "role", "model", "stop_reason", "usage"]),
                     );
                     seed_anthropic_content_blocks(&mut self.content_blocks, message.get("content"));
                 }
@@ -2032,10 +1820,7 @@ impl AnthropicMessagesStreamState {
             }
             "message_delta" => {
                 if let Some(delta) = event.get("delta") {
-                    merge_value_object(
-                        &mut self.out,
-                        pick_value(delta, &["stop_reason", "stop_sequence"]),
-                    );
+                    merge_value_object(&mut self.out, pick_value(delta, &["stop_reason"]));
                 }
                 merge_nested_object(&mut self.out, "usage", event.get("usage"));
             }
@@ -2060,13 +1845,11 @@ impl AnthropicMessagesStreamState {
         pick_value(
             &Value::Object(std::mem::take(&mut self.out)),
             &[
-                "id",
                 "type",
                 "role",
                 "model",
                 "content",
                 "stop_reason",
-                "stop_sequence",
                 "usage",
                 "error",
             ],
@@ -2076,21 +1859,7 @@ impl AnthropicMessagesStreamState {
 
 fn gemini_generate_content_view(kind: &str, parsed: &Value) -> Value {
     if kind == "request" {
-        return pick_value(
-            parsed,
-            &[
-                "contents",
-                "systemInstruction",
-                "tools",
-                "toolConfig",
-                "generationConfig",
-                "safetySettings",
-                "model",
-                "cachedContent",
-                "labels",
-                "thinkingConfig",
-            ],
-        );
+        return gemini_generate_content_request_view(parsed, None);
     }
     if parsed.is_array() {
         aggregate_gemini_generate_content_stream(parsed)
@@ -2105,6 +1874,31 @@ fn gemini_generate_content_view(kind: &str, parsed: &Value) -> Value {
                 "modelVersion",
             ],
         )
+    }
+}
+
+fn gemini_generate_content_request_view(parsed: &Value, upstream_path: Option<&str>) -> Value {
+    let view = pick_value(parsed, &["model", "contents", "systemInstruction"]);
+    let Value::Object(mut out) = view else {
+        return view;
+    };
+    if !out.contains_key("model") {
+        if let Some(model) = upstream_path.and_then(gemini_model_from_path) {
+            out.insert("model".into(), Value::String(model));
+        }
+    }
+    Value::Object(out)
+}
+
+fn gemini_model_from_path(path: &str) -> Option<String> {
+    let path = path_no_query(path);
+    let parts: Vec<&str> = path.split('/').collect();
+    let model_idx = parts.iter().position(|part| *part == "models")?;
+    let raw = parts.get(model_idx + 1)?.split(':').next()?;
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
     }
 }
 
@@ -2228,18 +2022,7 @@ impl GeminiGenerateContentStreamState {
 
 fn dashscope_generation_view(kind: &str, parsed: &Value) -> Value {
     if kind == "request" {
-        return pick_value(
-            parsed,
-            &[
-                "model",
-                "input",
-                "parameters",
-                "system",
-                "messages",
-                "response_format",
-                "thinking_budget",
-            ],
-        );
+        return pick_value(parsed, &["model", "input", "system", "messages"]);
     }
     if parsed.is_array() {
         aggregate_dashscope_generation_stream(parsed)
@@ -2478,33 +2261,13 @@ fn bedrock_converse_view(kind: &str, parsed: &Value) -> Value {
     if parsed.is_array() {
         aggregate_bedrock_converse_stream(parsed)
     } else {
-        pick_value(
-            parsed,
-            &[
-                "output",
-                "stopReason",
-                "usage",
-                "metrics",
-                "additionalModelResponseFields",
-                "error",
-            ],
-        )
+        pick_value(parsed, &["output", "stopReason", "usage", "error"])
     }
 }
 
 fn aggregate_bedrock_converse_stream(value: &Value) -> Value {
     let Some(items) = value.as_array() else {
-        return pick_value(
-            value,
-            &[
-                "output",
-                "stopReason",
-                "usage",
-                "metrics",
-                "additionalModelResponseFields",
-                "error",
-            ],
-        );
+        return pick_value(value, &["output", "stopReason", "usage", "error"]);
     };
     let mut out = serde_json::Map::new();
     let mut message = serde_json::Map::new();
@@ -2544,32 +2307,16 @@ fn aggregate_bedrock_converse_stream(value: &Value) -> Value {
             if let Some(stop_reason) = message_stop.get("stopReason") {
                 out.insert("stopReason".into(), stop_reason.clone());
             }
-            if let Some(fields) = message_stop.get("additionalModelResponseFields") {
-                out.insert("additionalModelResponseFields".into(), fields.clone());
-            }
         }
         if let Some(metadata) = event.get("metadata").and_then(Value::as_object) {
             if let Some(usage) = metadata.get("usage") {
                 out.insert("usage".into(), usage.clone());
             }
-            if let Some(metrics) = metadata.get("metrics") {
-                out.insert("metrics".into(), metrics.clone());
-            }
         }
         if event.get("output").is_some() {
             merge_value_object(
                 &mut out,
-                pick_value(
-                    item,
-                    &[
-                        "output",
-                        "stopReason",
-                        "usage",
-                        "metrics",
-                        "additionalModelResponseFields",
-                        "error",
-                    ],
-                ),
+                pick_value(item, &["output", "stopReason", "usage", "error"]),
             );
         }
         if let Some(error) = event.get("error") {
@@ -2590,14 +2337,7 @@ fn aggregate_bedrock_converse_stream(value: &Value) -> Value {
     }
     pick_value(
         &Value::Object(out),
-        &[
-            "output",
-            "stopReason",
-            "usage",
-            "metrics",
-            "additionalModelResponseFields",
-            "error",
-        ],
+        &["output", "stopReason", "usage", "error"],
     )
 }
 
@@ -2644,33 +2384,16 @@ impl BedrockConverseStreamState {
             if let Some(stop_reason) = message_stop.get("stopReason") {
                 self.out.insert("stopReason".into(), stop_reason.clone());
             }
-            if let Some(fields) = message_stop.get("additionalModelResponseFields") {
-                self.out
-                    .insert("additionalModelResponseFields".into(), fields.clone());
-            }
         }
         if let Some(metadata) = event.get("metadata").and_then(Value::as_object) {
             if let Some(usage) = metadata.get("usage") {
                 self.out.insert("usage".into(), usage.clone());
             }
-            if let Some(metrics) = metadata.get("metrics") {
-                self.out.insert("metrics".into(), metrics.clone());
-            }
         }
         if event.get("output").is_some() {
             merge_value_object(
                 &mut self.out,
-                pick_value(
-                    item,
-                    &[
-                        "output",
-                        "stopReason",
-                        "usage",
-                        "metrics",
-                        "additionalModelResponseFields",
-                        "error",
-                    ],
-                ),
+                pick_value(item, &["output", "stopReason", "usage", "error"]),
             );
         }
         if let Some(error) = event.get("error") {
@@ -2694,56 +2417,21 @@ impl BedrockConverseStreamState {
         }
         pick_value(
             &Value::Object(std::mem::take(&mut self.out)),
-            &[
-                "output",
-                "stopReason",
-                "usage",
-                "metrics",
-                "additionalModelResponseFields",
-                "error",
-            ],
+            &["output", "stopReason", "usage", "error"],
         )
     }
 }
 
 fn cohere_chat_view(kind: &str, parsed: &Value) -> Value {
     if kind == "request" {
-        return pick_value(
-            parsed,
-            &[
-                "model",
-                "messages",
-                "message",
-                "tools",
-                "tool_choice",
-                "temperature",
-                "p",
-                "k",
-                "max_tokens",
-                "stop_sequences",
-                "response_format",
-                "stream",
-                "documents",
-                "safety_mode",
-                "metadata",
-            ],
-        );
+        return pick_value(parsed, &["model", "messages", "message"]);
     }
     if parsed.is_array() {
         aggregate_cohere_chat_stream(parsed)
     } else {
         pick_value(
             parsed,
-            &[
-                "id",
-                "message",
-                "text",
-                "finish_reason",
-                "usage",
-                "tool_calls",
-                "citations",
-                "error",
-            ],
+            &["message", "text", "finish_reason", "usage", "error"],
         )
     }
 }
@@ -2752,16 +2440,7 @@ fn aggregate_cohere_chat_stream(value: &Value) -> Value {
     let Some(items) = value.as_array() else {
         return pick_value(
             value,
-            &[
-                "id",
-                "message",
-                "text",
-                "finish_reason",
-                "usage",
-                "tool_calls",
-                "citations",
-                "error",
-            ],
+            &["message", "text", "finish_reason", "usage", "error"],
         );
     };
     let mut out = serde_json::Map::new();
@@ -2783,16 +2462,7 @@ fn aggregate_cohere_chat_stream(value: &Value) -> Value {
                 &mut out,
                 pick_value(
                     response,
-                    &[
-                        "id",
-                        "message",
-                        "text",
-                        "finish_reason",
-                        "usage",
-                        "tool_calls",
-                        "citations",
-                        "error",
-                    ],
+                    &["message", "text", "finish_reason", "usage", "error"],
                 ),
             );
         }
@@ -2837,16 +2507,7 @@ fn aggregate_cohere_chat_stream(value: &Value) -> Value {
     }
     pick_value(
         &Value::Object(out),
-        &[
-            "id",
-            "message",
-            "text",
-            "finish_reason",
-            "usage",
-            "tool_calls",
-            "citations",
-            "error",
-        ],
+        &["message", "text", "finish_reason", "usage", "error"],
     )
 }
 
@@ -2874,16 +2535,7 @@ impl CohereChatStreamState {
                 &mut self.out,
                 pick_value(
                     response,
-                    &[
-                        "id",
-                        "message",
-                        "text",
-                        "finish_reason",
-                        "usage",
-                        "tool_calls",
-                        "citations",
-                        "error",
-                    ],
+                    &["message", "text", "finish_reason", "usage", "error"],
                 ),
             );
         }
@@ -2946,35 +2598,13 @@ impl CohereChatStreamState {
         }
         pick_value(
             &Value::Object(std::mem::take(&mut self.out)),
-            &[
-                "id",
-                "message",
-                "text",
-                "finish_reason",
-                "usage",
-                "tool_calls",
-                "citations",
-                "error",
-            ],
+            &["message", "text", "finish_reason", "usage", "error"],
         )
     }
 }
 
 fn bedrock_converse_request_view(parsed: &Value, upstream_path: Option<&str>) -> Value {
-    let view = pick_value(
-        parsed,
-        &[
-            "modelId",
-            "messages",
-            "system",
-            "inferenceConfig",
-            "toolConfig",
-            "additionalModelRequestFields",
-            "promptVariables",
-            "guardrailConfig",
-            "additionalModelResponseFieldPaths",
-        ],
-    );
+    let view = pick_value(parsed, &["modelId", "messages", "system"]);
     let Value::Object(mut out) = view else {
         return view;
     };
@@ -3374,18 +3004,18 @@ fn required_presence(protocol: &str, kind: &str) -> Vec<Vec<&'static str>> {
         ("openai.chat_completions", "response") => vec![vec!["choices"]],
         ("openai.responses", "request") => vec![vec!["model"], vec!["input"]],
         ("openai.responses", "response") => vec![vec!["output", "status"]],
-        ("anthropic.messages", "request") => {
-            vec![vec!["model"], vec!["messages"], vec!["max_tokens"]]
+        ("anthropic.messages", "request") => vec![vec!["model"], vec!["messages"]],
+        ("anthropic.messages", "response") => vec![vec!["content"]],
+        ("google.gemini.generate_content", "request") => vec![vec!["model"], vec!["contents"]],
+        ("google.gemini.generate_content", "response") => {
+            vec![vec!["candidates", "promptFeedback"]]
         }
-        ("anthropic.messages", "response") => vec![vec!["content"], vec!["stop_reason"]],
-        ("google.gemini.generate_content", "request") => vec![vec!["contents"]],
-        ("google.gemini.generate_content", "response") => vec![vec!["candidates"]],
         ("alibaba.dashscope.generation", "request") => vec![vec!["model"], vec!["input"]],
         ("alibaba.dashscope.generation", "response") => vec![vec!["output"]],
         ("aws.bedrock.converse", "request") => vec![vec!["modelId"], vec!["messages"]],
-        ("aws.bedrock.converse", "response") => vec![vec!["output", "stopReason"]],
-        ("cohere.chat", "request") => vec![vec!["model"], vec!["messages"]],
-        ("cohere.chat", "response") => vec![vec!["message", "finish_reason"]],
+        ("aws.bedrock.converse", "response") => vec![vec!["output"]],
+        ("cohere.chat", "request") => vec![vec!["model"], vec!["messages", "message"]],
+        ("cohere.chat", "response") => vec![vec!["message", "text"]],
         _ => Vec::new(),
     }
 }
@@ -4736,10 +4366,113 @@ mod field_claims_tests {
     fn openai_responses_request_hash_ignores_instructions() {
         let with_instructions = br#"{"model":"qwen3.7-plus","input":[{"role":"user","content":"hi"}],"instructions":"answer carefully","temperature":0.7,"stream":false}"#;
         let without_instructions =
-            br#"{"model":"qwen3.7-plus","input":[{"role":"user","content":"hi"}],"temperature":0.7,"stream":false}"#;
+            br#"{"model":"qwen3.7-plus","input":[{"role":"user","content":"hi"}]}"#;
         let with_view = field_view("openai.responses", "request", with_instructions, None);
         let without_view = field_view("openai.responses", "request", without_instructions, None);
         assert_eq!(canonical_json(&with_view), canonical_json(&without_view));
+    }
+
+    #[test]
+    fn core_request_hash_ignores_relay_default_parameters() {
+        let cases: Vec<(&str, &[u8], &[u8], Option<&str>)> = vec![
+            (
+                "openai.chat_completions",
+                br#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}"#,
+                br#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"temperature":0.2,"top_p":0.9,"stream":false,"metadata":{"relay":"default"}}"#,
+                None,
+            ),
+            (
+                "openai.responses",
+                br#"{"model":"gpt-test","input":[{"role":"user","content":"hi"}]}"#,
+                br#"{"model":"gpt-test","input":[{"role":"user","content":"hi"}],"instructions":"relay-added compatibility text","temperature":0.7,"stream":false,"store":true}"#,
+                None,
+            ),
+            (
+                "anthropic.messages",
+                br#"{"model":"claude-test","system":"be concise","messages":[{"role":"user","content":"hi"}]}"#,
+                br#"{"model":"claude-test","system":"be concise","messages":[{"role":"user","content":"hi"}],"max_tokens":128,"temperature":0.5,"tools":[],"stream":false}"#,
+                None,
+            ),
+            (
+                "google.gemini.generate_content",
+                br#"{"model":"gemini-test","contents":[{"role":"user","parts":[{"text":"hi"}]}],"systemInstruction":{"parts":[{"text":"be concise"}]}}"#,
+                br#"{"model":"gemini-test","contents":[{"role":"user","parts":[{"text":"hi"}]}],"systemInstruction":{"parts":[{"text":"be concise"}]},"generationConfig":{"temperature":0.7},"tools":[],"safetySettings":[]}"#,
+                None,
+            ),
+            (
+                "alibaba.dashscope.generation",
+                br#"{"model":"qwen-test","input":{"messages":[{"role":"user","content":"hi"}]},"system":"be concise","messages":[{"role":"user","content":"hi"}]}"#,
+                br#"{"model":"qwen-test","input":{"messages":[{"role":"user","content":"hi"}]},"system":"be concise","messages":[{"role":"user","content":"hi"}],"parameters":{"temperature":0.7,"stream":false},"response_format":{"type":"text"},"thinking_budget":0}"#,
+                None,
+            ),
+            (
+                "aws.bedrock.converse",
+                br#"{"modelId":"anthropic.claude-test","system":[{"text":"be concise"}],"messages":[{"role":"user","content":[{"text":"hi"}]}]}"#,
+                br#"{"modelId":"anthropic.claude-test","system":[{"text":"be concise"}],"messages":[{"role":"user","content":[{"text":"hi"}]}],"inferenceConfig":{"temperature":0.7,"maxTokens":128},"toolConfig":{"tools":[]},"additionalModelRequestFields":{}}"#,
+                None,
+            ),
+            (
+                "cohere.chat",
+                br#"{"model":"command-test","messages":[{"role":"user","content":"hi"}],"message":"hi"}"#,
+                br#"{"model":"command-test","messages":[{"role":"user","content":"hi"}],"message":"hi","temperature":0.7,"stream":false,"tools":[],"safety_mode":"CONTEXTUAL"}"#,
+                None,
+            ),
+        ];
+
+        for (protocol, core, with_defaults, path) in cases {
+            assert_eq!(
+                canonical_json(&field_view(protocol, "request", core, path)),
+                canonical_json(&field_view(protocol, "request", with_defaults, path)),
+                "core request view changed after adding relay defaults for {protocol}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_response_hash_ignores_relay_response_ids() {
+        let cases: Vec<(&str, &[u8], &[u8])> = vec![
+            (
+                "openai.responses",
+                br#"{"id":"resp_relay","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"total_tokens":3}}"#,
+                br#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"total_tokens":3}}"#,
+            ),
+            (
+                "anthropic.messages",
+                br#"{"id":"msg_relay","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"output_tokens":1}}"#,
+                br#"{"type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"output_tokens":1}}"#,
+            ),
+            (
+                "cohere.chat",
+                br#"{"id":"chat_relay","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"finish_reason":"COMPLETE","usage":{"total_tokens":3}}"#,
+                br#"{"message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"finish_reason":"COMPLETE","usage":{"total_tokens":3}}"#,
+            ),
+        ];
+
+        for (protocol, with_id, without_id) in cases {
+            assert_eq!(
+                canonical_json(&field_view(protocol, "response", with_id, None)),
+                canonical_json(&field_view(protocol, "response", without_id, None)),
+                "core response view changed after adding relay id for {protocol}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_request_view_extracts_model_from_upstream_path() {
+        let request =
+            br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"temperature":0.7}}"#;
+        let view = field_view(
+            "google.gemini.generate_content",
+            "request",
+            request,
+            Some("/v1beta/models/gemini-2.5-pro:generateContent"),
+        );
+        assert_eq!(
+            view.get("model").and_then(serde_json::Value::as_str),
+            Some("gemini-2.5-pro")
+        );
+        assert!(view.get("contents").is_some());
+        assert!(view.get("generationConfig").is_none());
     }
 
     #[test]
@@ -4758,7 +4491,7 @@ mod field_claims_tests {
             chat_claims
                 .get("field_policy_id")
                 .and_then(serde_json::Value::as_str),
-            Some("openai.chat_completions.default@2026-07-27")
+            Some("openai.chat_completions.core@2026-07-29")
         );
 
         let responses_request = br#"{"model":"gpt-test","input":[{"role":"user","content":"hi"}]}"#;
@@ -4775,7 +4508,7 @@ mod field_claims_tests {
             responses_claims
                 .get("field_policy_id")
                 .and_then(serde_json::Value::as_str),
-            Some("openai.responses.default@2026-07-29")
+            Some("openai.responses.core@2026-07-29")
         );
     }
 

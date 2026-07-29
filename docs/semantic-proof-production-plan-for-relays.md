@@ -413,7 +413,7 @@ Enclave / verifier 应按以下优先级识别协议：
   "upstream_path": "/v1/chat/completions",
   "http_method": "POST",
   "http_status": 200,
-  "field_policy_id": "openai.chat_completions.default@2026-07-27",
+  "field_policy_id": "openai.chat_completions.core@2026-07-29",
   "upstream_request_fields_sha256": "...",
   "upstream_response_fields_sha256": "...",
   "request_body_sha256_severity": "advisory",
@@ -487,12 +487,12 @@ verifier 至少校验：
 
 如果某个字段没有同时满足上述条件，就不能把它归为 `allow_rewrite`，只能按 `must_match` 或 `advisory` 处理。
 
-例如：
+当前 `*.core@2026-07-29` 策略中：
 
-- `temperature` 可视为 `must_match`
-- `model` 在存在别名映射时可视为 `allow_rewrite`，但需记录 `logical_model` 和 `physical_model`
-- `usage.total_tokens` 可作为 `allow_rewrite`，但需注明来源是 upstream 还是 relay 估算
-- `request_body_sha256` 和 `response_body_sha256` 可视为 `advisory`
+- `model`、消息/输入内容、主要输出内容、上游 `usage` 进入主哈希，属于 `must_match`
+- 采样参数、`stream`、默认值、metadata、provider-specific 扩展参数不进入主哈希，属于 `advisory`
+- `request_body_sha256` 和 `response_body_sha256` 只用于提示和对账，属于 `advisory`
+- 如未来需要证明模型别名或 usage 改写，应发布新的 `field_policy_id`，并引入可复算的 `rewrite_claims`
 
 ### 5.4 验证结果状态
 
@@ -568,14 +568,16 @@ verifier 应至少返回以下状态之一：
 
 本方案按 **协议族** 覆盖主流模型厂商，而不是按厂商名称逐个复制一套规则。
 
+当前生产策略采用 `core` 字段集：只把模型标识、用户提示词/消息内容、上游主要输出、上游 usage/error 纳入主哈希。采样参数、默认值、兼容包装字段和多数 provider-specific 扩展参数仍可通过 `request_body_sha256` / `response_body_sha256` 看到差异，但这两项只作为 advisory，不影响主验证结果。
+
 本章字段清单采用两类存在性语义：
 
 - `required_presence`
   - 协议识别成功后必须存在；缺失说明请求/响应不满足该协议字段级 proof 的最低结构要求，字段级验证应失败或返回 `UNSUPPORTED`。
-- `required_if_present`
+- `core_if_present`
   - 字段只要出现在请求/响应中，extractor 就必须纳入规范化与哈希；字段未出现不单独构成失败。
 
-除每节明确列为 `required_presence` 的字段外，下方“请求侧 required_if_present 字段”和“响应侧 required_if_present 字段”中的字段均按 `required_if_present` 处理。
+除每节明确列为 `required_presence` 的字段外，下方“请求侧 core 字段”和“响应侧 core 字段”中的字段均按 `core_if_present` 处理。未列出的字段不会进入字段级主哈希。
 
 各协议最低 `required_presence` 生产默认如下；如需调整，必须通过新的 `field_policy_id` 发布，不能在同一 policy 下静默变更：
 
@@ -583,13 +585,13 @@ verifier 应至少返回以下状态之一：
 | --- | --- | --- |
 | `openai.chat_completions` | `model`、`messages` | `choices` |
 | `openai.responses` | `model`、`input` | `output` 或 `status` |
-| `anthropic.messages` | `model`、`messages`、`max_tokens` | `content`、`stop_reason` |
-| `google.gemini.generate_content` | `contents` | `candidates` |
+| `anthropic.messages` | `model`、`messages` | `content` |
+| `google.gemini.generate_content` | `model`、`contents`；`model` 可从 upstream path 的 `/models/{model}:...` 提取 | `candidates` 或 `promptFeedback` |
 | `alibaba.dashscope.generation` | `model`、`input` | `output` |
-| `aws.bedrock.converse` | `modelId`、`messages` | `output` 或 `stopReason` |
-| `cohere.chat` | `model`、`messages` | `message` 或 `finish_reason` |
+| `aws.bedrock.converse` | `modelId`、`messages`；`modelId` 可从 upstream path 的 `/model/{modelId}/converse...` 提取 | `output` |
+| `cohere.chat` | `model`、`messages` 或 `message` | `message` 或 `text` |
 
-这些最低字段只用于判断该协议的字段级 proof 是否具备可验证结构。其它参数只要出现，就应按 `required_if_present` 纳入提取，避免 relay 删除、替换或遗漏关键可选参数。
+这些最低字段只用于判断该协议的字段级 proof 是否具备可验证结构。其它参数即使出现，也只有在本节 core 字段列表中才纳入字段级主哈希。
 
 ### 7.1 OpenAI Compatible Chat Completions
 
@@ -606,7 +608,7 @@ verifier 应至少返回以下状态之一：
 
 - `openai.chat_completions`
 
-#### 请求侧 required_if_present 字段
+#### 请求侧 core 字段
 
 ```json
 {
@@ -617,32 +619,11 @@ verifier 应至少返回以下状态之一：
       "name": "...",
       "content": "... or content_parts"
     }
-  ],
-  "tools": [...],
-  "tool_choice": "...",
-  "response_format": {...},
-  "temperature": 0.7,
-  "top_p": 1.0,
-  "max_tokens": 1024,
-  "presence_penalty": 0,
-  "frequency_penalty": 0,
-  "parallel_tool_calls": true,
-  "stream": false,
-  "stop": ["..."],
-  "seed": 123
+  ]
 }
 ```
 
-#### 请求侧建议提取字段
-
-- `user`
-- `reasoning_effort`
-- `service_tier`
-- `modalities`
-- `audio.format`
-- `audio.voice`
-
-#### 响应侧 required_if_present 字段
+#### 响应侧 core 字段
 
 ```json
 {
@@ -666,19 +647,10 @@ verifier 应至少返回以下状态之一：
 }
 ```
 
-#### 响应侧建议提取字段
-
-- `choices[].message.refusal`
-- `choices[].message.annotations`
-- `choices[].logprobs`
-- `system_fingerprint`
-- `service_tier`
-- `reasoning_content` 或等效思维字段
-
 #### 允许改写字段
 
-- `id`
 - `created`
+- `id`
 - `object`
 - `request_id`
 - `x-request-id`
@@ -698,42 +670,25 @@ verifier 应至少返回以下状态之一：
 
 - `openai.responses`
 
-#### 请求侧 required_if_present 字段
+#### 请求侧 core 字段
 
 ```json
 {
   "model": "...",
-  "input": "... or structured_input",
-  "instructions": "...",
-  "tools": [...],
-  "tool_choice": "...",
-  "temperature": 0.7,
-  "top_p": 1.0,
-  "max_output_tokens": 1024,
-  "stream": false,
-  "parallel_tool_calls": true,
-  "truncation": "...",
-  "text": {
-    "format": {...}
-  }
+  "input": "... or structured_input"
 }
 ```
 
-#### 请求侧建议提取字段
+`instructions` 明确排除在 `openai.responses.core@2026-07-29` 外；relay 为兼容客户端调整或注入该字段不会导致 core 字段级 proof 失败。
 
-- `metadata`
-- `reasoning.effort`
-- `store`
-- `include`
-
-#### 响应侧 required_if_present 字段
+#### 响应侧 core 字段
 
 ```json
 {
   "model": "...",
   "output": [...],
   "status": "...",
-  "incomplete_details": {...},
+  "output_text": "...",
   "usage": {
     "input_tokens": 1,
     "output_tokens": 2,
@@ -741,13 +696,6 @@ verifier 应至少返回以下状态之一：
   }
 }
 ```
-
-#### 响应侧建议提取字段
-
-- `output_text`
-- `output[].content`
-- `output[].tool_calls`
-- `reasoning`
 
 #### 允许改写字段
 
@@ -769,7 +717,7 @@ verifier 应至少返回以下状态之一：
 
 - `anthropic.messages`
 
-#### 请求侧 required_if_present 字段
+#### 请求侧 core 字段
 
 ```json
 {
@@ -780,26 +728,11 @@ verifier 应至少返回以下状态之一：
       "role": "...",
       "content": "... or content_blocks"
     }
-  ],
-  "tools": [...],
-  "tool_choice": {...},
-  "temperature": 0.7,
-  "top_p": 1.0,
-  "top_k": 50,
-  "max_tokens": 1024,
-  "stop_sequences": ["..."],
-  "stream": false
+  ]
 }
 ```
 
-#### 请求侧建议提取字段
-
-- `thinking`
-- `metadata.user_id`
-- `container`
-- `mcp_servers`
-
-#### 响应侧 required_if_present 字段
+#### 响应侧 core 字段
 
 ```json
 {
@@ -808,20 +741,12 @@ verifier 应至少返回以下状态之一：
   "role": "assistant",
   "content": [...],
   "stop_reason": "...",
-  "stop_sequence": "...",
   "usage": {
     "input_tokens": 1,
     "output_tokens": 2
   }
 }
 ```
-
-#### 响应侧建议提取字段
-
-- `content[].text`
-- `content[].tool_use`
-- `thinking`
-- `container`
 
 #### 允许改写字段
 
@@ -843,35 +768,17 @@ verifier 应至少返回以下状态之一：
 
 - `google.gemini.generate_content`
 
-#### 请求侧 required_if_present 字段
+#### 请求侧 core 字段
 
 ```json
 {
-  "model": "...",
+  "model": "... or model extracted from upstream path",
   "contents": [...],
-  "systemInstruction": {...},
-  "tools": [...],
-  "toolConfig": {...},
-  "generationConfig": {
-    "temperature": 0.7,
-    "topP": 1.0,
-    "topK": 40,
-    "maxOutputTokens": 1024,
-    "stopSequences": ["..."],
-    "responseMimeType": "application/json",
-    "responseSchema": {...}
-  },
-  "safetySettings": [...]
+  "systemInstruction": {...}
 }
 ```
 
-#### 请求侧建议提取字段
-
-- `cachedContent`
-- `labels`
-- `thinkingConfig`
-
-#### 响应侧 required_if_present 字段
+#### 响应侧 core 字段
 
 ```json
 {
@@ -886,16 +793,11 @@ verifier 应至少返回以下状态之一：
     "promptTokenCount": 1,
     "candidatesTokenCount": 2,
     "totalTokenCount": 3
-  }
+  },
+  "promptFeedback": {...},
+  "modelVersion": "..."
 }
 ```
-
-#### 响应侧建议提取字段
-
-- `candidates[].content.parts`
-- `candidates[].groundingMetadata`
-- `promptFeedback`
-- `modelVersion`
 
 #### 允许改写字段
 
@@ -920,34 +822,18 @@ verifier 应至少返回以下状态之一：
 
 - `alibaba.dashscope.generation`
 
-#### 请求侧 required_if_present 字段
+#### 请求侧 core 字段
 
 ```json
 {
   "model": "...",
   "input": {...},
-  "parameters": {
-    "temperature": 0.7,
-    "top_p": 1.0,
-    "top_k": 50,
-    "max_tokens": 1024,
-    "result_format": "message",
-    "incremental_output": false,
-    "stop": ["..."],
-    "tools": [...],
-    "tool_choice": "auto"
-  }
+  "system": "...",
+  "messages": [...]
 }
 ```
 
-#### 请求侧建议提取字段
-
-- `system`
-- `messages`
-- `response_format`
-- `thinking_budget`
-
-#### 响应侧 required_if_present 字段
+#### 响应侧 core 字段
 
 ```json
 {
@@ -959,13 +845,6 @@ verifier 应至少返回以下状态之一：
   }
 }
 ```
-
-#### 响应侧建议提取字段
-
-- `output.text`
-- `output.choices`
-- `output.finish_reason`
-- `request_id`
 
 #### 允许改写字段
 
@@ -985,31 +864,17 @@ verifier 应至少返回以下状态之一：
 
 - `aws.bedrock.converse`
 
-#### 请求侧 required_if_present 字段
+#### 请求侧 core 字段
 
 ```json
 {
-  "modelId": "...",
+  "modelId": "... or modelId extracted from upstream path",
   "system": [...],
-  "messages": [...],
-  "toolConfig": {...},
-  "inferenceConfig": {
-    "maxTokens": 1024,
-    "temperature": 0.7,
-    "topP": 1.0,
-    "stopSequences": ["..."]
-  },
-  "additionalModelRequestFields": {...}
+  "messages": [...]
 }
 ```
 
-#### 请求侧建议提取字段
-
-- `promptVariables`
-- `guardrailConfig`
-- `additionalModelResponseFieldPaths`
-
-#### 响应侧 required_if_present 字段
+#### 响应侧 core 字段
 
 ```json
 {
@@ -1022,12 +887,6 @@ verifier 应至少返回以下状态之一：
   }
 }
 ```
-
-#### 响应侧建议提取字段
-
-- `output.message`
-- `metrics.latencyMs`
-- `additionalModelResponseFields`
 
 #### 允许改写字段
 
@@ -1047,35 +906,22 @@ verifier 应至少返回以下状态之一：
 
 - `cohere.chat`
 
-#### 请求侧 required_if_present 字段
+#### 请求侧 core 字段
 
 ```json
 {
   "model": "...",
   "messages": [...],
-  "tools": [...],
-  "tool_choice": "...",
-  "temperature": 0.7,
-  "p": 0.75,
-  "k": 0,
-  "max_tokens": 1024,
-  "stop_sequences": ["..."],
-  "stream": false,
-  "response_format": {...}
+  "message": "..."
 }
 ```
 
-#### 请求侧建议提取字段
-
-- `documents`
-- `safety_mode`
-- `metadata`
-
-#### 响应侧 required_if_present 字段
+#### 响应侧 core 字段
 
 ```json
 {
   "message": {...},
+  "text": "...",
   "finish_reason": "...",
   "usage": {
     "input_tokens": 1,
@@ -1083,12 +929,6 @@ verifier 应至少返回以下状态之一：
   }
 }
 ```
-
-#### 响应侧建议提取字段
-
-- `message.content`
-- `message.tool_calls`
-- `citations`
 
 #### 允许改写字段
 
@@ -1523,7 +1363,7 @@ verifier/
 | --- | --- |
 | `proof_runtime_version` | Enclave 内 proof 程序版本 |
 | `proof_schema_version` | proof statement 的结构版本 |
-| `field_policy_id` | 字段提取、归一化、允许改写策略版本；按协议单独版本化，例如 `openai.chat_completions.default@2026-07-27`、`openai.responses.default@2026-07-29` |
+| `field_policy_id` | 字段提取、归一化、允许改写策略版本；按协议单独版本化，例如 `openai.chat_completions.core@2026-07-29`、`openai.responses.core@2026-07-29` |
 | `verifier_version` | 能验证该 schema/policy 的 verifier 版本 |
 | `tee_platform` | `aws` / `aliyun` / `huawei` |
 | `tee_profile` | `aws-nitro` / `aliyun-enclave` / `aliyun-vtpm` / `huawei-qingtian` |
