@@ -1523,7 +1523,7 @@ verifier/
 | --- | --- |
 | `proof_runtime_version` | Enclave 内 proof 程序版本 |
 | `proof_schema_version` | proof statement 的结构版本 |
-| `field_policy_id` | 字段提取、归一化、允许改写策略版本 |
+| `field_policy_id` | 字段提取、归一化、允许改写策略版本；按协议单独版本化，例如 `openai.chat_completions.default@2026-07-27`、`openai.responses.default@2026-07-29` |
 | `verifier_version` | 能验证该 schema/policy 的 verifier 版本 |
 | `tee_platform` | `aws` / `aliyun` / `huawei` |
 | `tee_profile` | `aws-nitro` / `aliyun-enclave` / `aliyun-vtpm` / `huawei-qingtian` |

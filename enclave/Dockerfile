@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends cmake clang lib
 # C 侧(BoringSSL)编译路径归一 → 复现（与 RUSTFLAGS 的 remap 对应；否则 .o 里嵌绝对路径会漂 PCR0）。
 ENV CFLAGS="-O2 -g0 -ffile-prefix-map=/src=/src -ffile-prefix-map=/usr/local/cargo=/cargo" \
     CXXFLAGS="-O2 -g0 -ffile-prefix-map=/src=/src -ffile-prefix-map=/usr/local/cargo=/cargo"
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock field-policy-registry.json ./
 COPY src ./src
 RUN cargo build --release --locked
 

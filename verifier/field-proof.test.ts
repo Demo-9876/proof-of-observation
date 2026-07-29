@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { buildFieldClaims, hashFieldView, verifyFieldClaims } from './field-proof.ts';
 
 const requestBody = Buffer.from(JSON.stringify({
@@ -174,6 +175,74 @@ describe('field-level proof extraction', () => {
 
     expect(hashFieldView('openai.responses', 'response', stream))
       .toBe(hashFieldView('openai.responses', 'response', merged));
+  });
+
+  it('ignores instructions when hashing OpenAI Responses request fields', () => {
+    const withInstructions = Buffer.from(JSON.stringify({
+      model: 'qwen3.7-plus',
+      input: [{ role: 'user', content: 'hi' }],
+      instructions: 'answer carefully',
+      temperature: 0.7,
+      stream: false,
+    }), 'utf8');
+    const withoutInstructions = Buffer.from(JSON.stringify({
+      model: 'qwen3.7-plus',
+      input: [{ role: 'user', content: 'hi' }],
+      temperature: 0.7,
+      stream: false,
+    }), 'utf8');
+
+    expect(hashFieldView('openai.responses', 'request', withInstructions))
+      .toBe(hashFieldView('openai.responses', 'request', withoutInstructions));
+  });
+
+  it('uses protocol-specific field policy versions', () => {
+    const openaiChat = buildFieldClaims({
+      nonceB64: Buffer.from('nonce').toString('base64'),
+      upstreamHost: 'api.example.com',
+      upstreamPath: '/v1/chat/completions',
+      httpMethod: 'POST',
+      httpStatus: 200,
+      requestBody: Buffer.from(JSON.stringify({
+        model: 'gpt-test',
+        messages: [{ role: 'user', content: 'hi' }],
+      }), 'utf8'),
+      responseBody: Buffer.from('{"choices":[{"message":{"content":"ok"}}]}', 'utf8'),
+    });
+    const responses = buildFieldClaims({
+      nonceB64: Buffer.from('nonce').toString('base64'),
+      upstreamHost: 'api.example.com',
+      upstreamPath: '/v1/responses',
+      httpMethod: 'POST',
+      httpStatus: 200,
+      requestBody: Buffer.from(JSON.stringify({
+        model: 'gpt-test',
+        input: [{ role: 'user', content: 'hi' }],
+      }), 'utf8'),
+      responseBody: Buffer.from(JSON.stringify({
+        status: 'completed',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+      }), 'utf8'),
+    });
+
+    expect(openaiChat?.claims.field_policy_id).toBe('openai.chat_completions.default@2026-07-27');
+    expect(responses?.claims.field_policy_id).toBe('openai.responses.default@2026-07-29');
+  });
+
+  it('requires explicit field policy versions for every supported protocol', () => {
+    const registry = JSON.parse(
+      readFileSync(new URL('../enclave/field-policy-registry.json', import.meta.url), 'utf8'),
+    ) as { protocol_versions?: Record<string, string> };
+
+    expect(registry.protocol_versions).toMatchObject({
+      'openai.chat_completions': expect.any(String),
+      'openai.responses': expect.any(String),
+      'anthropic.messages': expect.any(String),
+      'google.gemini.generate_content': expect.any(String),
+      'alibaba.dashscope.generation': expect.any(String),
+      'aws.bedrock.converse': expect.any(String),
+      'cohere.chat': expect.any(String),
+    });
   });
 
   it('parses multi-line SSE data as one event', () => {

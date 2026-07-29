@@ -15,7 +15,7 @@ use std::net::TcpStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use vsock::{VsockAddr, VsockListener, VsockStream};
@@ -195,7 +195,50 @@ const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
 const DEFAULT_PARENT_CID: u32 = 3;
 const PORT: u32 = 5005;
 const DOMAIN_V2: &str = "tee-exchange-v2";
-const FIELD_POLICY_VERSION: &str = "2026-07-27";
+
+#[derive(Debug, Deserialize)]
+struct FieldPolicyRegistry {
+    #[serde(rename = "default")]
+    _default_version: String,
+    protocol_versions: BTreeMap<String, String>,
+}
+
+static FIELD_POLICY_REGISTRY: OnceLock<FieldPolicyRegistry> = OnceLock::new();
+const SUPPORTED_PROTOCOLS: &[&str] = &[
+    "openai.chat_completions",
+    "openai.responses",
+    "anthropic.messages",
+    "google.gemini.generate_content",
+    "alibaba.dashscope.generation",
+    "aws.bedrock.converse",
+    "cohere.chat",
+];
+
+fn field_policy_registry() -> &'static FieldPolicyRegistry {
+    FIELD_POLICY_REGISTRY.get_or_init(|| {
+        let registry: FieldPolicyRegistry =
+            serde_json::from_str(include_str!("../field-policy-registry.json"))
+                .expect("parse field policy registry");
+        for protocol in SUPPORTED_PROTOCOLS {
+            let version = registry.protocol_versions.get(*protocol);
+            assert!(
+                matches!(version, Some(v) if !v.is_empty()),
+                "field policy registry missing supported protocol: {}",
+                protocol
+            );
+        }
+        registry
+    })
+}
+
+fn field_policy_version(protocol: &str) -> String {
+    let registry = field_policy_registry();
+    registry
+        .protocol_versions
+        .get(protocol)
+        .cloned()
+        .unwrap_or_else(|| panic!("missing field policy version for supported protocol: {protocol}"))
+}
 
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_RESP: usize = 64 * 1024 * 1024;
@@ -541,7 +584,6 @@ fn field_view(protocol: &str, kind: &str, body: &[u8], upstream_path: Option<&st
             &[
                 "model",
                 "input",
-                "instructions",
                 "tools",
                 "tool_choice",
                 "temperature",
@@ -691,7 +733,7 @@ fn build_field_claims_from_views(
         "upstream_path": path,
         "http_method": norm_method.to_ascii_uppercase(),
         "http_status": status,
-        "field_policy_id": format!("{}.default@{}", protocol, FIELD_POLICY_VERSION),
+        "field_policy_id": format!("{}.default@{}", protocol, field_policy_version(protocol)),
         "upstream_request_fields_sha256": request_fields_hash,
         "upstream_response_fields_sha256": response_fields_hash,
         "request_body_sha256_severity": "advisory",
@@ -1293,7 +1335,6 @@ fn openai_responses_view(kind: &str, parsed: &Value) -> Value {
             &[
                 "model",
                 "input",
-                "instructions",
                 "tools",
                 "tool_choice",
                 "temperature",
@@ -4573,8 +4614,9 @@ mod response_stream_tests {
 #[cfg(test)]
 mod field_claims_tests {
     use super::{
-        build_field_claims, build_proof_unavailable_payload, canonical_json, field_view,
-        FieldResponseCollector, ReqHead, Upstream, MAX_FIELD_CLAIMS_CAPTURE,
+        build_field_claims, build_proof_unavailable_payload, canonical_json, field_policy_registry,
+        field_view, FieldResponseCollector, ReqHead, Upstream, MAX_FIELD_CLAIMS_CAPTURE,
+        SUPPORTED_PROTOCOLS,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -4688,6 +4730,66 @@ mod field_claims_tests {
         let stream = b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"he\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"llo\"}\n\ndata: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"total_tokens\":3}}}\n\n";
         let merged = br#"{"id":"resp_1","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"total_tokens":3}}"#;
         assert_same_response_view("openai.responses", stream, merged);
+    }
+
+    #[test]
+    fn openai_responses_request_hash_ignores_instructions() {
+        let with_instructions = br#"{"model":"qwen3.7-plus","input":[{"role":"user","content":"hi"}],"instructions":"answer carefully","temperature":0.7,"stream":false}"#;
+        let without_instructions =
+            br#"{"model":"qwen3.7-plus","input":[{"role":"user","content":"hi"}],"temperature":0.7,"stream":false}"#;
+        let with_view = field_view("openai.responses", "request", with_instructions, None);
+        let without_view = field_view("openai.responses", "request", without_instructions, None);
+        assert_eq!(canonical_json(&with_view), canonical_json(&without_view));
+    }
+
+    #[test]
+    fn field_policy_version_is_protocol_specific() {
+        let chat_request = br#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}"#;
+        let chat_response = br#"{"choices":[{"message":{"content":"ok"}}]}"#;
+        let chat_claims = build_field_claims(
+            &head("/v1/chat/completions"),
+            "POST",
+            200,
+            chat_request,
+            chat_response,
+        )
+        .expect("chat claims");
+        assert_eq!(
+            chat_claims
+                .get("field_policy_id")
+                .and_then(serde_json::Value::as_str),
+            Some("openai.chat_completions.default@2026-07-27")
+        );
+
+        let responses_request = br#"{"model":"gpt-test","input":[{"role":"user","content":"hi"}]}"#;
+        let responses_response = br#"{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}"#;
+        let responses_claims = build_field_claims(
+            &head("/v1/responses"),
+            "POST",
+            200,
+            responses_request,
+            responses_response,
+        )
+        .expect("responses claims");
+        assert_eq!(
+            responses_claims
+                .get("field_policy_id")
+                .and_then(serde_json::Value::as_str),
+            Some("openai.responses.default@2026-07-29")
+        );
+    }
+
+    #[test]
+    fn field_policy_registry_covers_all_supported_protocols() {
+        let registry = field_policy_registry();
+        for protocol in SUPPORTED_PROTOCOLS {
+            let version = registry.protocol_versions.get(*protocol);
+            assert!(
+                matches!(version, Some(v) if !v.is_empty()),
+                "missing field policy version for supported protocol: {}",
+                protocol
+            );
+        }
     }
 
     #[test]

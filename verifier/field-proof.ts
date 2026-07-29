@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 export type ProtocolFamily =
   | 'openai.chat_completions'
@@ -10,7 +11,22 @@ export type ProtocolFamily =
   | 'cohere.chat'
   | 'unknown';
 
-const FIELD_POLICY_VERSION = '2026-07-27';
+const SUPPORTED_PROTOCOLS: Exclude<ProtocolFamily, 'unknown'>[] = [
+  'openai.chat_completions',
+  'openai.responses',
+  'anthropic.messages',
+  'google.gemini.generate_content',
+  'alibaba.dashscope.generation',
+  'aws.bedrock.converse',
+  'cohere.chat',
+];
+
+interface FieldPolicyRegistry {
+  default: string;
+  protocol_versions: Record<Exclude<ProtocolFamily, 'unknown'>, string>;
+}
+
+const FIELD_POLICY_REGISTRY = loadFieldPolicyRegistry();
 
 export interface FieldClaims {
   v: number;
@@ -257,7 +273,6 @@ function openaiResponsesView(kind: 'request' | 'response', parsed: unknown): unk
     return pick(parsed, [
       'model',
       'input',
-      'instructions',
       'tools',
       'tool_choice',
       'temperature',
@@ -943,7 +958,12 @@ function schemaVersion(protocol: ProtocolFamily): string {
 }
 
 function fieldPolicyId(protocol: ProtocolFamily): string {
-  return `${protocol}.default@${FIELD_POLICY_VERSION}`;
+  if (protocol === 'unknown') return `${protocol}.default@unknown`;
+  const version = FIELD_POLICY_REGISTRY.protocol_versions[protocol];
+  if (typeof version !== 'string' || version.length === 0) {
+    throw new Error(`missing field policy version for supported protocol: ${protocol}`);
+  }
+  return `${protocol}.default@${version}`;
 }
 
 function pathWithoutQuery(path: string): string {
@@ -953,6 +973,27 @@ function pathWithoutQuery(path: string): string {
 
 function sha256Hex(data: Buffer): string {
   return createHash('sha256').update(data).digest('hex');
+}
+
+function loadFieldPolicyRegistry(): FieldPolicyRegistry {
+  const raw = readFileSync(new URL('../enclave/field-policy-registry.json', import.meta.url), 'utf8');
+  const parsed = JSON.parse(raw) as Partial<FieldPolicyRegistry>;
+  if (typeof parsed.default !== 'string') {
+    throw new Error('field-policy-registry.default must be a string');
+  }
+  if (!parsed.protocol_versions || typeof parsed.protocol_versions !== 'object') {
+    throw new Error('field-policy-registry.protocol_versions must be an object');
+  }
+  for (const protocol of SUPPORTED_PROTOCOLS) {
+    const version = (parsed.protocol_versions as Record<string, unknown>)[protocol];
+    if (typeof version !== 'string' || version.length === 0) {
+      throw new Error(`field-policy-registry.protocol_versions missing supported protocol: ${protocol}`);
+    }
+  }
+  return {
+    default: parsed.default,
+    protocol_versions: parsed.protocol_versions as Record<Exclude<ProtocolFamily, 'unknown'>, string>,
+  };
 }
 
 function stringField(value: Record<string, unknown>, field: string): string | undefined {
