@@ -127,6 +127,7 @@ func (s *Server) HandleRequest(req Request) Response {
 		ResponseContentType:   req.ResponseContentType,
 		RequestBodySHA256Hex:  req.RequestSHA256Hex,
 		ResponseBodySHA256Hex: req.ResponseSHA256Hex,
+		FieldClaims:           req.FieldClaims,
 	}, proof.GenerateOptions{
 		PrivateKey: s.privateKey,
 		Attester:   s.attester,
@@ -172,6 +173,8 @@ func classifyError(err error) Response {
 		return failure("invalid_nonce", msg)
 	case strings.Contains(msg, "request_body_sha256") || strings.Contains(msg, "response_body_sha256"):
 		return failure("invalid_hash", msg)
+	case strings.Contains(msg, "field_claims"):
+		return failure("bad_request", msg)
 	case strings.Contains(msg, "get vtpm quote"):
 		return failure("vtpm_quote_failed", msg)
 	default:

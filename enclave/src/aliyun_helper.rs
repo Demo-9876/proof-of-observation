@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use serde_json::Value;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -20,6 +21,8 @@ pub struct ProofRequest<'a> {
     pub resp_content_type: &'a str,
     pub request_body_sha256: &'a str,
     pub response_body_sha256: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_claims: Option<&'a Value>,
 }
 
 impl<'a> ProofRequest<'a> {
@@ -33,6 +36,7 @@ impl<'a> ProofRequest<'a> {
         resp_content_type: &'a str,
         request_body_sha256: &'a str,
         response_body_sha256: &'a str,
+        field_claims: Option<&'a Value>,
     ) -> Self {
         Self {
             v: PROTOCOL_VERSION,
@@ -44,6 +48,7 @@ impl<'a> ProofRequest<'a> {
             resp_content_type,
             request_body_sha256,
             response_body_sha256,
+            field_claims,
         }
     }
 }
@@ -126,13 +131,17 @@ mod tests {
 
     #[test]
     fn request_proof_returns_proof_payload() {
-        let socket_path = std::path::PathBuf::from(format!(
-            "target/apo-{}-{}.sock",
+        let socket_path = std::env::temp_dir().join(format!(
+            "apo-{}-{}.sock",
             std::process::id(),
             unique_suffix()
         ));
         let _ = fs::remove_file(&socket_path);
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("bind helper test socket: {e}"),
+        };
         let proof = br#"{"profile":"aliyun-vtpm", "ok": true}"#;
         let expected = proof.to_vec();
         let handle = thread::spawn({
@@ -166,6 +175,7 @@ mod tests {
                 "text/event-stream",
                 &req_hash,
                 &resp_hash,
+                None,
             ),
         )
         .unwrap();

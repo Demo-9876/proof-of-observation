@@ -15,16 +15,17 @@ const (
 )
 
 type Request struct {
-	Version             int    `json:"v"`
-	Op                  string `json:"op,omitempty"`
-	NonceB64            string `json:"nonce_b64,omitempty"`
-	UpstreamHost        string `json:"upstream_host,omitempty"`
-	UpstreamPath        string `json:"upstream_path,omitempty"`
-	HTTPMethod          string `json:"http_method,omitempty"`
-	HTTPStatus          int    `json:"http_status,omitempty"`
-	ResponseContentType string `json:"resp_content_type,omitempty"`
-	RequestSHA256Hex    string `json:"request_body_sha256,omitempty"`
-	ResponseSHA256Hex   string `json:"response_body_sha256,omitempty"`
+	Version             int             `json:"v"`
+	Op                  string          `json:"op,omitempty"`
+	NonceB64            string          `json:"nonce_b64,omitempty"`
+	UpstreamHost        string          `json:"upstream_host,omitempty"`
+	UpstreamPath        string          `json:"upstream_path,omitempty"`
+	HTTPMethod          string          `json:"http_method,omitempty"`
+	HTTPStatus          int             `json:"http_status,omitempty"`
+	ResponseContentType string          `json:"resp_content_type,omitempty"`
+	RequestSHA256Hex    string          `json:"request_body_sha256,omitempty"`
+	ResponseSHA256Hex   string          `json:"response_body_sha256,omitempty"`
+	FieldClaims         json.RawMessage `json:"field_claims,omitempty"`
 }
 
 type Response struct {

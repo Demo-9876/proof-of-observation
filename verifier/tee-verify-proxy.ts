@@ -1,6 +1,6 @@
 // 本地校验代理(透明每调验,「最省心」的客户端验证组件)。
 //
-//   npx tsx tee-verify-proxy.ts --upstream https://api.example.com (--pcr0 <hex> | --trust <trust.json>) [--port 8788] [--enforce] [--nonce-header x-tee-nonce]
+//   npx tsx tee-verify-proxy.ts --upstream https://api.example.com (--pcr0 <hex> | --trust <trust.json>) [--port 8788] [--enforce] [--nonce-header x-tee-nonce] [--allow-legacy-proof]
 //
 // 把你的 LLM 客户端 baseURL 改指向本代理(http://127.0.0.1:8788),其余照常调用。代理对每次请求:
 //   ① 原样转发到真实上游(relay),逐字节回传给你的客户端 —— 流式不破(holdback 只压住流末)。
@@ -43,8 +43,9 @@ const DEFAULT_HOLDBACK = 64 * 1024; // 须 ≥ 最大 proof 体积(含 COSE atte
 export interface VerifyingProxyOptions {
   upstream: string; // 真实上游 base URL,如 https://api.example.com
   expectedPcr0?: string; // legacy Nitro shorthand
-  trust?: EvidenceTrust; // profile-aware trust config; required for Aliyun/QingTian 等 non-Nitro profiles
+  trust?: EvidenceTrust; // profile-aware trust config; Aliyun/QingTian 等 non-Nitro 用它提供 PCR allowlist / 平台证书 pin
   nonceHeader?: string; // 可选:每请求生成 nonce 并用该 header 发给 relay,再强制 proof.nonce 匹配
+  requireFieldClaims?: boolean; // 默认 true: 生产路径强制字段级 proof; legacy 可显式关闭
   enforce?: boolean; // true=fail-closed(缓冲+阻断);默认 false=fail-open(流式+日志)
   holdback?: number; // 流式压住流末的字节数;默认 64KiB
   verifyAttestationDoc?: AttestationVerifier; // 默认真 COSE;测试注桩
@@ -88,7 +89,14 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
         opts.onVerdict?.(verdict, { method: clientReq.method || 'GET', path: clientReq.url || '/', nonce, attested });
       const runVerify = (body: Buffer, proof: any): TeeVerifyResult =>
         verifyTeeExchange(
-          { expectedPcr0: opts.expectedPcr0, trust: opts.trust, expectedNonceB64, responseBody: body, proof },
+          {
+            expectedPcr0: opts.expectedPcr0,
+            trust: opts.trust,
+            expectedNonceB64,
+            responseBody: body,
+            proof,
+            requireFieldClaims: opts.requireFieldClaims !== false,
+          },
           { verifyAttestationDoc: opts.verifyAttestationDoc },
         );
 
@@ -99,6 +107,7 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
         const lowerCt = ct.toLowerCase();
         const streaming = lowerCt.includes('text/event-stream');
         const multipart = lowerCt.includes('multipart/mixed');
+        const jsonEnvelope = lowerCt.includes('json') && hasTeeProofSignal(upRes.headers);
 
         // ── fail-closed:整段缓冲,必须有 proof 且验过才放行;缺 proof/验不过 → 502。
         if (opts.enforce) {
@@ -142,6 +151,29 @@ export function createVerifyingProxy(opts: VerifyingProxyOptions): http.Server {
               return;
             }
             copyHeaders(upRes, clientRes, true, verdict?.ok ? proof?.resp_content_type : parsed.bodyContentType);
+            clientRes.end(body);
+          });
+          upRes.on('error', () => endError(clientRes));
+          return;
+        }
+
+        // ── fail-open · JSON envelope proof:非流式响应可能在顶层 `proof` 字段携带证明。
+        // 只有响应头明确带 proof 信号时才缓冲 JSON；普通 JSON 仍走下方逐字节透传。
+        if (jsonEnvelope) {
+          const buf: Buffer[] = [];
+          upRes.on('data', (c: Buffer) => buf.push(c));
+          upRes.on('end', () => {
+            const whole = Buffer.concat(buf);
+            const parsed = parseTeeProofCapture(whole, ct);
+            const { body, proof } = parsed;
+            const verdict = proof ? runVerify(body, proof) : null;
+            report(verdict, Boolean(proof), proof?.nonce ?? '');
+            if (!proof && !parsed.bodyContentType) {
+              copyHeaders(upRes, clientRes, false);
+              clientRes.end(whole);
+              return;
+            }
+            copyHeaders(upRes, clientRes, true, parsed.bodyContentType ?? 'application/json');
             clientRes.end(body);
           });
           upRes.on('error', () => endError(clientRes));
@@ -217,6 +249,10 @@ function copyHeaders(upRes: http.IncomingMessage, clientRes: http.ServerResponse
   clientRes.writeHead(upRes.statusCode || 200, out);
 }
 
+function hasTeeProofSignal(headers: http.IncomingHttpHeaders): boolean {
+  return Object.keys(headers).some((k) => k.toLowerCase().startsWith('x-tee-proof-'));
+}
+
 function endError(clientRes: http.ServerResponse): void {
   if (clientRes.headersSent) { clientRes.end(); return; }
   clientRes.writeHead(502, { 'content-type': 'application/json' });
@@ -233,9 +269,10 @@ function runCli(): void {
   const pcr0 = flag('--pcr0');
   const trustPath = flag('--trust');
   const nonceHeader = flag('--nonce-header');
+  const allowLegacyProof = has('--allow-legacy-proof');
   const port = Number(flag('--port') ?? process.env.TEE_PROXY_PORT ?? 8788);
   const enforce = has('--enforce');
-  const usage = '用法: tsx tee-verify-proxy.ts --upstream <url> (--pcr0 <hex> | --trust <trust.json>) [--port 8788] [--enforce] [--nonce-header x-tee-nonce]';
+  const usage = '用法: tsx tee-verify-proxy.ts --upstream <url> (--pcr0 <hex> | --trust <trust.json>) [--port 8788] [--enforce] [--nonce-header x-tee-nonce] [--allow-legacy-proof]';
   if (!upstream) {
     console.error(usage);
     process.exit(2);
@@ -252,6 +289,7 @@ function runCli(): void {
     expectedPcr0: pcr0,
     trust,
     nonceHeader,
+    requireFieldClaims: !allowLegacyProof,
     enforce,
     onVerdict: (v, ctx) => {
       const tag = `${ctx.method} ${ctx.path}`;
@@ -267,6 +305,7 @@ function runCli(): void {
     console.log(`  监听  http://127.0.0.1:${port}  →  上游 ${upstream}`);
     console.log(`  trust ${trustPath ? trustPath : `legacy nitro pcr0=${pcr0}`}`);
     if (nonceHeader) console.log(`  nonce 每请求生成并通过 ${nonceHeader} 发送,返回 proof 必须匹配`);
+    console.log(`  字段级 ${allowLegacyProof ? 'legacy proof 兼容模式(--allow-legacy-proof)' : '默认强制 field_claims'}`);
     console.log(`  模式  ${enforce ? 'fail-closed(--enforce:缺 proof 或验不过 → 502)' : 'fail-open(放行 + 日志,持续抽查/威慑)'}`);
     console.log(`  用法  把你的 LLM 客户端 baseURL 改成上面的监听地址即可${nonceHeader ? '(会注入 nonce header)' : '(默认不注入额外头)'}。`);
     console.log('  注    response-only 会展示签名覆盖的 host;但不含请求绑定,要连「答的就是我这条请求」用整 bundle 验证。');

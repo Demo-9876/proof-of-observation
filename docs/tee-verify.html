@@ -539,11 +539,11 @@
   <div class="panel" id="loadPanel">
     <h2 id="loadTitle">把你收到的响应放进来</h2>
     <div class="drop" id="drop">
-      <span id="dropText">把 <b>response.sse</b> / <b>response.multipart</b> 文件拖到这里，或点此选择</span>
-      <input type="file" id="file" accept=".sse,.multipart,text/event-stream,multipart/mixed" hidden />
+      <span id="dropText">把 <b>response.sse</b> / <b>response.multipart</b> / <b>response.json</b> 文件拖到这里，或点此选择</span>
+      <input type="file" id="file" accept=".sse,.multipart,.json,text/event-stream,multipart/mixed,application/json" hidden />
     </div>
     <label id="pasteLabel">或直接粘贴完整响应(连 curl 命令一起贴也行)</label>
-    <textarea class="pastebox" id="pasteInput" placeholder="流式请求：粘贴从 event: message_start 到末尾 event: tee.proof 的整段 response.sse。&#10;非流式请求：粘贴完整 multipart/mixed response.multipart。&#10;（只粘 tee.proof 那段也能验真实性,但缺响应正文就验不了响应有没有被改）"></textarea>
+    <textarea class="pastebox" id="pasteInput" placeholder="流式请求：粘贴从 event: message_start 到末尾 event: tee.proof 的整段 response.sse。&#10;非流式请求：粘贴完整 multipart/mixed response.multipart，或粘贴顶层带 proof 的 application/json 响应。&#10;（只粘 tee.proof 那段也能验真实性,但缺响应正文就验不了响应有没有被改）"></textarea>
     <div class="cta"><button id="play">▶ 开始验证</button></div>
     <div class="chips">
       <span class="chip" id="chip-bundle">响应材料 未载入</span>
@@ -551,7 +551,7 @@
       <span class="hint load-msg" id="loadMsg"></span>
       <button class="proofbtn hidden" id="btn-proof" type="button" style="margin-left:auto">▸ 查看 proof 数据</button>
     </div>
-    <p class="note" id="captureHelp"><b>怎么拿到响应材料?</b> 流式调用保存整段 <code>response.sse</code>(末尾 <code>event: tee.proof</code>);非流式 proof 模式保存完整 <code>response.multipart</code>。</p>
+    <p class="note" id="captureHelp"><b>怎么拿到响应材料?</b> 流式调用保存整段 <code>response.sse</code>(末尾 <code>event: tee.proof</code>);非流式 proof 模式保存完整 <code>response.multipart</code> 或顶层带 <code>proof</code> 的 <code>response.json</code>。</p>
     <div class="example-actions">
       <button class="examplebtn" type="button" data-example="stream">查看请求示例</button>
     </div>
@@ -932,6 +932,85 @@ function parseLooseProofData(text){
     const o=JSON.parse(candidate);
     return isProofWire(o)?o:null;
   }catch{return null;}
+}
+function parseProofJsonEnvelopeBytes(bytes){
+  return parseProofJsonEnvelopeObject(bytes) || parseProofJsonEnvelopeObject(stripHttpResponseEnvelopeBytes(bytes));
+}
+function parseProofJsonEnvelopeObject(bytes){
+  const candidates=[];
+  for(const span of findJsonEnvelopeSpans(bytes)){
+    const candidate=bytes.subarray(span.start,span.end);
+    if(findBytes(candidate,te.encode('"proof"'),0)<0)continue;
+    const parsed=parseProofJsonEnvelopeObjectAt(candidate);
+    if(parsed)candidates.push(parsed);
+  }
+  return candidates.length===1?candidates[0]:null;
+}
+function parseProofJsonEnvelopeObjectAt(bytes){
+  if(!looksLikeJsonObject(bytes))return null;
+  let o;
+  try{o=JSON.parse(td.decode(bytes));}catch{return null;}
+  if(!o || typeof o!=='object' || Array.isArray(o) || !Object.prototype.hasOwnProperty.call(o,'proof'))return null;
+  const p=o.proof;
+  const unavailable=p&&typeof p==='object'&&p.type==='tee.proof_unavailable'?p:null;
+  if(!isProofWire(p)&&!unavailable)return null;
+  const body=Object.assign({},o);
+  delete body.proof;
+  return {bodyBytes:te.encode(JSON.stringify(body)),proof:isProofWire(p)?p:null,unavailable};
+}
+function stripHttpResponseEnvelopeBytes(bytes){
+  const stripped=stripHttpResponseEnvelopeAt(bytes,0);
+  if(stripped!==bytes)return stripped;
+  const marker=findBytes(bytes,te.encode('\nHTTP/'),0);
+  return marker>=0?stripHttpResponseEnvelopeAt(bytes,marker+1):bytes;
+}
+function stripHttpResponseEnvelopeAt(bytes,offset){
+  if(!startsWithBytes(bytes,te.encode('HTTP/'),offset))return bytes;
+  const headerEnd=multipartHeaderEnd(bytes,offset);
+  return headerEnd?bytes.subarray(headerEnd.bodyStart):bytes;
+}
+function looksLikeJsonObject(bytes){
+  for(const b of bytes){
+    if(isAsciiWhitespaceByte(b))continue;
+    return b===123;
+  }
+  return false;
+}
+function findJsonEnvelopeSpans(bytes){
+  const spans=[];
+  const stack=[];
+  let inString=false;
+  let escape=false;
+  for(let i=0;i<bytes.length;i++){
+    const b=bytes[i];
+    if(inString){
+      if(escape){escape=false;continue;}
+      if(b===92){escape=true;continue;}
+      if(b===34)inString=false;
+      continue;
+    }
+    if(b===34){inString=true;continue;}
+    if(b===123){
+      stack.push(i);
+      continue;
+    }
+    if(b===125&&stack.length>0){
+      const start=stack.pop();
+      spans.push({start,end:i+1});
+    }
+  }
+  return outermostJsonEnvelopeSpans(spans);
+}
+function outermostJsonEnvelopeSpans(spans){
+  const ordered=spans.sort((a,b)=>a.start-b.start||(b.end-b.start)-(a.end-a.start));
+  const outermost=[];
+  let coveredEnd=-1;
+  for(const span of ordered){
+    if(span.end<=coveredEnd)continue;
+    outermost.push(span);
+    coveredEnd=span.end;
+  }
+  return outermost;
 }
 function findBytes(bytes,needle,offset=0){
   if(!needle.length||needle.length>bytes.length)return -1;
@@ -1473,19 +1552,19 @@ const I18N={
     tmUser:'你', tmLocalVerify:'本地验证', tmRequest:'request', tmResponseProof:'◀ 响应+tee.proof',
     tmRelay:'中转站', tmUntrusted:'不可信', tmAnchor:'信任锚',
     tmEnclave:'TEE（Nitro Enclave）', tmMeasured:'可测量 · 密钥不外泄', tmOfficialApi:'官方 API', tmTls:'TEE 内校验 TLS',
-    step1:'存下响应材料(response.sse / response.multipart)', step2:'贴 / 拖进下面的框', step3:'点「验证」,看顶部结论',
+    step1:'存下响应材料(response.sse / response.multipart / response.json)', step2:'贴 / 拖进下面的框', step3:'点「验证」,看顶部结论',
     localBadge:'🔒 纯本地运行 · 全程无网络请求(DevTools「Network」可核)· 可断网用',
     howSummary:'技术上怎么做到的?',
     howNote:'验证 <span class="term" title="可信执行环境(Trusted Execution Environment)· 本页实例 = AWS Nitro Enclaves —— 代码与签名密钥跑在隔离硬件里,机器管理员不能取出密钥或伪造签名">TEE</span>(AWS Nitro Enclaves)的 attestation 链到 AWS 根、PCR0 匹配审计镜像;再用文档背书的公钥对<b>字段分解声明</b>(路由/来源明文可还原 + 请求体/响应体各自 sha256)做 Ed25519 验签。纯前端 WebCrypto,零依赖、无网络。',
     loadTitle:'把你收到的响应放进来',
-    dropText:'把 <b>response.sse</b> / <b>response.multipart</b> 文件拖到这里，或点此选择',
+    dropText:'把 <b>response.sse</b> / <b>response.multipart</b> / <b>response.json</b> 文件拖到这里，或点此选择',
     pasteLabel:'或直接粘贴完整响应(连 curl 命令一起贴也行)',
-    pastePlaceholder:'流式请求：粘贴从 event: message_start 到末尾 event: tee.proof 的整段 response.sse。\n非流式请求：粘贴完整 multipart/mixed response.multipart。\n（只粘 tee.proof 那段也能验真实性,但缺响应正文就验不了响应有没有被改）',
+    pastePlaceholder:'流式请求：粘贴从 event: message_start 到末尾 event: tee.proof 的整段 response.sse。\n非流式请求：粘贴完整 multipart/mixed response.multipart，或粘贴顶层带 proof 的 application/json 响应。\n（只粘 tee.proof 那段也能验真实性,但缺响应正文就验不了响应有没有被改）',
     play:'▶ 开始验证',
     bundleLoaded:'响应材料 已载入 ✓', proofOnlyLoaded:'仅 proof 已载入', bundleMissing:'响应材料 未载入',
     trustLoaded:'审计 PCR0 已载入 ✓', trustMissing:'审计 PCR0 未载入',
     proofButton:'▸ 查看 proof 数据',
-    captureHelp:'<b>怎么拿到响应材料?</b> 流式调用保存整段 <code>response.sse</code>(末尾 <code>event: tee.proof</code>);非流式 proof 模式保存完整 <code>response.multipart</code>。',
+    captureHelp:'<b>怎么拿到响应材料?</b> 流式调用保存整段 <code>response.sse</code>(末尾 <code>event: tee.proof</code>);非流式 proof 模式保存完整 <code>response.multipart</code> 或顶层带 <code>proof</code> 的 <code>response.json</code>。',
     exampleButton:'查看请求示例',
     dataTitle:'① 先把响应变成哈希 —— 签名盖住的就是这个响应哈希',
     beltTitle:'② 信任链 · 从你信的地基,一层层垒到你这条响应',
@@ -1533,6 +1612,8 @@ const I18N={
     multipartUnavailable:(code)=>'已识别 multipart 响应，但 proof 不可用：'+code,
     multipartInvalid:'⚠️ 已识别 multipart 响应，但 proof 段缺失或无效',
     multipartLoaded:(ignored,got)=>'已识别 multipart 响应'+ignored+(got?'，并从 proof 读取审计 PCR0':'，但未找到审计 PCR0'),
+    jsonEnvelopeUnavailable:(code)=>'已识别 JSON envelope 响应，但 proof 不可用：'+code,
+    jsonEnvelopeLoaded:(got)=>'已识别顶层 proof JSON 响应'+(got?'，并从 proof 读取审计 PCR0':'，但未找到审计 PCR0'),
     ignoredLeading:(n)=>'，已忽略粘贴开头 '+n+' 字节空行',
     proofOnlyLoad:(got)=>'已识别 tee.proof data'+(got?'，并从 proof 读取审计 PCR0':'，但未找到审计 PCR0')+'；缺少前面的 SSE 响应正文，不能完成验签',
     sseLoaded:(got)=>'已识别完整 SSE 响应'+(got?'，并从 proof 读取审计 PCR0':'，但未找到审计 PCR0'),
@@ -1569,19 +1650,19 @@ const I18N={
     tmUser:'You', tmLocalVerify:'local verification', tmRequest:'request', tmResponseProof:'◀ response + tee.proof',
     tmRelay:'Relay', tmUntrusted:'not trusted', tmAnchor:'trust anchor',
     tmEnclave:'TEE (Nitro Enclave)', tmMeasured:'measured · key stays sealed', tmOfficialApi:'Official API', tmTls:'TLS checked inside TEE',
-    step1:'Save the response material (response.sse / response.multipart)', step2:'Paste or drop it below', step3:'Click Verify and read the result',
+    step1:'Save the response material (response.sse / response.multipart / response.json)', step2:'Paste or drop it below', step3:'Click Verify and read the result',
     localBadge:'🔒 Local-only · no network requests (check DevTools Network) · works offline',
     howSummary:'How does this work?',
     howNote:'The page verifies the <span class="term" title="Trusted Execution Environment. Here: AWS Nitro Enclaves, where code and signing keys run in isolated hardware.">TEE</span> attestation chain to the AWS root, checks PCR0 against the audited image, then verifies the signed statement with Ed25519. The statement binds the route/source fields and request/response SHA-256 hashes. Pure frontend WebCrypto, no dependencies, no network.',
     loadTitle:'Drop in the response you received',
-    dropText:'Drop <b>response.sse</b> / <b>response.multipart</b> here, or click to choose',
+    dropText:'Drop <b>response.sse</b> / <b>response.multipart</b> / <b>response.json</b> here, or click to choose',
     pasteLabel:'Or paste the complete response, curl command included if needed',
-    pastePlaceholder:'Streaming request: paste the full response.sse from event: message_start through the final event: tee.proof.\nNon-streaming request: paste the complete multipart/mixed response.multipart.\n(Pasting only tee.proof can verify the proof, but without the response body the page cannot prove the visible response bytes were unchanged.)',
+    pastePlaceholder:'Streaming request: paste the full response.sse from event: message_start through the final event: tee.proof.\nNon-streaming request: paste the complete multipart/mixed response.multipart, or paste an application/json response with a top-level proof field.\n(Pasting only tee.proof can verify the proof, but without the response body the page cannot prove the visible response bytes were unchanged.)',
     play:'▶ Start verification',
     bundleLoaded:'Response material loaded ✓', proofOnlyLoaded:'Proof only loaded', bundleMissing:'Response material not loaded',
     trustLoaded:'Audit PCR0 loaded ✓', trustMissing:'Audit PCR0 not loaded',
     proofButton:'▸ View proof data',
-    captureHelp:'<b>How do I get response material?</b> For streaming calls, save the full <code>response.sse</code> ending with <code>event: tee.proof</code>. For non-streaming proof mode, save the complete <code>response.multipart</code>.',
+    captureHelp:'<b>How do I get response material?</b> For streaming calls, save the full <code>response.sse</code> ending with <code>event: tee.proof</code>. For non-streaming proof mode, save the complete <code>response.multipart</code> or a <code>response.json</code> with a top-level <code>proof</code> field.',
     exampleButton:'View request examples',
     dataTitle:'① Hash the response first: this is the response hash covered by the signature',
     beltTitle:'② Trust chain: from your trust anchors up to this response',
@@ -1629,6 +1710,8 @@ const I18N={
     multipartUnavailable:(code)=>'Recognized a multipart response, but proof is unavailable: '+code,
     multipartInvalid:'⚠️ Recognized a multipart response, but the proof part is missing or invalid',
     multipartLoaded:(ignored,got)=>'Recognized multipart response'+ignored+(got?', and loaded audit PCR0 from proof':', but audit PCR0 was not found'),
+    jsonEnvelopeUnavailable:(code)=>'Recognized a JSON envelope response, but proof is unavailable: '+code,
+    jsonEnvelopeLoaded:(got)=>'Recognized top-level proof JSON response'+(got?', and loaded audit PCR0 from proof':', but audit PCR0 was not found'),
     ignoredLeading:(n)=>', ignored '+n+' leading blank byte(s) from the pasted text',
     proofOnlyLoad:(got)=>'Recognized tee.proof data'+(got?', and loaded audit PCR0 from proof':', but audit PCR0 was not found')+'; missing the preceding SSE response body, so full signature verification cannot complete',
     sseLoaded:(got)=>'Recognized complete SSE response'+(got?', and loaded audit PCR0 from proof':', but audit PCR0 was not found'),
@@ -2083,13 +2166,29 @@ function loadSseBytes(bytes){
   refreshLoad();
   return true;
 }
+function loadJsonEnvelopeBytes(bytes){
+  const parsed=parseProofJsonEnvelopeBytes(bytes);
+  if(!parsed)return false;
+  if(!parsed.proof){
+    loaded=null; partialProof=null;
+    setLoadMsg(tt('jsonEnvelopeUnavailable',parsed.unavailable&&parsed.unavailable.code||parsed.unavailable&&parsed.unavailable.type||'tee.proof_unavailable'),'error');
+    refreshLoad();
+    return true;
+  }
+  loaded={v:2,responseBody_b64:bytesToB64(parsed.bodyBytes),proof:parsed.proof,_source:'json-envelope'};
+  partialProof=null;
+  const gotPcr0=adoptExpectedPcr0(parsed.proof);
+  setLoadMsg(tt('jsonEnvelopeLoaded',gotPcr0),gotPcr0?'ok':'error');
+  refreshLoad();
+  return true;
+}
 async function ingestBytes(bytes){
-  try{ if(await loadMultipartBytes(bytes))return; if(loadSseBytes(bytes))return; }catch(e){setLoadMsg(tt('proofParseFailed',e.message),'error');return;}
+  try{ if(await loadMultipartBytes(bytes))return; if(loadSseBytes(bytes))return; if(loadJsonEnvelopeBytes(bytes))return; }catch(e){setLoadMsg(tt('proofParseFailed',e.message),'error');return;}
   await ingest(td.decode(bytes));
 }
 async function ingest(text){
   const bytes=te.encode(text);
-  try{ if(await loadMultipartBytes(bytes))return; if(loadSseText(text))return; }catch(e){setLoadMsg(tt('proofParseFailed',e.message),'error');return;}
+  try{ if(await loadMultipartBytes(bytes))return; if(loadSseText(text))return; if(loadJsonEnvelopeBytes(bytes))return; }catch(e){setLoadMsg(tt('proofParseFailed',e.message),'error');return;}
   const looseProof=parseLooseProofData(text);
   if(looseProof){
     partialProof=looseProof; loaded=null;

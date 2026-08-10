@@ -1,0 +1,2662 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proof-of-Observation 校验工作台</title>
+<style>
+  :root {
+    --bg:#f4f6f8;
+    --panel:#ffffff;
+    --soft:#f8fafc;
+    --line:#d9e0ea;
+    --text:#172033;
+    --muted:#66758a;
+    --accent:#2563eb;
+    --ok:#15803d;
+    --warn:#b45309;
+    --bad:#dc2626;
+    --ok-bg:#ecfdf3;
+    --warn-bg:#fffbeb;
+    --bad-bg:#fff1f2;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font:15px/1.65 var(--sans);
+  }
+  .wrap {
+    max-width:1160px;
+    margin:0 auto;
+    padding:28px 18px 70px;
+  }
+  header {
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:18px;
+    margin-bottom:18px;
+  }
+  h1 {
+    margin:0 0 6px;
+    font-size:28px;
+    line-height:1.18;
+  }
+  .lead {
+    margin:0;
+    max-width:780px;
+    color:var(--muted);
+  }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .layout {
+    display:grid;
+    grid-template-columns:minmax(0, 1fr) 360px;
+    gap:16px;
+  }
+  .panel {
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:10px;
+    padding:18px;
+    box-shadow:0 1px 2px rgba(15,23,42,.04);
+  }
+  .panel + .panel { margin-top:16px; }
+  h2 {
+    margin:0 0 12px;
+    font-size:15px;
+  }
+  label {
+    display:block;
+    margin:12px 0 6px;
+    color:var(--muted);
+    font-size:13px;
+    font-weight:650;
+  }
+  textarea, input[type=text] {
+    width:100%;
+    border:1px solid var(--line);
+    border-radius:8px;
+    background:var(--soft);
+    color:var(--text);
+    padding:10px 11px;
+    font:13px/1.55 var(--mono);
+    outline:none;
+  }
+  textarea:focus, input[type=text]:focus {
+    border-color:var(--accent);
+    box-shadow:0 0 0 3px rgba(37,99,235,.12);
+  }
+  textarea.main { min-height:260px; resize:vertical; }
+  textarea.req { min-height:132px; resize:vertical; }
+  textarea.trust { min-height:150px; resize:vertical; }
+  .drop {
+    border:1.5px dashed var(--line);
+    border-radius:9px;
+    background:var(--soft);
+    padding:18px;
+    color:var(--muted);
+    cursor:pointer;
+    text-align:center;
+  }
+  .drop.hot {
+    border-color:var(--accent);
+    background:#eff6ff;
+    color:var(--text);
+  }
+  .row {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:12px;
+  }
+  .actions {
+    display:flex;
+    align-items:center;
+    gap:10px;
+    flex-wrap:wrap;
+    margin-top:14px;
+  }
+  button {
+    border:0;
+    background:var(--accent);
+    color:#fff;
+    border-radius:8px;
+    padding:10px 18px;
+    font-weight:750;
+    cursor:pointer;
+  }
+  button.secondary {
+    color:var(--text);
+    background:var(--panel);
+    border:1px solid var(--line);
+  }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .hint {
+    color:var(--muted);
+    font-size:13px;
+  }
+  .status {
+    display:none;
+    border-radius:10px;
+    padding:16px;
+    margin-bottom:16px;
+    border:1px solid var(--line);
+    background:var(--panel);
+  }
+  .status.show { display:block; }
+  .status.ok { background:var(--ok-bg); border-color:#bbf7d0; }
+  .status.warn { background:var(--warn-bg); border-color:#fde68a; }
+  .status.bad { background:var(--bad-bg); border-color:#fecaca; }
+  .status-title {
+    font-size:20px;
+    font-weight:850;
+    margin-bottom:6px;
+  }
+  .status.ok .status-title { color:var(--ok); }
+  .status.warn .status-title { color:var(--warn); }
+  .status.bad .status-title { color:var(--bad); }
+  .kv {
+    display:grid;
+    grid-template-columns:130px minmax(0,1fr);
+    gap:8px 12px;
+    margin-top:10px;
+  }
+  .k {
+    color:var(--muted);
+    font-size:12px;
+    font-weight:750;
+  }
+  .v {
+    font:12px/1.55 var(--mono);
+    word-break:break-all;
+  }
+  .checks {
+    display:grid;
+    gap:10px;
+  }
+  .check {
+    border:1px solid var(--line);
+    border-left-width:5px;
+    border-radius:9px;
+    background:var(--panel);
+    padding:12px 13px;
+  }
+  .check.ok { border-left-color:var(--ok); }
+  .check.warn { border-left-color:var(--warn); }
+  .check.bad { border-left-color:var(--bad); }
+  .check-head {
+    display:flex;
+    justify-content:space-between;
+    gap:12px;
+    align-items:flex-start;
+  }
+  .check-name { font-weight:800; }
+  .badge {
+    flex:none;
+    border-radius:999px;
+    padding:2px 9px;
+    font-size:12px;
+    font-weight:800;
+  }
+  .ok .badge { color:var(--ok); background:var(--ok-bg); }
+  .warn .badge { color:var(--warn); background:var(--warn-bg); }
+  .bad .badge { color:var(--bad); background:var(--bad-bg); }
+  .check-detail {
+    margin-top:5px;
+    color:var(--muted);
+    word-break:break-word;
+  }
+  .code {
+    font-family:var(--mono);
+    word-break:break-all;
+  }
+  pre {
+    white-space:pre-wrap;
+    overflow:auto;
+    max-height:360px;
+    background:var(--soft);
+    border:1px solid var(--line);
+    border-radius:8px;
+    padding:12px;
+    font:12px/1.55 var(--mono);
+  }
+  .hidden { display:none; }
+  .pill {
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    border:1px solid var(--line);
+    border-radius:999px;
+    padding:3px 9px;
+    color:var(--muted);
+    font-size:12px;
+  }
+  .side .panel { position:sticky; top:14px; }
+  @media (max-width:900px) {
+    header { display:block; }
+    .layout { grid-template-columns:1fr; }
+    .row { grid-template-columns:1fr; }
+    .side .panel { position:static; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Proof-of-Observation 校验工作台</h1>
+      <p class="lead">新页面独立于现有 <code>tee-verify.html</code>。把流式 SSE、非流式 multipart、顶层 <code>proof</code> JSON 或 bundle 粘贴进来，在浏览器本地完成解析和校验。</p>
+    </div>
+    <span class="pill">纯前端 · 不上传数据</span>
+  </header>
+
+  <div id="status" class="status"></div>
+
+  <div class="layout">
+    <main>
+      <section class="panel">
+        <h2>1. 载入响应材料</h2>
+        <div id="drop" class="drop">
+          拖入响应文件，或点击选择 <span class="code">.sse / .multipart / .json</span>
+          <input id="file" type="file" hidden>
+        </div>
+        <label for="capture">响应 capture</label>
+        <textarea id="capture" class="main" placeholder="支持：
+1. 流式 SSE：... data: [DONE]\n\nevent: tee.proof\ndata: {...}
+2. multipart/mixed：第一段响应体，第二段 tee.proof
+3. 非流式 JSON：原响应顶层增加 proof 字段
+4. bundle：{ &quot;responseBody_b64&quot;: &quot;...&quot;, &quot;proof&quot;: {...} }"></textarea>
+        <div class="actions">
+          <button id="verifyBtn">开始校验</button>
+          <button id="parseBtn" class="secondary" type="button">只解析</button>
+          <button id="clearBtn" class="secondary" type="button">清空结果</button>
+          <span id="parseMsg" class="hint"></span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>2. 可选：请求体绑定</h2>
+        <p class="hint">如果你有自己发出的原始请求体，贴在这里可额外校验请求字段级绑定。没有也能做 response-only 校验。</p>
+        <textarea id="requestBody" class="req" placeholder="{&quot;model&quot;:&quot;...&quot;,&quot;messages&quot;:[...]}"></textarea>
+      </section>
+
+      <section id="resultPanel" class="panel hidden">
+        <h2>校验项</h2>
+        <div id="checks" class="checks"></div>
+      </section>
+
+      <section id="proofPanel" class="panel hidden">
+        <h2>解析出的 proof</h2>
+        <pre id="proofDump"></pre>
+      </section>
+    </main>
+
+    <aside class="side">
+      <section class="panel">
+        <h2>信任输入</h2>
+        <label for="measurement">可信 PCR0</label>
+        <input id="measurement" type="text" placeholder="AWS Nitro / QingTian PCR0">
+        <label for="pcr8">可信 PCR8</label>
+        <input id="pcr8" type="text" placeholder="QingTian PCR8 / Aliyun sha256:8">
+        <label for="pcr9">可信 PCR9</label>
+        <input id="pcr9" type="text" placeholder="Aliyun sha256:9">
+        <label for="pcr11">可信 PCR11</label>
+        <input id="pcr11" type="text" placeholder="Aliyun sha256:11">
+        <label for="host">期望上游 host</label>
+        <input id="host" type="text" placeholder="例如 api.openai.com / dashscope.aliyuncs.com">
+        <label for="path">期望上游 path</label>
+        <input id="path" type="text" placeholder="例如 /v1/chat/completions / /openai/responses">
+        <label for="trustConfig">高级覆盖：trust.json</label>
+        <textarea id="trustConfig" class="trust" placeholder='默认已内置平台根信任锚；这里只在需要覆盖或补充 CA PEM 时填写，例如：
+{
+  "profile": "aliyun-vtpm",
+  "platformTrust": {
+    "mode": "cert-chain",
+    "rootCertificatesPem": ["-----BEGIN CERTIFICATE-----..."],
+    "intermediateCertificatesPem": ["-----BEGIN CERTIFICATE-----..."]
+  }
+}'></textarea>
+	    <div class="kv" id="summary">
+	      <div class="k">平台</div><div class="v">未解析</div>
+	      <div class="k">模式</div><div class="v">未解析</div>
+	      <div class="k">响应字节</div><div class="v">0</div>
+	      <div class="k">信任锚</div><div class="v">未解析</div>
+	      <div class="k">上游</div><div class="v">未解析</div>
+	    </div>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<script>
+const te = new TextEncoder();
+const td = new TextDecoder();
+const SIGNING_DOMAIN_V2 = 'tee-exchange-v2';
+const AWS_NITRO_ROOT_FP = '64:1A:03:21:A3:E2:44:EF:E4:56:46:31:95:D6:06:31:7E:D7:CD:CC:3C:17:56:E0:98:93:F3:C6:8F:79:BB:5B';
+const WOKEY_SSE_TRANSPORT_KEEPALIVE_V1 = te.encode(': wokey-transport-keepalive-v1\n\n');
+
+const $ = (id) => document.getElementById(id);
+const bytes = (s) => te.encode(s);
+const text = (b) => td.decode(b);
+const b64ToBytes = (b64) => {
+  const s = atob(String(b64).replace(/\s+/g, ''));
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+};
+const bytesToB64 = (u) => {
+  let s = '';
+  for (const b of u) s += String.fromCharCode(b);
+  return btoa(s);
+};
+const concat = (items) => {
+  const n = items.reduce((m, x) => m + x.length, 0);
+  const out = new Uint8Array(n);
+  let p = 0;
+  for (const item of items) { out.set(item, p); p += item.length; }
+  return out;
+};
+const hex = (u) => Array.from(u).map((b) => b.toString(16).padStart(2, '0')).join('');
+const sha256Bytes = async (b) => new Uint8Array(await crypto.subtle.digest('SHA-256', b));
+const sha256Hex = async (b) => hex(await sha256Bytes(b));
+const short = (s) => {
+  s = String(s ?? '');
+  return s.length > 22 ? `${s.slice(0, 12)}...${s.slice(-8)}` : s;
+};
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+
+let parsedMaterial = null;
+
+function isObject(v) {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+const REQUIRED_PROOF_STRING_FIELDS = [
+  'public_key',
+  'nonce',
+  'upstream_host',
+  'upstream_path',
+  'http_method',
+  'resp_content_type',
+  'request_body_sha256',
+  'response_body_sha256',
+  'signature',
+  'attestation',
+];
+
+function isProofWire(o) {
+  return isObject(o)
+    && typeof o.public_key === 'string'
+    && typeof o.nonce === 'string'
+    && typeof o.signature === 'string'
+    && typeof o.upstream_host === 'string'
+    && typeof o.request_body_sha256 === 'string'
+    && typeof o.response_body_sha256 === 'string';
+}
+
+function proofWireEnvelopeCheck(proof) {
+  if (!isObject(proof)) {
+    return { name:'proof wire', state:'bad', detail:'proof must be a JSON object' };
+  }
+  const errors = [];
+  if (proof.v !== 2) errors.push(`unsupported proof.v: ${String(proof.v)}; expected 2`);
+  if (proof.alg !== 'ed25519') errors.push(`unsupported proof.alg: ${String(proof.alg)}; expected ed25519`);
+  for (const field of REQUIRED_PROOF_STRING_FIELDS) {
+    const value = proof[field];
+    if (typeof value !== 'string') {
+      errors.push(`${field} must be string`);
+    } else if (bytes(value).length > 1024 * 1024) {
+      errors.push(`${field} exceeds 1048576 bytes`);
+    }
+  }
+  if (typeof proof.http_status !== 'number' || !Number.isInteger(proof.http_status) || proof.http_status < 100 || proof.http_status > 599) {
+    errors.push('http_status must be an integer HTTP status code');
+  }
+  if (proof.profile !== undefined && typeof proof.profile !== 'string') errors.push('profile must be string when present');
+  if (proof.evidence !== undefined && !isObject(proof.evidence)) errors.push('evidence must be an object when present');
+  if (proof.field_claims !== undefined && !isObject(proof.field_claims)) errors.push('field_claims must be an object when present');
+  if (typeof proof.request_body_sha256 === 'string' && !/^[0-9a-f]{64}$/.test(proof.request_body_sha256)) {
+    errors.push('request_body_sha256 must be lowercase hex sha256');
+  }
+  if (typeof proof.response_body_sha256 === 'string' && !/^[0-9a-f]{64}$/.test(proof.response_body_sha256)) {
+    errors.push('response_body_sha256 must be lowercase hex sha256');
+  }
+  return errors.length
+    ? { name:'proof wire', state:'bad', detail:errors.join('; ') }
+    : { name:'proof wire', state:'ok', detail:'proof.v == 2 且 proof.alg == ed25519' };
+}
+
+function startsWithBytes(data, prefix, offset = 0) {
+  if (offset < 0 || offset + prefix.length > data.length) return false;
+  for (let i = 0; i < prefix.length; i++) if (data[offset + i] !== prefix[i]) return false;
+  return true;
+}
+
+function findBytes(data, needle, offset = 0) {
+  if (!needle.length || needle.length > data.length) return -1;
+  for (let i = Math.max(0, offset); i <= data.length - needle.length; i++) {
+    if (startsWithBytes(data, needle, i)) return i;
+  }
+  return -1;
+}
+
+function findLastBytes(data, needle) {
+  if (!needle.length || needle.length > data.length) return -1;
+  for (let i = data.length - needle.length; i >= 0; i--) {
+    if (startsWithBytes(data, needle, i)) return i;
+  }
+  return -1;
+}
+
+function stripHttpEnvelope(data) {
+  const lineEnd = data.indexOf(10);
+  if (lineEnd < 0) return { body: data, contentType: undefined };
+  const first = text(data.subarray(0, lineEnd)).replace(/\r$/, '');
+  if (!/^HTTP\/\d(?:\.\d)?\s+\d{3}(?:\s|$)/i.test(first)) return { body: data, contentType: undefined };
+  const headerEnd = multipartHeaderEnd(data, 0);
+  if (!headerEnd) return { body: data, contentType: undefined };
+  const headers = text(data.subarray(0, headerEnd.headerEnd));
+  const contentType = headerContentType(headers);
+  return { body: data.subarray(headerEnd.bodyStart), contentType };
+}
+
+function headerContentType(headers) {
+  for (const line of headers.split(/\r?\n/)) {
+    const m = line.match(/^content-type:\s*(.+?)\s*$/i);
+    if (m) return m[1];
+  }
+  return undefined;
+}
+
+function parseSseProof(data) {
+  const markerLf = bytes('event: tee.proof\n');
+  const markerCrLf = bytes('event: tee.proof\r\n');
+  const idx = Math.max(findLastBytes(data, markerLf), findLastBytes(data, markerCrLf));
+  if (idx < 0) return null;
+  const eventBlock = data.subarray(idx);
+  const lines = text(eventBlock).split(/\r?\n/);
+  const dataLines = [];
+  let ended = false;
+  for (const line of lines) {
+    if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+    else if (line === '' && dataLines.length) { ended = true; break; }
+  }
+  if (!dataLines.length && !ended) return null;
+  const proof = JSON.parse(dataLines.join('\n'));
+  if (!isProofWire(proof)) throw new Error('tee.proof data 不是有效 proof');
+  return { body: data.subarray(0, idx), proof, source: 'sse' };
+}
+
+function consumeLineEnding(data, offset) {
+  if (data[offset] === 13 && data[offset + 1] === 10) return offset + 2;
+  if (data[offset] === 10) return offset + 1;
+  return -1;
+}
+
+function firstMultipartBoundary(data) {
+  let start = startsWithBytes(data, bytes('--'), 0) ? 0 : -1;
+  if (start < 0) {
+    for (let i = 0; i < data.length; i++) {
+      if (data[i] === 10 && data[i + 1] === 45 && data[i + 2] === 45) { start = i + 1; break; }
+    }
+  }
+  if (start < 0) return null;
+  const nl = data.indexOf(10, start);
+  if (nl < 0) return null;
+  let line = text(data.subarray(start, nl)).replace(/\r$/, '');
+  if (!line.startsWith('--') || line.endsWith('--')) return null;
+  return { boundary: line.slice(2), offset: start };
+}
+
+function multipartHeaderEnd(data, offset) {
+  const crlf = findBytes(data, bytes('\r\n\r\n'), offset);
+  const lf = findBytes(data, bytes('\n\n'), offset);
+  if (crlf >= 0 && (lf < 0 || crlf < lf)) return { headerEnd: crlf, bodyStart: crlf + 4 };
+  if (lf >= 0) return { headerEnd: lf, bodyStart: lf + 2 };
+  return null;
+}
+
+function readMultipartBoundary(data, boundaryBytes, offset) {
+  if (!startsWithBytes(data, boundaryBytes, offset)) return null;
+  let p = offset + boundaryBytes.length;
+  const closing = data[p] === 45 && data[p + 1] === 45;
+  if (closing) p += 2;
+  if (closing && p === data.length) return { closing, nextOffset: p };
+  const nextOffset = consumeLineEnding(data, p);
+  if (nextOffset < 0) return null;
+  return { closing, nextOffset };
+}
+
+function multipartContentLength(headers) {
+  for (const line of headers.split(/\r?\n/)) {
+    const m = line.match(/^content-length:\s*(\d+)\s*$/i);
+    if (!m) continue;
+    const n = Number.parseInt(m[1], 10);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+  }
+  return undefined;
+}
+
+function readMultipartPart(data, boundaryBytes, offset) {
+  const headerEnd = multipartHeaderEnd(data, offset);
+  if (!headerEnd) return null;
+  const headers = text(data.subarray(offset, headerEnd.headerEnd));
+  const length = multipartContentLength(headers);
+  const bodyStart = headerEnd.bodyStart;
+  let bodyEnd = -1;
+  let nextBoundaryOffset = -1;
+  if (length !== undefined) {
+    const expectedEnd = bodyStart + length;
+    const expectedNext = consumeLineEnding(data, expectedEnd);
+    if (expectedEnd <= data.length && expectedNext >= 0 && startsWithBytes(data, boundaryBytes, expectedNext)) {
+      bodyEnd = expectedEnd;
+      nextBoundaryOffset = expectedNext;
+    }
+  }
+  if (bodyEnd < 0) {
+    const boundaryText = text(boundaryBytes);
+    const crlfBoundary = findBytes(data, bytes('\r\n' + boundaryText), bodyStart);
+    const lfBoundary = findBytes(data, bytes('\n' + boundaryText), bodyStart);
+    let marker = -1;
+    let markerLength = 0;
+    if (crlfBoundary >= 0 && (lfBoundary < 0 || crlfBoundary <= lfBoundary)) {
+      marker = crlfBoundary;
+      markerLength = 2;
+    } else if (lfBoundary >= 0) {
+      marker = lfBoundary;
+      markerLength = 1;
+    }
+    if (marker < 0) return null;
+    bodyEnd = marker;
+    nextBoundaryOffset = marker + markerLength;
+  }
+  return { headers, body: data.subarray(bodyStart, bodyEnd), nextBoundaryOffset };
+}
+
+function stripBoundarySeparatorLineEnding(data) {
+  if (data.length >= 2 && data[data.length - 2] === 13 && data[data.length - 1] === 10) return data.subarray(0, data.length - 2);
+  if (data.length >= 1 && data[data.length - 1] === 10) return data.subarray(0, data.length - 1);
+  return data;
+}
+
+function isProofPartHeaders(headers) {
+  return /content-disposition:\s*[^;\r\n]*(?:;\s*)?name="?(?:proof|tee\.proof)"?/i.test(headers)
+    || /content-type:\s*application\/[^;\r\n]*proof[^;\r\n]*/i.test(headers);
+}
+
+function parseMultipart(data, contentType) {
+  const first = firstMultipartBoundary(data);
+  const fromContentType = contentType?.match(/boundary="?([^";]+)"?/i)?.[1];
+  const boundary = fromContentType || first?.boundary;
+  if (!boundary || !first) return null;
+  const boundaryBytes = bytes('--' + boundary);
+  if (first.offset > 0) {
+    const tail = parseMultipartTail(data, boundaryBytes, first.offset);
+    if (tail) return tail;
+  }
+  const capture = data.subarray(first.offset);
+  const firstBoundary = readMultipartBoundary(capture, boundaryBytes, 0);
+  if (!firstBoundary || firstBoundary.closing) return null;
+  const responsePart = readMultipartPart(capture, boundaryBytes, firstBoundary.nextOffset);
+  if (!responsePart) return null;
+  const proofBoundary = readMultipartBoundary(capture, boundaryBytes, responsePart.nextBoundaryOffset);
+  if (!proofBoundary || proofBoundary.closing) return null;
+  const proofPart = readMultipartPart(capture, boundaryBytes, proofBoundary.nextOffset);
+  if (!proofPart) return null;
+  const closing = readMultipartBoundary(capture, boundaryBytes, proofPart.nextBoundaryOffset);
+  if (!closing?.closing) return null;
+  const proof = JSON.parse(text(proofPart.body));
+  if (!isProofWire(proof)) throw new Error('multipart proof part 不是有效 proof');
+  return { body: responsePart.body, proof, source: 'multipart' };
+}
+
+function parseMultipartTail(data, boundaryBytes, boundaryOffset) {
+  const capture = data.subarray(boundaryOffset);
+  const firstBoundary = readMultipartBoundary(capture, boundaryBytes, 0);
+  if (!firstBoundary || firstBoundary.closing) return null;
+  const proofPart = readMultipartPart(capture, boundaryBytes, firstBoundary.nextOffset);
+  if (!proofPart || !isProofPartHeaders(proofPart.headers)) return null;
+  const closing = readMultipartBoundary(capture, boundaryBytes, proofPart.nextBoundaryOffset);
+  if (!closing?.closing) return null;
+  const proof = JSON.parse(text(proofPart.body));
+  if (!isProofWire(proof)) throw new Error('multipart tail proof part 不是有效 proof');
+  return { body: stripBoundarySeparatorLineEnding(data.subarray(0, boundaryOffset)), proof, source: 'multipart-tail' };
+}
+
+async function normalizeResponseBody(data, proof, source) {
+  if (!proof?.response_body_sha256 || !/^[a-f0-9]{64}$/i.test(proof.response_body_sha256)) return { body: data, note: '' };
+  const expected = proof.response_body_sha256.toLowerCase();
+  if (await sha256Hex(data) === expected) return { body: data, note: '' };
+  if (source === 'sse') {
+    let offset = 0;
+    let count = 0;
+    while (startsWithBytes(data, WOKEY_SSE_TRANSPORT_KEEPALIVE_V1, offset)) {
+      offset += WOKEY_SSE_TRANSPORT_KEEPALIVE_V1.length;
+      count += 1;
+      const candidate = data.subarray(offset);
+      if (await sha256Hex(candidate) === expected) {
+        return { body: candidate, note: `已剥离 ${count} 条传输 keepalive` };
+      }
+    }
+  }
+  if (source === 'multipart-tail') {
+    let offset = 0;
+    for (;;) {
+      const next = consumeLeadingBlankLine(data, offset);
+      if (next <= offset) break;
+      offset = next;
+      const candidate = data.subarray(offset);
+      if (await sha256Hex(candidate) === expected) return { body: candidate, note: `已剥离 ${offset} 字节前置空行` };
+    }
+  }
+  return { body: data, note: '' };
+}
+
+function consumeLeadingBlankLine(data, offset) {
+  let p = offset;
+  while (data[p] === 32 || data[p] === 9) p++;
+  if (data[p] === 13 && data[p + 1] === 10) return p + 2;
+  if (data[p] === 10) return p + 1;
+  return -1;
+}
+
+function parseJsonMaterial(rawText) {
+  const obj = JSON.parse(rawText.trim());
+  if (isProofWire(obj)) return { body: new Uint8Array(), proof: obj, source: 'proof-only' };
+  if (isProofWire(obj.proof) && typeof obj.responseBody_b64 === 'string') {
+    return { body: b64ToBytes(obj.responseBody_b64), proof: obj.proof, source: 'bundle' };
+  }
+  if (isProofWire(obj.proof) && typeof obj.response_body_b64 === 'string') {
+    return { body: b64ToBytes(obj.response_body_b64), proof: obj.proof, source: 'bundle' };
+  }
+  if (isProofWire(obj.proof)) {
+    const copy = Array.isArray(obj) ? obj.slice() : { ...obj };
+    delete copy.proof;
+    return { body: bytes(JSON.stringify(copy)), proof: obj.proof, source: 'json-top-level-proof' };
+  }
+  const dataMatch = rawText.match(/^data:\s*(\{[\s\S]*\})\s*$/m);
+  if (dataMatch) {
+    const proof = JSON.parse(dataMatch[1]);
+    if (isProofWire(proof)) return { body: new Uint8Array(), proof, source: 'proof-only' };
+  }
+  return null;
+}
+
+async function parseCapture(input) {
+  const data = typeof input === 'string' ? bytes(input) : input;
+  const envelope = stripHttpEnvelope(data);
+  const body = envelope.body;
+  const sse = parseSseProof(body);
+  if (sse) {
+    const norm = await normalizeResponseBody(sse.body, sse.proof, sse.source);
+    return { ...sse, body: norm.body, note: norm.note };
+  }
+  const multipart = parseMultipart(body, envelope.contentType);
+  if (multipart) {
+    const norm = await normalizeResponseBody(multipart.body, multipart.proof, multipart.source);
+    return { ...multipart, body: norm.body, note: norm.note };
+  }
+  try {
+    const json = parseJsonMaterial(text(body));
+    if (json) return json;
+  } catch {}
+  throw new Error('未识别到 tee.proof。请粘贴完整 SSE、multipart、顶层 proof JSON 或 bundle。');
+}
+
+function platformIdFromProfile(value) {
+  const profile = normalizeProfileName(value);
+  if (profile === 'nitro') return 'aws';
+  if (profile === 'aliyun-vtpm') return 'aliyun';
+  if (profile === 'qingtian') return 'huawei';
+  const s = String(value || '').toLowerCase();
+  if (s.includes('aws') || s.includes('nitro') || s === 'pcr0') return 'aws';
+  if (s.includes('aliyun') || s.includes('alibaba') || s.includes('vtpm')) return 'aliyun';
+  if (s.includes('huawei') || s.includes('qingtian')) return 'huawei';
+  return 'unknown';
+}
+
+function detectPlatform(proof, trust = {}) {
+  const source = declaredPlatformSources(proof, trust)[0];
+  if (source) return source.platform;
+  if (typeof proof.attestation === 'string') return 'aws';
+  return 'unknown';
+}
+
+function declaredPlatformSources(proof, trust = {}) {
+  const entries = [
+    ['tee_platform', proof.tee_platform],
+    ['tee_profile', proof.tee_profile],
+    ['profile', proof.profile],
+    ['trust.profile', trust.profile],
+    ['evidence.profile', proof.evidence?.profile],
+    ['measurement_type', proof.measurement_type],
+  ];
+  const out = [];
+  for (const [field, value] of entries) {
+    const platform = platformIdFromProfile(value);
+    if (platform !== 'unknown') out.push({ field, value, platform });
+  }
+  return out;
+}
+
+function evidenceProfile(platform) {
+  if (platform === 'aliyun') return 'aliyun-vtpm';
+  if (platform === 'huawei') return 'qingtian';
+  if (platform === 'aws') return 'nitro';
+  return 'unknown';
+}
+
+function normalizeProfileName(value) {
+  const s = String(value || '').toLowerCase();
+  if (s === 'aws-nitro' || s === 'aws_nitro' || s === 'nitro' || s === 'aws') return 'nitro';
+  if (s === 'aliyun-vtpm' || s === 'aliyun_vtpm' || s === 'aliyun-enclave' || s === 'aliyun' || s === 'alibaba') return 'aliyun-vtpm';
+  if (s === 'qingtian' || s === 'huawei-qingtian' || s === 'huawei_qingtian' || s === 'huawei') return 'qingtian';
+  return s;
+}
+
+function normalizeHex(value) {
+  return String(value || '').replace(/^0x/i, '').replace(/[:\s]/g, '').toLowerCase();
+}
+
+const ALIYUN_TPM_ROOT_CA_PEM = `-----BEGIN CERTIFICATE-----
+MIIDkDCCAnigAwIBAgIBATANBgkqhkiG9w0BAQwFADBYMQswCQYDVQQGEwJDTjEP
+MA0GA1UECgwGQWxpeXVuMRswGQYDVQQLDBJBbGl5dW4gVFBNIFJvb3QgQ0ExGzAZ
+BgNVBAMMEkFsaXl1biBUUE0gUm9vdCBDQTAgFw0yMTA5MTYwNTQ2NDFaGA8yMDMw
+MTIzMTIzNTk1OVowWDELMAkGA1UEBhMCQ04xDzANBgNVBAoMBkFsaXl1bjEbMBkG
+A1UECwwSQWxpeXVuIFRQTSBSb290IENBMRswGQYDVQQDDBJBbGl5dW4gVFBNIFJv
+b3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDLV/ZSl0NlLmTD
+p0nfeQXCm2mp7xxJkIl5ZJJtH8ypkTU+es9o4KEv3Vuo1SYOUxllQLlRPdIgnSTQ
+G+MjwpyFzl7UaOkTLd6AEChjVI0sjU8f4OjWVY9s9PZHqlQFpqgFrDFiyNxvjz0Y
+eXV/jQHX8+0YfB4ShVJsvkcWtm0Xz8Yd66vAwiVDen1M59EOeUY2dl7CKzWBVb2s
+U6yBrduQ9pO0cDZF05wdGltnf9sKwsH+D9dVXmEczXsCI2bK+GW2SjwAodyc98zG
+SGmLjmy+oIxZ5heN6J9LGEI909h/v6I3MT673VayfiZaIBuvRaKHatmpfasapCm7
+qfYgWvlTAgMBAAGjYzBhMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/
+MB0GA1UdDgQWBBRYM3qc0OjDYSFnQ5E+/CF9Y4GbHTAfBgNVHSMEGDAWgBRYM3qc
+0OjDYSFnQ5E+/CF9Y4GbHTANBgkqhkiG9w0BAQwFAAOCAQEAtM69xrWNBoXwRkWY
+IF7vCo9/2erjzqr6SCfiln25w+8ZNPXwOjAznrzlPxdZWJ88X0WpirFhJ3KX3JEB
+vjZIp10cpq6Dw9xFgsLzMIAlRuOP37aLICRp7DDl1WIILPDiQst2bOzuZrwWXabR
+Z3zBO+e+cwm0BZnDSRHIbRedsX1evcUISpW6WXLXubOzWPUtoX9qKRS804szXI5v
+9fK6l4+tbCqRJXD5So9+UYwKj8H+Qdql4f0ti95eAHRto3yzONYw1pDPuX0IpYLz
+y9tNYrDHlg/2pn4eeQQDg1dNsJPKcXR1duogCpq5nQ4O3U9S8//AEzzYynpaL9hO
+mEGpYg==
+-----END CERTIFICATE-----`;
+
+const ALIYUN_TPM_EKMF_CA_PEM = `-----BEGIN CERTIFICATE-----
+MIIEZDCCA0ygAwIBAgIBAjANBgkqhkiG9w0BAQwFADBYMQswCQYDVQQGEwJDTjEP
+MA0GA1UECgwGQWxpeXVuMRswGQYDVQQLDBJBbGl5dW4gVFBNIFJvb3QgQ0ExGzAZ
+BgNVBAMMEkFsaXl1biBUUE0gUm9vdCBDQTAgFw0yMTA5MTYwNTQ4MjRaGA8yMDMw
+MTIzMTIzNTk1OVowbzELMAkGA1UEBhMCQ04xDzANBgNVBAoMBkFsaXl1bjEyMDAG
+A1UECwwpQWxpeXVuIFRQTSBFbmRvcnNlbWVudCBLZXkgTWFudWZhY3R1cmUgQ0Ex
+GzAZBgNVBAMMEkFsaXl1biBUUE0gRUtNRiBDQTCCASIwDQYJKoZIhvcNAQEBBQAD
+ggEPADCCAQoCggEBAOVZJCvDrDJHcXYRv9PFwwUTB4GoOkuaw7R/eam8V8BOA4jr
+31ACFImfudSnvPY0L2kF9Bsh9HHN8F4LCk67EBTNF0aOPyY9qYDMyUqlToIQzwhN
+gptaoLDkvmKgVjfQzW01hZeU4Wv/n+5nvNH8+XDnU72Ay+ythsf9ohq12D8u7bwb
+7NaYkHM5H/zVm38p6cDSsoO7sMol3d3fXv9FftG/fpOvLXXRh/B99Ln3Rr/05HQy
+mg+aDdxDokNsmw1YGjxvOGJnmvm8Kkf2A7KLSEElOYVXxqWESg20HRniJKpuj2qV
+Bn1gS07Mv250UpNXOrkUDoVUNSx1UaVEff4h4ncCAwEAAaOCAR4wggEaMGAGCCsG
+AQUFBwEBBFQwUjBQBggrBgEFBQcwAoZEaHR0cHM6Ly9hbGl5dW4tdHBtLWNhLm9z
+cy1jbi1iZWlqaW5nLmFsaXl1bmNzLmNvbS9wa2kwMDEvcm9vdC1jYS5jcnQwVQYD
+VR0fBE4wTDBKoEigRoZEaHR0cHM6Ly9hbGl5dW4tdHBtLWNhLm9zcy1jbi1iZWlq
+aW5nLmFsaXl1bmNzLmNvbS9wa2kwMDEvcm9vdC1jYS5jcmwwDgYDVR0PAQH/BAQD
+AgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFIGqmmSSiP8HBwdQms+XTv9m
+WVDIMB8GA1UdIwQYMBaAFFgzepzQ6MNhIWdDkT78IX1jgZsdMA0GCSqGSIb3DQEB
+DAUAA4IBAQCeAwSUF4icjyOBmpXDIS2ebmzjGAh8Laos3YcdCjCpfx92gzeottSO
+2Wi45lNF5ltB0TU0ESEElRO3Iwbi6E8YIknMquC5nO3GcpPHB667O5MZ1Lhmvx0D
+gs3j7OAKuiund7D6ERuE5u0ICzLcvkpw2bc5Yhbkt1JcKpTYKv5V9MdiZvpUZyx7
+j3DVEjOXrsyrh2l9Zk6CG+DpT22kUh4G6YNuoeBfJAnWN2AMKOzNlbBqBmBb0g7J
+LDThTXwdjOxhzuE215DARLRSgIl3MTZ9c92vRMyXgVsHrn/039i2Lx3zZd71L8Aq
+Jt4Eufnz78SXN2e2/PV74sr9XIKvsVAa
+-----END CERTIFICATE-----`;
+
+const BUILTIN_PLATFORM_TRUST = {
+  aliyun: {
+    profile: 'aliyun-vtpm',
+    requirePlatformTrust: true,
+    platformTrust: {
+      mode: 'cert-chain',
+      rootCertificatesPem: [ALIYUN_TPM_ROOT_CA_PEM],
+      intermediateCertificatesPem: [ALIYUN_TPM_EKMF_CA_PEM],
+      rootFingerprintsSha256: [
+        '870d6e888c3531b69983f0aebb7b9802aa097065ae01a825913ad398ce96252f',
+      ],
+      intermediateFingerprintsSha256: [
+        '141805f04cd9b89bfbcd30cb792d5ca3a0a2382db6ee35720e6e27e4189e43a0',
+      ],
+      enclaveSubjectCnPattern: '^i-[A-Za-z0-9][A-Za-z0-9-]*-enclave-[0-9]+$',
+      revocation: { required:false, method:'crl' },
+    },
+  },
+  huawei: {
+    profile: 'qingtian',
+    platformTrust: {
+      mode: 'cert-chain',
+      trustAnchorId: 'huawei-qingtian-prod',
+      rootFingerprintsSha256: [
+        'F23443B4EB52A70719DF49BDDA0E57BB25F1C04530885DBECDBDE241C8C4F581',
+      ],
+      revocation: { required:false, method:'crl-or-ocsp', checkedExternally:false },
+    },
+  },
+};
+
+function mergePlainObjects(base, override) {
+  const out = { ...(isObject(base) ? base : {}) };
+  if (!isObject(override)) return out;
+  for (const [key, value] of Object.entries(override)) {
+    if (isObject(value) && isObject(out[key])) out[key] = mergePlainObjects(out[key], value);
+    else if (Array.isArray(value) && value.length === 0 && Array.isArray(out[key]) && out[key].length > 0) continue;
+    else out[key] = value;
+  }
+  return out;
+}
+
+function parseTrustConfig(raw, platform, opts = {}) {
+  const trimmed = String(raw || '').trim();
+  const userTrust = trimmed ? JSON.parse(trimmed) : {};
+  if (!isObject(userTrust)) throw new Error('trust.json 必须是 JSON object');
+  const builtIn = BUILTIN_PLATFORM_TRUST[platform] || {};
+  const trust = mergePlainObjects(builtIn, userTrust);
+  if (!trust.profile) trust.profile = evidenceProfile(platform);
+  const pcr0 = normalizeHex(opts.pcr0);
+  const pcr8 = normalizeHex(opts.pcr8);
+  const pcr9 = normalizeHex(opts.pcr9);
+  const pcr11 = normalizeHex(opts.pcr11);
+  if (pcr0 && (platform === 'aws' || platform === 'huawei') && !trust.expectedPcr0) trust.expectedPcr0 = pcr0;
+  if (platform === 'huawei') {
+    if (pcr8 && !trust.expectedPcr8) trust.expectedPcr8 = pcr8;
+    trust.expectedPcrs = mergePlainObjects({ ...(pcr0 ? { 'sha384:0': pcr0 } : {}), ...(pcr8 ? { 'sha384:8': pcr8 } : {}) }, trust.expectedPcrs);
+  }
+  if (platform === 'aliyun') {
+    const quickPcrs = {};
+    if (pcr8) quickPcrs['sha256:8'] = pcr8;
+    if (pcr9) quickPcrs['sha256:9'] = pcr9;
+    if (pcr11) quickPcrs['sha256:11'] = pcr11;
+    trust.expectedPcrs = mergePlainObjects(quickPcrs, trust.expectedPcrs);
+  }
+  return trust;
+}
+
+function parseTrustInput(raw) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return {};
+  const trust = JSON.parse(trimmed);
+  if (!isObject(trust)) throw new Error('trust.json 必须是 JSON object');
+  return trust;
+}
+
+function checkFromEvidence(c) {
+  return { name: c.name, state: c.ok ? 'ok' : 'bad', detail: c.detail };
+}
+
+function pathNoQuery(path) {
+  const s = String(path || '');
+  const q = s.indexOf('?');
+  return q >= 0 ? s.slice(0, q) : s;
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
+  const keys = Object.keys(value).sort();
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + canonicalJson(value[k])).join(',') + '}';
+}
+
+async function fieldClaimsHash(fieldClaims) {
+  return sha256Hex(bytes(canonicalJson(fieldClaims)));
+}
+
+async function buildV2Statement(proof) {
+  const lines = [
+    SIGNING_DOMAIN_V2,
+    'nonce=' + proof.nonce,
+    'upstream-host=' + String(proof.upstream_host || '').toLowerCase(),
+    'upstream-path=' + pathNoQuery(proof.upstream_path),
+    'http-method=' + String(proof.http_method || '').toUpperCase(),
+    'http-status=' + String(proof.http_status),
+    'resp-content-type=' + String(proof.resp_content_type || ''),
+    'request-body-sha256=' + proof.request_body_sha256,
+    'response-body-sha256=' + proof.response_body_sha256,
+  ];
+  if (proof.field_claims) lines.push('field-claims-sha256=' + await fieldClaimsHash(proof.field_claims));
+  return bytes(lines.map((l) => l + '\n').join(''));
+}
+
+async function importEd25519Spki(b64) {
+  return crypto.subtle.importKey('spki', b64ToBytes(b64), { name:'Ed25519' }, false, ['verify']);
+}
+
+async function verifyEd25519(keyB64, sigB64, message) {
+  const key = await importEd25519Spki(keyB64);
+  return crypto.subtle.verify({ name:'Ed25519' }, key, b64ToBytes(sigB64), message);
+}
+
+const CBOR_BREAK = Symbol('cbor.break');
+const MAX_CBOR_DEPTH = 32;
+const MAX_CBOR_CONTAINER_ITEMS = 1024;
+const MAX_CBOR_STRING_BYTES = 256 * 1024;
+
+function cborNeed(b, p, n) {
+  if (!Number.isSafeInteger(p) || !Number.isSafeInteger(n) || p < 0 || n < 0 || p + n > b.length) {
+    throw new Error('truncated CBOR length/value');
+  }
+}
+
+function cborReadAdditional(b, p, ai) {
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  if (ai < 24) return [ai, p];
+  if (ai === 24) { cborNeed(b, p, 1); return [b[p], p + 1]; }
+  if (ai === 25) { cborNeed(b, p, 2); return [dv.getUint16(p), p + 2]; }
+  if (ai === 26) { cborNeed(b, p, 4); return [dv.getUint32(p), p + 4]; }
+  if (ai === 27) {
+    cborNeed(b, p, 8);
+    const len = Number(dv.getBigUint64(p));
+    if (!Number.isSafeInteger(len)) throw new Error('CBOR uint64 length is not safe integer');
+    return [len, p + 8];
+  }
+  if (ai === 31) throw new Error('unexpected indefinite-length marker');
+  throw new Error('reserved CBOR additional information');
+}
+
+function cborBoundedSlice(b, p, len, kind) {
+  if (len > MAX_CBOR_STRING_BYTES) throw new Error(`${kind} too large`);
+  cborNeed(b, p, len);
+  return b.subarray(p, p + len);
+}
+
+function cborDecodeIndefinite(b, p, mt, depth) {
+  switch (mt) {
+    case 2: {
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        let chunk; [chunk, p] = cborDec(b, p, depth + 1, true);
+        if (chunk === CBOR_BREAK) return [concat(chunks), p];
+        if (!(chunk instanceof Uint8Array)) throw new Error('non-bytes chunk in indefinite byte string');
+        total += chunk.length;
+        if (chunks.length >= MAX_CBOR_CONTAINER_ITEMS || total > MAX_CBOR_STRING_BYTES) throw new Error('CBOR byte string too large');
+        chunks.push(chunk);
+      }
+    }
+    case 3: {
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        let chunk; [chunk, p] = cborDec(b, p, depth + 1, true);
+        if (chunk === CBOR_BREAK) return [chunks.join(''), p];
+        if (typeof chunk !== 'string') throw new Error('non-text chunk in indefinite text string');
+        total += bytes(chunk).length;
+        if (chunks.length >= MAX_CBOR_CONTAINER_ITEMS || total > MAX_CBOR_STRING_BYTES) throw new Error('CBOR text string too large');
+        chunks.push(chunk);
+      }
+    }
+    case 4: {
+      const a = [];
+      for (;;) {
+        let v; [v, p] = cborDec(b, p, depth + 1, true);
+        if (v === CBOR_BREAK) return [a, p];
+        if (a.length >= MAX_CBOR_CONTAINER_ITEMS) throw new Error('CBOR array too large');
+        a.push(v);
+      }
+    }
+    case 5: {
+      const m = {};
+      let count = 0;
+      for (;;) {
+        let k, v; [k, p] = cborDec(b, p, depth + 1, true);
+        if (k === CBOR_BREAK) return [m, p];
+        [v, p] = cborDec(b, p, depth + 1);
+        if (count >= MAX_CBOR_CONTAINER_ITEMS) throw new Error('CBOR map too large');
+        m[k] = v;
+        count++;
+      }
+    }
+    default:
+      throw new Error('invalid indefinite-length CBOR item');
+  }
+}
+
+function cborDec(b, p, depth = 0, allowBreak = false) {
+  if (depth > MAX_CBOR_DEPTH) throw new Error('CBOR nesting too deep');
+  cborNeed(b, p, 1);
+  if (b[p] === 0xff) {
+    if (allowBreak) return [CBOR_BREAK, p + 1];
+    throw new Error('unexpected CBOR break');
+  }
+  const ib = b[p], mt = ib >> 5, ai = ib & 0x1f; p++;
+  if (ai === 31) return cborDecodeIndefinite(b, p, mt, depth);
+  let len; [len, p] = cborReadAdditional(b, p, ai);
+  switch (mt) {
+    case 0: return [len, p];
+    case 1: return [-1 - len, p];
+    case 2:
+      return [cborBoundedSlice(b, p, len, 'CBOR byte string'), p + len];
+    case 3:
+      return [text(cborBoundedSlice(b, p, len, 'CBOR text string')), p + len];
+    case 4: {
+      if (len > MAX_CBOR_CONTAINER_ITEMS) throw new Error('CBOR array too large');
+      const a = [];
+      for (let i = 0; i < len; i++) { let v; [v, p] = cborDec(b, p, depth + 1); a.push(v); }
+      return [a, p];
+    }
+    case 5: {
+      if (len > MAX_CBOR_CONTAINER_ITEMS) throw new Error('CBOR map too large');
+      const m = {};
+      for (let i = 0; i < len; i++) { let k, v; [k, p] = cborDec(b, p, depth + 1); [v, p] = cborDec(b, p, depth + 1); m[k] = v; }
+      return [m, p];
+    }
+    case 6: return cborDec(b, p, depth + 1);
+    case 7:
+      if (ai === 20) return [false, p];
+      if (ai === 21) return [true, p];
+      if (ai === 22) return [null, p];
+      throw new Error(`unsupported CBOR simple/float ai=${ai}`);
+    default:
+      throw new Error('unsupported CBOR major type ' + mt);
+  }
+}
+
+function cborDecodeComplete(b, label = 'CBOR') {
+  const [value, offset] = cborDec(b, 0);
+  if (offset !== b.length) throw new Error(`${label} has trailing bytes`);
+  return value;
+}
+
+function cborBstr(b) {
+  if (b.length < 24) return concat([Uint8Array.of(0x40 | b.length), b]);
+  if (b.length < 256) return concat([Uint8Array.of(0x58, b.length), b]);
+  if (b.length < 65536) {
+    const h = new Uint8Array(3);
+    h[0] = 0x59;
+    new DataView(h.buffer).setUint16(1, b.length);
+    return concat([h, b]);
+  }
+  const h = new Uint8Array(5);
+  h[0] = 0x5a;
+  new DataView(h.buffer).setUint32(1, b.length);
+  return concat([h, b]);
+}
+
+function cborText(s) {
+  const b = bytes(s);
+  if (b.length >= 24) throw new Error('internal cbor text too long');
+  return concat([Uint8Array.of(0x60 | b.length), b]);
+}
+
+function der(b, p) {
+  const tag = b[p];
+  let i = p + 1;
+  let len = b[i]; i++;
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    len = 0;
+    for (let k = 0; k < n; k++) { len = (len * 256) + b[i]; i++; }
+  }
+  return { tag, start:p, cstart:i, cend:i + len, end:i + len };
+}
+
+function derChildren(b, t) {
+  const out = [];
+  let p = t.cstart;
+  while (p < t.cend) { const c = der(b, p); out.push(c); p = c.end; }
+  return out;
+}
+
+function ecdsaDerToRaw(d, size) {
+  const seq = der(d, 0);
+  const [r, s] = derChildren(d, seq);
+  const norm = (t) => {
+    let v = d.subarray(t.cstart, t.cend);
+    while (v.length > size && v[0] === 0) v = v.subarray(1);
+    const o = new Uint8Array(size);
+    o.set(v, size - v.length);
+    return o;
+  };
+  return concat([norm(r), norm(s)]);
+}
+
+function derTime(b, t) {
+  const s = text(b.subarray(t.cstart, t.cend));
+  let i = 0, y;
+  if ((t.tag & 0xff) === 0x17) { y = +s.slice(0, 2); y += y < 50 ? 2000 : 1900; i = 2; }
+  else { y = +s.slice(0, 4); i = 4; }
+  return Date.UTC(y, (+s.slice(i, i + 2)) - 1, +s.slice(i + 2, i + 4), +s.slice(i + 4, i + 6), +s.slice(i + 6, i + 8), +s.slice(i + 8, i + 10));
+}
+
+function derOid(b, t) {
+  const v = b.subarray(t.cstart, t.cend);
+  if (!v.length) return '';
+  const parts = [Math.floor(v[0] / 40), v[0] % 40];
+  let n = 0;
+  for (let i = 1; i < v.length; i++) {
+    n = (n << 7) | (v[i] & 0x7f);
+    if ((v[i] & 0x80) === 0) { parts.push(n); n = 0; }
+  }
+  return parts.join('.');
+}
+
+function derValueString(b, t) {
+  if ([0x0c, 0x13, 0x14, 0x16, 0x1e].includes(t.tag & 0xff)) return text(b.subarray(t.cstart, t.cend));
+  return hex(b.subarray(t.cstart, t.cend));
+}
+
+function parseNameComponents(b, t) {
+  const out = {};
+  for (const set of derChildren(b, t)) {
+    for (const seq of derChildren(b, set)) {
+      const [oidT, valueT] = derChildren(b, seq);
+      if (oidT && valueT) out[derOid(b, oidT)] = derValueString(b, valueT);
+    }
+  }
+  return out;
+}
+
+function certSubjectCn(cert) {
+  return cert.subject?.['2.5.4.3'];
+}
+
+function certFingerprintHex(c) {
+  return sha256Hex(c);
+}
+
+function certSignatureAlgorithm(cert) {
+  const oid = cert.sigAlgOid;
+  if (oid === '1.2.840.10045.4.3.3') return { kind:'ecdsa', hash:'SHA-384', curve:'P-384' };
+  if (oid === '1.2.840.10045.4.3.2') return { kind:'ecdsa', hash:'SHA-256', curve:'P-256' };
+  if (oid === '1.2.840.113549.1.1.11') return { kind:'rsa-pkcs1', hash:'SHA-256' };
+  if (oid === '1.2.840.113549.1.1.12') return { kind:'rsa-pkcs1', hash:'SHA-384' };
+  throw new Error('unsupported certificate signature algorithm OID ' + oid);
+}
+
+function parseCert(c) {
+  const top = der(c, 0);
+  const [tbs, sigAlg, sigVal] = derChildren(c, top);
+  const children = derChildren(c, tbs);
+  const versionPresent = ((children[0].tag & 0xff) === 0xa0);
+  const issuerT = children[versionPresent ? 3 : 2];
+  const validityT = children[versionPresent ? 4 : 3];
+  const subjectT = children[versionPresent ? 5 : 4];
+  const spkiT = children[versionPresent ? 6 : 5];
+  const [notBeforeT, notAfterT] = derChildren(c, validityT);
+  const sigOidT = derChildren(c, sigAlg)[0];
+  const sigBytes = c.subarray(sigVal.cstart + 1, sigVal.cend);
+  let sigRaw = null;
+  try { sigRaw = ecdsaDerToRaw(sigBytes, 48); } catch {}
+  return {
+    raw: c,
+    tbsBytes: c.subarray(tbs.start, tbs.end),
+    spki: c.subarray(spkiT.start, spkiT.end),
+    sigAlgOid: derOid(c, sigOidT),
+    sigBytes,
+    sigRaw,
+    issuerRaw: hex(c.subarray(issuerT.start, issuerT.end)),
+    subjectRaw: hex(c.subarray(subjectT.start, subjectT.end)),
+    subject: parseNameComponents(c, subjectT),
+    notBefore: derTime(c, notBeforeT),
+    notAfter: derTime(c, notAfterT),
+  };
+}
+
+async function ecVerify(spki, sigRaw, msg) {
+  if (!(sigRaw instanceof Uint8Array)) throw new Error('certificate signature is not ECDSA DER');
+  const key = await crypto.subtle.importKey('spki', spki, { name:'ECDSA', namedCurve:'P-384' }, false, ['verify']);
+  return crypto.subtle.verify({ name:'ECDSA', hash:'SHA-384' }, key, sigRaw, msg);
+}
+
+async function verifyCertSignature(child, issuer) {
+  const alg = certSignatureAlgorithm(child);
+  if (alg.kind === 'ecdsa') {
+    const key = await crypto.subtle.importKey('spki', issuer.spki, { name:'ECDSA', namedCurve:alg.curve }, false, ['verify']);
+    const size = alg.curve === 'P-384' ? 48 : 32;
+    return crypto.subtle.verify({ name:'ECDSA', hash:alg.hash }, key, ecdsaDerToRaw(child.sigBytes, size), child.tbsBytes);
+  }
+  const key = await crypto.subtle.importKey('spki', issuer.spki, { name:'RSASSA-PKCS1-v1_5', hash:alg.hash }, false, ['verify']);
+  return crypto.subtle.verify({ name:'RSASSA-PKCS1-v1_5' }, key, child.sigBytes, child.tbsBytes);
+}
+
+function pemCertToDer(pem) {
+  const m = String(pem).match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+  return b64ToBytes((m ? m[1] : pem).replace(/\s+/g, ''));
+}
+
+function parseQuoteReportCert(certDer, allowSyntheticQuoteReportCertForTest) {
+  try {
+    return { ...parseCert(certDer), isX509:true };
+  } catch (err) {
+    if (!allowSyntheticQuoteReportCertForTest) throw new Error('quote_report.cert_b64 must be a DER X.509 certificate');
+    return { spki:certDer, isX509:false, syntheticError:err.message };
+  }
+}
+
+function trustVerificationTime(trust) {
+  const value = trust.verificationTime ?? trust.verification_time ?? trust.evidenceTime ?? trust.evidence_time;
+  if (value === undefined || value === null || value === '') return Date.now();
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  throw new Error('trust verificationTime must be an ISO time string or epoch milliseconds');
+}
+
+async function sha256HexColon(b) {
+  return Array.from(await sha256Bytes(b)).map((x) => x.toString(16).padStart(2, '0').toUpperCase()).join(':');
+}
+
+async function verifyAwsAttestation(attestationB64, now = Date.now()) {
+  const buf = b64ToBytes(attestationB64);
+  const cose = cborDecodeComplete(buf, 'AWS attestation COSE');
+  const [protectedRaw, , payloadRaw, sig] = cose;
+  const doc = cborDecodeComplete(payloadRaw, 'AWS attestation payload');
+  const leaf = parseCert(doc.certificate);
+  const sigStruct = concat([Uint8Array.of(0x84), cborText('Signature1'), cborBstr(protectedRaw), cborBstr(new Uint8Array(0)), cborBstr(payloadRaw)]);
+  const sigOk = await ecVerify(leaf.spki, sig, sigStruct);
+  const certs = [...doc.cabundle.map(parseCert), leaf];
+  let chainOk = true;
+  for (let i = 1; i < certs.length; i++) {
+    chainOk = chainOk && await ecVerify(certs[i - 1].spki, certs[i].sigRaw, certs[i].tbsBytes);
+  }
+  const root = certs[0];
+  const rootSelf = await ecVerify(root.spki, root.sigRaw, root.tbsBytes);
+  const rootFp = await sha256HexColon(doc.cabundle[0]);
+  const timeValid = certs.every((c) => now >= c.notBefore && now <= c.notAfter);
+  return {
+    sigOk,
+    chainOk,
+    rootSelf,
+    rootPinned: rootFp === AWS_NITRO_ROOT_FP,
+    timeValid,
+    leafNotAfter: new Date(leaf.notAfter).toISOString(),
+    moduleId: doc.module_id,
+    pcr0: doc.pcrs?.[0] ? hex(doc.pcrs[0]) : null,
+    publicKey: doc.public_key ? bytesToB64(doc.public_key) : null,
+    nonce: doc.nonce ? bytesToB64(doc.nonce) : null,
+    rootFp,
+  };
+}
+
+async function publicKeySha256Hex(publicKeyB64) {
+  return sha256Hex(b64ToBytes(publicKeyB64));
+}
+
+async function buildAliyunChallengePayload(proof) {
+  return canonicalJson({
+    http_method: proof.http_method,
+    http_status: proof.http_status,
+    nonce: proof.nonce,
+    profile: 'aliyun-vtpm',
+    request_body_sha256: proof.request_body_sha256,
+    resp_content_type: proof.resp_content_type,
+    response_body_sha256: proof.response_body_sha256,
+    statement_public_key_sha256: await publicKeySha256Hex(proof.public_key),
+    upstream_host: proof.upstream_host,
+    upstream_path: proof.upstream_path,
+    ...(proof.field_claims ? { field_claims_sha256: await fieldClaimsHash(proof.field_claims) } : {}),
+  });
+}
+
+function parseAliyunEvidence(proof) {
+  const evidence = isObject(proof.evidence) ? proof.evidence : JSON.parse(text(b64ToBytes(proof.attestation)));
+  if (!isObject(evidence)) throw new Error('aliyun-vtpm evidence must be object');
+  if (evidence.profile && evidence.profile !== 'aliyun-vtpm') throw new Error('unexpected evidence profile: ' + evidence.profile);
+  if (evidence.version !== undefined && evidence.version !== 1) throw new Error('unsupported aliyun-vtpm evidence version: ' + evidence.version);
+  return evidence;
+}
+
+class ByteReader {
+  constructor(buf) { this.buf = buf; this.offset = 0; }
+  need(n) {
+    if (this.offset + n > this.buf.length) throw new Error('unexpected end of TPM blob');
+  }
+  u8() { this.need(1); return this.buf[this.offset++]; }
+  u16() { this.need(2); const v = (this.buf[this.offset] << 8) | this.buf[this.offset + 1]; this.offset += 2; return v; }
+  u32() {
+    this.need(4);
+    const v = ((this.buf[this.offset] * 0x1000000) + ((this.buf[this.offset + 1] << 16) | (this.buf[this.offset + 2] << 8) | this.buf[this.offset + 3])) >>> 0;
+    this.offset += 4;
+    return v;
+  }
+  bytes(n) { this.need(n); const out = this.buf.subarray(this.offset, this.offset + n); this.offset += n; return out; }
+  tpm2b() { return this.bytes(this.u16()); }
+  done() { if (this.offset !== this.buf.length) throw new Error(`trailing ${this.buf.length - this.offset} bytes in TPM blob`); }
+}
+
+const TPM_GENERATED_VALUE = 0xff544347;
+const TPM_ST_ATTEST_QUOTE = 0x8018;
+const TPM_ALG_SHA256 = 0x000b;
+const TPM_ALG_RSASSA = 0x0014;
+const TPM_ALG_RSAPSS = 0x0016;
+const REQUIRED_ALIYUN_PCRS = ['sha256:8', 'sha256:9', 'sha256:11'];
+
+function normalizeQuotedAttest(buf) {
+  if (buf.length >= 4 && new ByteReader(buf).u32() === TPM_GENERATED_VALUE) return buf;
+  if (buf.length >= 6) {
+    const r = new ByteReader(buf);
+    const size = r.u16();
+    if (size === buf.length - 2 && r.u32() === TPM_GENERATED_VALUE) return buf.subarray(2);
+  }
+  return buf;
+}
+
+function pcrsFromSelect(select) {
+  const out = [];
+  for (let byte = 0; byte < select.length; byte++) {
+    for (let bit = 0; bit < 8; bit++) if (select[byte] & (1 << bit)) out.push(byte * 8 + bit);
+  }
+  return out;
+}
+
+function readPcrSelections(r) {
+  const count = r.u32();
+  if (count < 1 || count > 8) throw new Error('invalid PCR selection count');
+  const selections = [];
+  for (let i = 0; i < count; i++) {
+    const hashAlg = r.u16();
+    const sizeOfSelect = r.u8();
+    if (sizeOfSelect < 1 || sizeOfSelect > 8) throw new Error('invalid PCR select size');
+    selections.push({ hashAlg, pcrs: pcrsFromSelect(r.bytes(sizeOfSelect)) });
+  }
+  return selections;
+}
+
+function parseTpmsAttestQuote(buf) {
+  const r = new ByteReader(buf);
+  const magic = r.u32();
+  if (magic !== TPM_GENERATED_VALUE) throw new Error(`unexpected TPM magic: 0x${magic.toString(16)}`);
+  const type = r.u16();
+  if (type !== TPM_ST_ATTEST_QUOTE) throw new Error(`unexpected attestation type: 0x${type.toString(16)}`);
+  r.tpm2b();
+  const extraData = r.tpm2b();
+  r.bytes(17);
+  r.bytes(8);
+  const selections = readPcrSelections(r);
+  const pcrDigest = r.tpm2b();
+  r.done();
+  return { extraData, selections, pcrDigest };
+}
+
+function parseTpmlPcrSelection(buf) {
+  const r = new ByteReader(buf);
+  const selections = readPcrSelections(r);
+  r.done();
+  return selections;
+}
+
+function parseTpmlDigest(buf) {
+  const r = new ByteReader(buf);
+  const count = r.u32();
+  if (count < 1 || count > 32) throw new Error('invalid PCRValues digest count');
+  const digests = [];
+  for (let i = 0; i < count; i++) digests.push(r.tpm2b());
+  r.done();
+  return digests;
+}
+
+function selectionSummary(selections) {
+  return selections.map((s) => ({ hashAlg: s.hashAlg, pcrs: [...s.pcrs].sort((a, b) => a - b) }))
+    .sort((a, b) => a.hashAlg - b.hashAlg);
+}
+
+function sameSelections(a, b) {
+  return JSON.stringify(selectionSummary(a)) === JSON.stringify(selectionSummary(b));
+}
+
+function normalizePcrKey(key, hash = 'sha256') {
+  const s = String(key).toLowerCase();
+  const m = s.match(/^(?:sha\d+:)?(\d+)$/);
+  return m ? `${hash}:${Number(m[1])}` : s;
+}
+
+function expectedPcrs(trust, hash = 'sha256') {
+  const out = {};
+  for (const [key, value] of Object.entries(trust.expectedPcrs || {})) out[normalizePcrKey(key, hash)] = normalizeHex(value);
+  if (hash === 'sha384' && trust.expectedPcr0) out['sha384:0'] = normalizeHex(trust.expectedPcr0);
+  if (hash === 'sha384' && trust.expectedPcr8) out['sha384:8'] = normalizeHex(trust.expectedPcr8);
+  return out;
+}
+
+function parseAliyunPcrInfo(evidence) {
+  const pcrValuesRaw = b64ToBytes(evidence.quote_report?.pcr_info?.pcr_values_b64 || '');
+  const pcrSelectionRaw = b64ToBytes(evidence.quote_report?.pcr_info?.pcr_selection_out_b64 || '');
+  const selections = parseTpmlPcrSelection(pcrSelectionRaw);
+  const digests = parseTpmlDigest(pcrValuesRaw);
+  const pcrs = selections.flatMap((s) => s.hashAlg === TPM_ALG_SHA256 ? s.pcrs.map((pcr) => ({ pcr, hashAlg: s.hashAlg })) : []);
+  if (digests.length !== pcrs.length) throw new Error(`PCRValues digest count ${digests.length} does not match PCRSelectionOut count ${pcrs.length}`);
+  const values = {};
+  for (let i = 0; i < pcrs.length; i++) values[`sha256:${pcrs[i].pcr}`] = hex(digests[i]);
+  return { values, selections };
+}
+
+async function verifyQuotedPcrDigest(parsedQuote, pcrValues) {
+  const selection = parsedQuote.selections.find((s) => s.hashAlg === TPM_ALG_SHA256);
+  if (!selection) return { ok:false, detail:'quote 未包含 sha256 PCR selection' };
+  const chunks = [];
+  for (const pcr of selection.pcrs) {
+    const value = pcrValues[`sha256:${pcr}`];
+    if (!value) return { ok:false, detail:`缺少 quote selection 中的 sha256:${pcr} PCR 值` };
+    chunks.push(Uint8Array.from(value.match(/../g).map((x) => Number.parseInt(x, 16))));
+  }
+  const calculated = await sha256Bytes(concat(chunks));
+  const ok = hex(calculated) === hex(parsedQuote.pcrDigest);
+  return {
+    ok,
+    detail: ok ? 'quote 内 PCR digest == PCRInfo.PCRValues 重算值' : `PCR digest 不符: calc=${short(hex(calculated))} quote=${short(hex(parsedQuote.pcrDigest))}`,
+  };
+}
+
+async function verifyTpmRsaSignature(spki, quoteMsg, signatureBlob) {
+  const r = new ByteReader(signatureBlob);
+  const sigAlg = r.u16();
+  const hashAlg = r.u16();
+  if (hashAlg !== TPM_ALG_SHA256) throw new Error(`unsupported TPM signature hash algorithm: 0x${hashAlg.toString(16)}`);
+  const sig = r.tpm2b();
+  r.done();
+  if (sigAlg === TPM_ALG_RSASSA) {
+    const key = await crypto.subtle.importKey('spki', spki, { name:'RSASSA-PKCS1-v1_5', hash:'SHA-256' }, false, ['verify']);
+    return crypto.subtle.verify({ name:'RSASSA-PKCS1-v1_5' }, key, sig, quoteMsg);
+  }
+  if (sigAlg === TPM_ALG_RSAPSS) {
+    const key = await crypto.subtle.importKey('spki', spki, { name:'RSA-PSS', hash:'SHA-256' }, false, ['verify']);
+    return crypto.subtle.verify({ name:'RSA-PSS', saltLength:32 }, key, sig, quoteMsg);
+  }
+  throw new Error(`unsupported TPM signature algorithm: 0x${sigAlg.toString(16)}`);
+}
+
+async function verifyAliyunCertChain(leaf, trust, now, evidence) {
+  const platformTrust = trust.platformTrust || {};
+  const invalid = (detail) => ({ ok:false, detail });
+  if (platformTrust.revocation?.required && !platformTrust.revocation.checkedExternally) {
+    return invalid('CRL/OCSP 吊销检查被要求但浏览器页不能联网检查；需先外部检查并设置 checkedExternally=true');
+  }
+  const evidenceChainPem = Array.isArray(evidence?.platform_attestation?.cert_chain_pem)
+    ? evidence.platform_attestation.cert_chain_pem
+    : [];
+  const rootsPem = platformTrust.rootCertificatesPem?.length
+    ? platformTrust.rootCertificatesPem
+    : evidenceChainPem;
+  const intermediatesPem = platformTrust.intermediateCertificatesPem?.length
+    ? platformTrust.intermediateCertificatesPem
+    : evidenceChainPem;
+  const roots = rootsPem.map((pem) => parseCert(pemCertToDer(pem)));
+  const intermediates = intermediatesPem.map((pem) => parseCert(pemCertToDer(pem)));
+  if (!roots.length) return invalid('platformTrust.rootCertificatesPem is required for cert-chain mode');
+  if (!intermediates.length) return invalid('platformTrust.intermediateCertificatesPem is required for cert-chain mode');
+  const rootPins = (platformTrust.rootFingerprintsSha256 || []).map(normalizeHex);
+  const intermediatePins = (platformTrust.intermediateFingerprintsSha256 || []).map(normalizeHex);
+  const at = now || Date.now();
+  for (const root of roots) {
+    if (!(at >= root.notBefore && at <= root.notAfter)) continue;
+    if (root.subjectRaw !== root.issuerRaw) continue;
+    if (!await verifyCertSignature(root, root)) continue;
+    const rootFp = await certFingerprintHex(root.raw);
+    if (rootPins.length && !rootPins.includes(rootFp)) continue;
+    for (const intermediate of intermediates) {
+      if (!(at >= intermediate.notBefore && at <= intermediate.notAfter)) continue;
+      if (intermediate.issuerRaw !== root.subjectRaw) continue;
+      if (!await verifyCertSignature(intermediate, root)) continue;
+      const intermediateFp = await certFingerprintHex(intermediate.raw);
+      if (intermediatePins.length && !intermediatePins.includes(intermediateFp)) continue;
+      if (leaf.issuerRaw !== intermediate.subjectRaw) continue;
+      if (!(at >= leaf.notBefore && at <= leaf.notAfter)) return invalid('QuoteReport.Cert 不在有效期内');
+      if (!await verifyCertSignature(leaf, intermediate)) continue;
+      const cn = certSubjectCn(leaf);
+      const pattern = platformTrust.enclaveSubjectCnPattern || '^i-[A-Za-z0-9][A-Za-z0-9-]*-enclave-[0-9]+$';
+      if (!cn || !(new RegExp(pattern)).test(cn)) return invalid(`QuoteReport.Cert subject CN 不匹配: ${cn || '<missing>'}`);
+      const chainSource = platformTrust.rootCertificatesPem?.length ? 'trust.json/内置 PEM' : 'proof cert_chain_pem + 内置 fingerprint pin';
+      return { ok:true, detail:`QuoteReport.Cert chains to configured Aliyun TPM root; EK CN=${cn}; root=${short(rootFp)} intermediate=${short(intermediateFp)}；chain=${chainSource}` };
+    }
+  }
+  return invalid('QuoteReport.Cert does not chain to configured Alibaba Cloud TPM root/intermediate certificates');
+}
+
+async function verifyAliyunEvidence(proof, trust) {
+  const checks = [];
+  let evidence;
+  try {
+    evidence = parseAliyunEvidence(proof);
+    checks.push({ name:'Evidence 格式', ok:true, detail:'aliyun-vtpm QuoteReport evidence envelope 可解析' });
+  } catch (err) {
+    checks.push({ name:'Evidence 格式', ok:false, detail:err.message });
+    return { checks, measurements:{}, publicKey:null, nonce:null };
+  }
+
+  const rebuiltPayload = await buildAliyunChallengePayload(proof);
+  const qualifyingDataHex = await sha256Hex(bytes(rebuiltPayload));
+  checks.push({ name:'challenge alg', ok:evidence.challenge?.alg === 'sha256', detail:evidence.challenge?.alg === 'sha256' ? 'challenge.alg == sha256' : `unsupported challenge.alg: ${evidence.challenge?.alg}` });
+  try {
+    const payloadOk = text(b64ToBytes(evidence.challenge?.payload_b64 || '')) === rebuiltPayload;
+    checks.push({ name:'challenge payload', ok:payloadOk, detail:payloadOk ? 'payload_b64 == verifier 重建的 JCS payload' : 'payload_b64 与 verifier 重建 payload 不一致' });
+    const qOk = normalizeHex(evidence.challenge?.qualifying_data_hex) === qualifyingDataHex;
+    checks.push({ name:'qualifying data', ok:qOk, detail:qOk ? 'qualifying_data_hex == sha256(challenge_payload)' : 'qualifying_data_hex 与 sha256(challenge_payload) 不一致' });
+  } catch (err) {
+    checks.push({ name:'challenge payload', ok:false, detail:err.message });
+  }
+
+  let quote, signature, certInfo;
+  try {
+    quote = normalizeQuotedAttest(b64ToBytes(evidence.quote_report?.quoted_b64 || ''));
+    signature = b64ToBytes(evidence.quote_report?.signature_b64 || '');
+    certInfo = parseQuoteReportCert(b64ToBytes(evidence.quote_report?.cert_b64 || ''), !!trust.allowSyntheticQuoteReportCertForTest);
+    checks.push({
+      name:'QuoteReport 字段',
+      ok:true,
+      detail:certInfo.isX509
+        ? 'quoted/signature/Cert DER 已解码，Cert 可解析为 X.509'
+        : 'quoted/signature 已解码；测试模式使用 SPKI public key 代替 X.509 Cert',
+    });
+  } catch (err) {
+    checks.push({ name:'QuoteReport 字段', ok:false, detail:err.message });
+  }
+
+  let parsedQuote;
+  if (quote) {
+    try {
+      parsedQuote = parseTpmsAttestQuote(quote);
+      checks.push({ name:'quote 结构', ok:true, detail:'TPMS_ATTEST quote 结构可解析' });
+    } catch (err) {
+      checks.push({ name:'quote 结构', ok:false, detail:err.message });
+    }
+  }
+  if (quote && signature && certInfo) {
+    try {
+      const ok = await verifyTpmRsaSignature(certInfo.spki, quote, signature);
+      checks.push({ name:'quote 签名', ok, detail:ok ? 'QuoteReport.Cert public key 验证 quote signature 通过' : 'QuoteReport.Cert public key 验证 quote signature 失败' });
+    } catch (err) {
+      checks.push({ name:'quote 签名', ok:false, detail:err.message });
+    }
+  }
+  if (parsedQuote) {
+    const ok = hex(parsedQuote.extraData) === qualifyingDataHex;
+    checks.push({ name:'quote challenge', ok, detail:ok ? 'quote extraData == sha256(challenge_payload)' : 'quote extraData 与 sha256(challenge_payload) 不一致' });
+  }
+
+  let pcrValues = {};
+  let pcrSelections = [];
+  try {
+    const pcr = parseAliyunPcrInfo(evidence);
+    pcrValues = pcr.values;
+    pcrSelections = pcr.selections;
+    checks.push({ name:'PCRInfo', ok:true, detail:`PCRInfo parsed (${Object.keys(pcrValues).join(', ')})` });
+  } catch (err) {
+    checks.push({ name:'PCRInfo', ok:false, detail:err.message });
+  }
+  if (parsedQuote && pcrSelections.length) {
+    const ok = sameSelections(parsedQuote.selections, pcrSelections);
+    checks.push({ name:'PCR selection', ok, detail:ok ? 'Quote PCR selection == PCRInfo.PCRSelectionOut' : 'Quote PCR selection 与 PCRInfo.PCRSelectionOut 不一致' });
+    checks.push({ name:'PCR digest', ...(await verifyQuotedPcrDigest(parsedQuote, pcrValues)) });
+  }
+
+  const expected = expectedPcrs(trust, 'sha256');
+  const missing = REQUIRED_ALIYUN_PCRS.filter((key) => !expected[key]);
+  checks.push({ name:'PCR allowlist', ok:missing.length === 0, detail:missing.length ? `missing required PCR allowlist entries: ${missing.join(', ')}` : 'required PCR allowlist contains sha256:8, sha256:9, sha256:11' });
+  for (const [key, expectedValue] of Object.entries(expected)) {
+    const actual = pcrValues[key];
+    const ok = !!actual && actual === expectedValue;
+    checks.push({ name:`${key} 比对`, ok, detail:ok ? `${key} == allowlist` : `${key} 不符: ${short(actual)} ≠ ${short(expectedValue)}` });
+  }
+
+  const mode = trust.platformTrust?.mode || evidence.platform_attestation?.mode || 'missing';
+  if (mode === 'cert-chain') {
+    let chain;
+    try {
+      chain = certInfo?.isX509
+        ? await verifyAliyunCertChain(certInfo, trust, trustVerificationTime(trust), evidence)
+        : { ok:false, detail:'QuoteReport.Cert is not a parseable X.509 certificate; fail closed' };
+    } catch (err) {
+      chain = { ok:false, detail:err.message };
+    }
+    checks.push({ name:'平台证明链', ok:chain.ok, detail:chain.detail });
+  } else {
+    const ok = !!trust.allowUntrustedPlatformEvidenceForTest;
+    checks.push({
+      name:'平台证明链',
+      ok,
+      detail:ok
+        ? '测试模式 allowUntrustedPlatformEvidenceForTest=true：未验证 QuoteReport.Cert root/intermediate chain'
+        : '生产校验要求 platformTrust.mode=cert-chain 且配置 root/intermediate certificates',
+    });
+  }
+
+  return {
+    checks,
+    measurements:pcrValues,
+    publicKey:proof.public_key,
+    nonce:proof.nonce,
+  };
+}
+
+function cborEncode(value) {
+  if (typeof value === 'number') {
+    if (value >= 0) return cborHead(0, value);
+    return cborHead(1, -1 - value);
+  }
+  if (typeof value === 'string') return concat([cborHead(3, bytes(value).length), bytes(value)]);
+  if (value instanceof Uint8Array) return concat([cborHead(2, value.length), value]);
+  if (Array.isArray(value)) return concat([cborHead(4, value.length), ...value.map(cborEncode)]);
+  throw new Error('unsupported CBOR encode value');
+}
+
+function cborHead(major, value) {
+  if (value < 24) return Uint8Array.of((major << 5) | value);
+  if (value <= 0xff) return Uint8Array.of((major << 5) | 24, value);
+  if (value <= 0xffff) {
+    const h = new Uint8Array(3);
+    h[0] = (major << 5) | 25;
+    new DataView(h.buffer).setUint16(1, value);
+    return h;
+  }
+  const h = new Uint8Array(5);
+  h[0] = (major << 5) | 26;
+  new DataView(h.buffer).setUint32(1, value);
+  return h;
+}
+
+function qingtianPcrHex(pcrs, index) {
+  const value = pcrs[index] ?? pcrs[String(index)];
+  if (!(value instanceof Uint8Array) || value.length !== 48) throw new Error(`PCR${index} missing or not SHA384-sized`);
+  return hex(value);
+}
+
+function requiredMapField(map, key, kind) {
+  const value = map[key];
+  if (kind === 'string' && typeof value !== 'string') throw new Error(`${key} must be string`);
+  if (kind === 'number' && typeof value !== 'number') throw new Error(`${key} must be number`);
+  if (kind === 'bytes' && !(value instanceof Uint8Array)) throw new Error(`${key} must be bytes`);
+  if (kind === 'array' && !Array.isArray(value)) throw new Error(`${key} must be array`);
+  if (kind === 'object' && !isObject(value)) throw new Error(`${key} must be map`);
+  return value;
+}
+
+function parseQingTianEvidence(attestationB64) {
+  const raw = b64ToBytes(attestationB64);
+  if (raw.length > 128 * 1024) throw new Error('attestation exceeds 128KiB');
+  const cose = cborDecodeComplete(raw, 'QingTian COSE_Sign1');
+  if (!Array.isArray(cose) || cose.length !== 4) throw new Error('QingTian attestation must be COSE_Sign1 array[4]');
+  const [protectedRaw, unprotected, payloadRaw, signature] = cose;
+  if (!(protectedRaw instanceof Uint8Array)) throw new Error('COSE protected header must be bstr');
+  if (!isObject(unprotected) || Object.keys(unprotected).length !== 0) throw new Error('COSE unprotected header must be empty map');
+  if (!(payloadRaw instanceof Uint8Array)) throw new Error('COSE payload must be bstr');
+  if (!(signature instanceof Uint8Array)) throw new Error('COSE signature must be bstr');
+  const protectedHeader = cborDecodeComplete(protectedRaw, 'QingTian protected header');
+  const payload = cborDecodeComplete(payloadRaw, 'QingTian payload');
+  if (!isObject(protectedHeader)) throw new Error('COSE protected header must decode to map');
+  if (!isObject(payload)) throw new Error('QingTian payload must decode to map');
+  const cabundle = requiredMapField(payload, 'cabundle', 'array');
+  return {
+    protectedRaw,
+    protectedHeader,
+    payloadRaw,
+    signature,
+    moduleId: requiredMapField(payload, 'module_id', 'string'),
+    timestamp: requiredMapField(payload, 'timestamp', 'number'),
+    digest: requiredMapField(payload, 'digest', 'string'),
+    pcrs: requiredMapField(payload, 'pcrs', 'object'),
+    certificate: requiredMapField(payload, 'certificate', 'bytes'),
+    cabundle: cabundle.map((c, i) => {
+      if (!(c instanceof Uint8Array)) throw new Error(`cabundle[${i}] must be bstr DER certificate`);
+      return c;
+    }),
+    nonce: requiredMapField(payload, 'nonce', 'bytes'),
+    publicKey: requiredMapField(payload, 'public_key', 'bytes'),
+  };
+}
+
+function reverseEcdsaHalves(raw) {
+  const half = raw.length / 2;
+  return concat([Array.from(raw.subarray(0, half)).reverse(), Array.from(raw.subarray(half)).reverse()].map((a) => Uint8Array.from(a)));
+}
+
+async function verifyQingTianEs384(data, leaf, signature) {
+  const key = await crypto.subtle.importKey('spki', leaf.spki, { name:'ECDSA', namedCurve:'P-384' }, false, ['verify']);
+  if (await crypto.subtle.verify({ name:'ECDSA', hash:'SHA-384' }, key, signature, data)) return true;
+  if (signature.length === 96) {
+    const reversed = reverseEcdsaHalves(signature);
+    return crypto.subtle.verify({ name:'ECDSA', hash:'SHA-384' }, key, reversed, data);
+  }
+  return false;
+}
+
+async function verifyQingTianCertChain(leaf, cabundle, trust, evidenceTime) {
+  if (trust.platformTrust?.mode !== 'cert-chain' || !trust.platformTrust.rootFingerprintsSha256?.length) {
+    return { ok:false, detail:'QingTian trust config must pin platformTrust.rootFingerprintsSha256' };
+  }
+  if (trust.platformTrust.revocation?.required && !trust.platformTrust.revocation.checkedExternally) {
+    return { ok:false, detail:'QingTian revocation checking is required but not externally checked' };
+  }
+  const remaining = cabundle.map(parseCert);
+  const chain = [leaf];
+  let current = leaf;
+  const maxDepth = remaining.length + 1;
+  for (let depth = 0; depth < maxDepth; depth++) {
+    if (current.subjectRaw === current.issuerRaw) break;
+    const i = remaining.findIndex((candidate) => candidate.subjectRaw === current.issuerRaw);
+    if (i < 0) return { ok:false, detail:`issuer certificate not found for ${certSubjectCn(current) || current.subjectRaw.slice(0, 16)}` };
+    const [issuer] = remaining.splice(i, 1);
+    chain.push(issuer);
+    current = issuer;
+  }
+  const root = chain[chain.length - 1];
+  const rootFp = await certFingerprintHex(root.raw);
+  const pinnedRoots = trust.platformTrust.rootFingerprintsSha256.map(normalizeHex);
+  if (!pinnedRoots.includes(rootFp)) return { ok:false, detail:`root fingerprint not pinned: ${rootFp}` };
+  if (root.subjectRaw !== root.issuerRaw || !await verifyCertSignature(root, root)) return { ok:false, detail:'root certificate is not self-signed/self-verifiable' };
+  for (let i = 0; i < chain.length - 1; i++) {
+    if (!await verifyCertSignature(chain[i], chain[i + 1])) return { ok:false, detail:`certificate signature failed at depth ${i}` };
+  }
+  const badTime = chain.find((cert) => !(evidenceTime >= cert.notBefore && evidenceTime <= cert.notAfter));
+  if (badTime) return { ok:false, detail:`certificate not valid at evidence time: ${certSubjectCn(badTime) || short(badTime.subjectRaw)}` };
+  const intermediateFps = [];
+  for (const cert of chain.slice(1, -1)) intermediateFps.push(await certFingerprintHex(cert.raw));
+  const pinnedIntermediates = (trust.platformTrust.intermediateFingerprintsSha256 || []).map(normalizeHex);
+  const missing = pinnedIntermediates.find((fp) => !intermediateFps.includes(fp));
+  if (missing) return { ok:false, detail:`pinned intermediate not present in chain: ${missing}` };
+  return { ok:true, detail:`QingTian certificate chain verified to pinned root ${short(rootFp)}` };
+}
+
+async function verifyQingTianEvidence(proof, trust) {
+  const checks = [];
+  let evidence;
+  try {
+    evidence = parseQingTianEvidence(proof.attestation);
+    checks.push({ name:'QingTian evidence 格式', ok:true, detail:'COSE_Sign1/QTSM payload 可解析' });
+  } catch (err) {
+    checks.push({ name:'QingTian evidence 格式', ok:false, detail:err.message });
+    return { checks, measurements:{}, publicKey:null, nonce:null };
+  }
+  try {
+    const algOk = evidence.protectedHeader[1] === -35 || evidence.protectedHeader['1'] === -35;
+    checks.push({ name:'QingTian COSE alg', ok:algOk, detail:algOk ? 'protected.alg == ES384(-35)' : `unsupported COSE alg: ${String(evidence.protectedHeader[1] ?? evidence.protectedHeader['1'])}` });
+    if (!algOk) return { checks, measurements:{}, publicKey:null, nonce:null };
+    const leaf = parseCert(evidence.certificate);
+    const sigStructure = cborEncode(['Signature1', evidence.protectedRaw, new Uint8Array(), evidence.payloadRaw]);
+    const sigOk = await verifyQingTianEs384(sigStructure, leaf, evidence.signature);
+    checks.push({ name:'QingTian COSE 签名', ok:sigOk, detail:sigOk ? 'COSE_Sign1 signature verified by attested leaf certificate' : 'COSE_Sign1 signature verification failed' });
+    const digestOk = evidence.digest === 'SHA384';
+    checks.push({ name:'QingTian digest', ok:digestOk, detail:digestOk ? 'payload.digest == SHA384' : `unsupported payload.digest: ${evidence.digest}` });
+    const timestampOk = Number.isSafeInteger(evidence.timestamp) && evidence.timestamp > 0;
+    checks.push({ name:'QingTian timestamp', ok:timestampOk, detail:timestampOk ? `payload.timestamp = ${new Date(evidence.timestamp).toISOString()}` : `invalid payload.timestamp: ${evidence.timestamp}` });
+    const evidenceTime = timestampOk ? evidence.timestamp : Date.now();
+    const chain = await verifyQingTianCertChain(leaf, evidence.cabundle, trust, evidenceTime);
+    checks.push({ name:'QingTian 证书链', ok:chain.ok, detail:chain.detail });
+
+    const pcr0 = qingtianPcrHex(evidence.pcrs, 0);
+    const pcr8 = qingtianPcrHex(evidence.pcrs, 8);
+    const expected = expectedPcrs(trust, 'sha384');
+    const pcr0Ok = !!expected['sha384:0'] && pcr0 === expected['sha384:0'];
+    const pcr8Ok = !!expected['sha384:8'] && pcr8 === expected['sha384:8'];
+    checks.push({ name:'PCR0 比对', ok:pcr0Ok, detail:pcr0Ok ? 'PCR0 == QingTian trust allowlist' : `PCR0 不符或未配置: ${short(pcr0)} ≠ ${short(expected['sha384:0'])}` });
+    checks.push({ name:'PCR8 比对', ok:pcr8Ok, detail:pcr8Ok ? 'PCR8 == QingTian signing certificate allowlist' : `PCR8 不符或未配置: ${short(pcr8)} ≠ ${short(expected['sha384:8'])}` });
+    const pubB64 = bytesToB64(evidence.publicKey);
+    const nonceB64 = bytesToB64(evidence.nonce);
+    checks.push({ name:'公钥绑定', ok:pubB64 === proof.public_key, detail:pubB64 === proof.public_key ? '签名公钥 == QingTian evidence 背书的 public_key' : '签名公钥与 QingTian evidence public_key 不符' });
+    checks.push({ name:'nonce 绑定', ok:nonceB64 === proof.nonce, detail:nonceB64 === proof.nonce ? 'QingTian evidence nonce == proof 顶层 nonce' : 'QingTian evidence nonce 与 proof 顶层 nonce 不一致' });
+    const measurements = {};
+    for (const [key, value] of Object.entries(evidence.pcrs)) if (value instanceof Uint8Array) measurements[`sha384:${key}`] = hex(value);
+    return { checks, measurements, pcr0, pcr8, publicKey:pubB64, nonce:nonceB64 };
+  } catch (err) {
+    checks.push({ name:'QingTian evidence 校验', ok:false, detail:err.message });
+    return { checks, measurements:{}, publicKey:null, nonce:null };
+  }
+}
+
+const SUPPORTED_PROTOCOLS = [
+  'openai.chat_completions',
+  'openai.responses',
+  'anthropic.messages',
+  'google.gemini.generate_content',
+  'alibaba.dashscope.generation',
+  'aws.bedrock.converse',
+  'cohere.chat',
+];
+const FIELD_POLICY_REGISTRY = {
+  policy: 'core',
+  default: '2026-07-29',
+  protocol_versions: {
+    'openai.chat_completions': '2026-07-29',
+    'openai.responses': '2026-07-29',
+    'anthropic.messages': '2026-07-29',
+    'google.gemini.generate_content': '2026-07-29',
+    'alibaba.dashscope.generation': '2026-07-29',
+    'aws.bedrock.converse': '2026-07-29',
+    'cohere.chat': '2026-07-29',
+  },
+};
+
+function expectedFieldPolicyId(protocol) {
+  const version = FIELD_POLICY_REGISTRY.protocol_versions[protocol];
+  if (typeof version !== 'string' || !version) throw new Error(`missing field policy version for ${protocol}`);
+  return `${protocol}.${FIELD_POLICY_REGISTRY.policy}@${version}`;
+}
+
+function looksLikeSse(body) {
+  return /^event:|^data:/m.test(text(body.subarray(0, Math.min(body.length, 512))));
+}
+
+function parseSseData(body) {
+  const out = [];
+  let dataLines = [];
+  const flush = () => {
+    if (!dataLines.length) return;
+    const data = dataLines.join('\n');
+    dataLines = [];
+    if (!data.trim() || data.trim() === '[DONE]') return;
+    try { out.push(JSON.parse(data)); }
+    catch { out.push({ raw_data: data, parse_error: 'invalid_sse_json' }); }
+  };
+  for (const rawLine of text(body).split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line === '') { flush(); continue; }
+    if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+  }
+  flush();
+  return out;
+}
+
+function parseJsonOrSse(body) {
+  if (looksLikeSse(body)) return parseSseData(body);
+  const raw = text(body).trim();
+  if (!raw) return null;
+  try { return JSON.parse(raw); }
+  catch { return { raw_body: raw, parse_error: 'invalid_json' }; }
+}
+
+function pick(value, keys) {
+  if (Array.isArray(value)) return value.map((item) => pick(item, keys));
+  if (!isObject(value)) return value;
+  const out = {};
+  for (const key of keys) if (Object.prototype.hasOwnProperty.call(value, key)) out[key] = value[key];
+  return out;
+}
+
+function mergeObject(target, source) {
+  if (!isObject(source)) return;
+  for (const [key, value] of Object.entries(source)) target[key] = value;
+}
+
+function appendStringField(target, field, value) {
+  if (typeof value !== 'string') return;
+  target[field] = typeof target[field] === 'string' ? target[field] + value : value;
+}
+
+function numberOrDefault(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function setStringField(target, field, value) {
+  if (typeof value === 'string') target[field] = value;
+}
+
+function stringValue(value) {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function mergeToolCalls(existing, deltaValue) {
+  if (!Array.isArray(deltaValue)) return existing;
+  const out = existing.map((item) => isObject(item) ? { ...item } : item);
+  for (const raw of deltaValue) {
+    if (!isObject(raw)) continue;
+    const index = numberOrDefault(raw.index, out.length);
+    const current = isObject(out[index]) ? { ...out[index] } : {};
+    for (const [key, value] of Object.entries(raw)) {
+      if (key === 'function' && isObject(value)) {
+        const fn = isObject(current.function) ? { ...current.function } : {};
+        appendStringField(fn, 'name', value.name);
+        appendStringField(fn, 'arguments', value.arguments);
+        current.function = fn;
+      } else if (key !== 'index') {
+        current[key] = value;
+      }
+    }
+    out[index] = current;
+  }
+  return out;
+}
+
+function ensureIndexedObject(map, rawIndex) {
+  const index = numberOrDefault(rawIndex, map.size);
+  const item = map.get(index) || {};
+  map.set(index, item);
+  return item;
+}
+
+function mergeOpenAIResponseContentPart(item, rawIndex, rawPart) {
+  const content = Array.isArray(item.content) ? [...item.content] : [];
+  const index = numberOrDefault(rawIndex, content.length);
+  const part = isObject(content[index]) ? { ...content[index] } : {};
+  if (isObject(rawPart)) mergeObject(part, rawPart);
+  content[index] = part;
+  item.content = content;
+  return part;
+}
+
+function mergeSemanticPart(target, source) {
+  if (!isObject(source)) return;
+  for (const [key, value] of Object.entries(source)) {
+    if (key === 'text' || key === 'thinking' || key === 'signature') {
+      appendStringField(target, key, value);
+    } else if (isObject(target[key]) && isObject(value)) {
+      target[key] = { ...target[key], ...value };
+    } else if (value !== null && value !== undefined) {
+      target[key] = value;
+    }
+  }
+}
+
+function mergeIndexedParts(existing, incoming) {
+  const out = existing.map((item) => isObject(item) ? { ...item } : item);
+  for (let i = 0; i < incoming.length; i++) {
+    if (!isObject(incoming[i])) {
+      out[i] = incoming[i];
+      continue;
+    }
+    const current = isObject(out[i]) ? { ...out[i] } : {};
+    mergeSemanticPart(current, incoming[i]);
+    out[i] = current;
+  }
+  return out;
+}
+
+function mergeGeminiCandidate(target, source) {
+  for (const [key, value] of Object.entries(source)) {
+    if (key === 'index') continue;
+    if (key === 'content' && isObject(value)) {
+      const content = isObject(target.content) ? { ...target.content } : {};
+      for (const [contentKey, contentValue] of Object.entries(value)) {
+        if (contentKey === 'parts' && Array.isArray(contentValue)) {
+          content.parts = mergeIndexedParts(Array.isArray(content.parts) ? content.parts : [], contentValue);
+        } else if (contentValue !== null && contentValue !== undefined) {
+          content[contentKey] = contentValue;
+        }
+      }
+      target.content = content;
+    } else if (value !== null && value !== undefined) {
+      target[key] = value;
+    }
+  }
+}
+
+function mergeNestedSemanticObject(existing, incoming, appendFields) {
+  const out = isObject(existing) ? { ...existing } : {};
+  for (const [key, value] of Object.entries(incoming)) {
+    if (appendFields.includes(key)) appendStringField(out, key, value);
+    else if (isObject(out[key]) && isObject(value)) out[key] = { ...out[key], ...value };
+    else if (value !== null && value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+function mergeBedrockContentDelta(block, delta) {
+  appendStringField(block, 'text', delta.text);
+  if (delta.text !== undefined && block.type === undefined) block.type = 'text';
+  if (isObject(delta.reasoningContent)) {
+    block.reasoningContent = mergeNestedSemanticObject(block.reasoningContent, delta.reasoningContent, ['text', 'signature']);
+  }
+  if (isObject(delta.toolUse)) {
+    block.toolUse = mergeNestedSemanticObject(block.toolUse, delta.toolUse, ['input']);
+  }
+  if (isObject(delta.citationsContent)) {
+    block.citationsContent = mergeNestedSemanticObject(block.citationsContent, delta.citationsContent, ['text']);
+  }
+  for (const [key, value] of Object.entries(delta)) {
+    if (!['text', 'reasoningContent', 'toolUse', 'citationsContent'].includes(key) && value !== null && value !== undefined) {
+      block[key] = value;
+    }
+  }
+}
+
+function mergeCohereContentBlock(blocks, index, rawBlock) {
+  if (!isObject(rawBlock)) return;
+  const block = blocks.get(index) || {};
+  mergeSemanticPart(block, rawBlock);
+  blocks.set(index, block);
+}
+
+function mergeCohereMessageDelta(message, contentBlocks, rawMessage) {
+  if (!isObject(rawMessage)) return;
+  for (const [key, value] of Object.entries(rawMessage)) {
+    if (key !== 'content' && value !== null && value !== undefined) message[key] = value;
+  }
+  const rawContent = rawMessage.content;
+  if (Array.isArray(rawContent)) {
+    for (let i = 0; i < rawContent.length; i++) mergeCohereContentBlock(contentBlocks, i, rawContent[i]);
+  } else if (isObject(rawContent)) {
+    mergeCohereContentBlock(
+      contentBlocks,
+      numberOrDefault(rawContent.index, contentBlocks.size === 0 ? 0 : contentBlocks.size - 1),
+      rawContent,
+    );
+  } else if (typeof rawContent === 'string') {
+    const block = contentBlocks.get(0) || { type:'text' };
+    appendStringField(block, 'text', rawContent);
+    contentBlocks.set(0, block);
+  }
+}
+
+function aggregateOpenAIChatStream(chunks) {
+  const out = {};
+  const choices = new Map();
+  for (const chunk of chunks) {
+    if (!isObject(chunk)) continue;
+    if (out.model === undefined && typeof chunk.model === 'string') out.model = chunk.model;
+    if (chunk.usage !== undefined) out.usage = chunk.usage;
+    if (chunk.error !== undefined) out.error = chunk.error;
+    for (const rawChoice of Array.isArray(chunk.choices) ? chunk.choices : []) {
+      if (!isObject(rawChoice)) continue;
+      const index = numberOrDefault(rawChoice.index, choices.size);
+      const choice = choices.get(index) || { index, message:{} };
+      const message = isObject(choice.message) ? choice.message : {};
+      const src = isObject(rawChoice.delta) ? rawChoice.delta : (isObject(rawChoice.message) ? rawChoice.message : {});
+      if (typeof src.role === 'string' && message.role === undefined) message.role = src.role;
+      appendStringField(message, 'content', src.content);
+      appendStringField(message, 'reasoning_content', src.reasoning_content);
+      if (src.tool_calls !== undefined) message.tool_calls = mergeToolCalls(Array.isArray(message.tool_calls) ? message.tool_calls : [], src.tool_calls);
+      choice.message = message;
+      if (rawChoice.finish_reason !== undefined && rawChoice.finish_reason !== null) choice.finish_reason = rawChoice.finish_reason;
+      if (rawChoice.logprobs !== undefined) choice.logprobs = rawChoice.logprobs;
+      choices.set(index, choice);
+    }
+  }
+  if (choices.size) out.choices = Array.from(choices.values()).sort((a, b) => Number(a.index) - Number(b.index));
+  return out;
+}
+
+function aggregateOpenAIResponsesStream(events) {
+  const out = {};
+  const outputItems = new Map();
+  const ensureItem = (rawIndex) => {
+    const index = numberOrDefault(rawIndex, outputItems.size);
+    const item = outputItems.get(index) || {};
+    outputItems.set(index, item);
+    return item;
+  };
+  const ensurePart = (item, rawIndex, type) => {
+    const content = Array.isArray(item.content) ? item.content : [];
+    const index = numberOrDefault(rawIndex, content.length);
+    const part = isObject(content[index]) ? content[index] : {};
+    if (type && part.type === undefined) part.type = type;
+    content[index] = part;
+    item.content = content;
+    return part;
+  };
+  for (const event of events) {
+    if (!isObject(event)) continue;
+    if (isObject(event.response)) mergeObject(out, pick(event.response, ['model','status','output','output_text','usage','error']));
+    const type = typeof event.type === 'string' ? event.type : '';
+    if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+      const item = ensureItem(event.output_index);
+      if (isObject(event.item)) mergeObject(item, event.item);
+    } else if (type === 'response.content_part.added' || type === 'response.content_part.done') {
+      mergeOpenAIResponseContentPart(ensureItem(event.output_index), event.content_index, event.part);
+    } else if (type === 'response.output_text.delta' || type === 'response.output_text.done') {
+      const part = ensurePart(ensureItem(event.output_index), event.content_index, 'output_text');
+      if (type.endsWith('.done')) { if (typeof event.text === 'string') part.text = event.text; }
+      else appendStringField(part, 'text', event.delta);
+    } else if (type === 'response.reasoning_text.delta' || type === 'response.reasoning_text.done') {
+      const part = ensurePart(ensureItem(event.output_index), event.content_index, 'reasoning_text');
+      if (type.endsWith('.done')) { if (typeof event.text === 'string') part.text = event.text; }
+      else appendStringField(part, 'text', event.delta);
+    } else if (type === 'response.refusal.delta' || type === 'response.refusal.done') {
+      const part = ensurePart(ensureItem(event.output_index), event.content_index, 'refusal');
+      if (type.endsWith('.done')) { if (typeof event.refusal === 'string') part.refusal = event.refusal; }
+      else appendStringField(part, 'refusal', event.delta);
+    } else if (type === 'response.function_call_arguments.delta' || type === 'response.function_call_arguments.done') {
+      const item = ensureItem(event.output_index);
+      if (type.endsWith('.done')) setStringField(item, 'arguments', event.arguments);
+      else appendStringField(item, 'arguments', event.delta);
+    } else if (type === 'response.completed' && out.status === undefined) {
+      out.status = 'completed';
+    } else if (type === 'response.failed' && event.error !== undefined) {
+      out.error = event.error;
+    }
+  }
+  if (outputItems.size && (!Array.isArray(out.output) || out.output.length === 0)) {
+    out.output = Array.from(outputItems.entries()).sort(([a], [b]) => a - b).map(([, item]) => item);
+  }
+  return pick(out, ['model','status','output','output_text','usage','error']);
+}
+
+function aggregateAnthropicStream(events) {
+  const out = {};
+  const blocks = new Map();
+  for (const event of events) {
+    if (!isObject(event)) continue;
+    const type = typeof event.type === 'string' ? event.type : '';
+    if (type === 'message_start' && isObject(event.message)) mergeObject(out, pick(event.message, ['type','role','model','stop_reason','usage']));
+    if (type === 'content_block_start' && isObject(event.content_block)) blocks.set(numberOrDefault(event.index, blocks.size), { ...event.content_block });
+    if (type === 'content_block_delta' && isObject(event.delta)) {
+      const index = numberOrDefault(event.index, blocks.size);
+      const block = blocks.get(index) || {};
+      if (block.type === undefined && typeof event.delta.type === 'string') block.type = event.delta.type.replace(/_delta$/, '');
+      appendStringField(block, 'text', event.delta.text);
+      appendStringField(block, 'thinking', event.delta.thinking);
+      appendStringField(block, 'signature', event.delta.signature);
+      appendStringField(block, 'input_json', event.delta.partial_json);
+      blocks.set(index, block);
+    }
+    if (type === 'message_delta' && isObject(event.delta)) {
+      mergeObject(out, pick(event.delta, ['stop_reason','stop_sequence']));
+      if (event.usage !== undefined) out.usage = event.usage;
+    }
+    if (type === 'error') out.error = event.error || event;
+  }
+  if (blocks.size) out.content = Array.from(blocks.entries()).sort(([a], [b]) => a - b).map(([, block]) => block);
+  return pick(out, ['type','role','model','content','stop_reason','usage','error']);
+}
+
+function aggregateDashscopeStream(chunks) {
+  const out = {};
+  const output = {};
+  const choices = new Map();
+  for (const chunk of chunks) {
+    if (!isObject(chunk)) continue;
+    for (const key of ['usage','request_id','code','message']) if (chunk[key] !== undefined) out[key] = chunk[key];
+    if (!isObject(chunk.output)) continue;
+    for (const [key, value] of Object.entries(chunk.output)) if (key !== 'choices') output[key] = value;
+    for (const rawChoice of Array.isArray(chunk.output.choices) ? chunk.output.choices : []) {
+      if (!isObject(rawChoice)) continue;
+      const index = numberOrDefault(rawChoice.index, choices.size);
+      const choice = choices.get(index) || { index, message:{} };
+      const message = isObject(choice.message) ? choice.message : {};
+      const src = isObject(rawChoice.message) ? rawChoice.message : (isObject(rawChoice.delta) ? rawChoice.delta : {});
+      appendStringField(message, 'content', src.content);
+      appendStringField(message, 'reasoning_content', src.reasoning_content);
+      choice.message = message;
+      choices.set(index, choice);
+    }
+  }
+  if (choices.size) output.choices = Array.from(choices.values()).sort((a, b) => Number(a.index) - Number(b.index));
+  if (Object.keys(output).length) out.output = output;
+  return pick(out, ['output','usage','request_id','code','message']);
+}
+
+function aggregateGeminiStream(chunks) {
+  const out = {};
+  const candidates = new Map();
+  for (const chunk of chunks) {
+    if (!isObject(chunk)) continue;
+    if (chunk.promptFeedback !== undefined) out.promptFeedback = chunk.promptFeedback;
+    if (chunk.usageMetadata !== undefined) out.usageMetadata = chunk.usageMetadata;
+    if (chunk.error !== undefined) out.error = chunk.error;
+    if (chunk.modelVersion !== undefined) out.modelVersion = chunk.modelVersion;
+    const rawCandidates = Array.isArray(chunk.candidates) ? chunk.candidates : [];
+    for (let i = 0; i < rawCandidates.length; i++) {
+      const rawCandidate = rawCandidates[i];
+      if (!isObject(rawCandidate)) continue;
+      const index = numberOrDefault(rawCandidate.index, i);
+      const candidate = candidates.get(index) || { index };
+      mergeGeminiCandidate(candidate, rawCandidate);
+      candidates.set(index, candidate);
+    }
+  }
+  if (candidates.size) out.candidates = Array.from(candidates.values()).sort((a, b) => Number(a.index) - Number(b.index));
+  return pick(out, ['candidates','promptFeedback','usageMetadata','error','modelVersion']);
+}
+
+function aggregateBedrockStream(events) {
+  const out = {};
+  const message = {};
+  const contentBlocks = new Map();
+  for (const event of events) {
+    if (!isObject(event)) continue;
+    if (isObject(event.messageStart) && event.messageStart.role !== undefined) message.role = event.messageStart.role;
+    if (isObject(event.contentBlockStart)) {
+      const index = numberOrDefault(event.contentBlockStart.contentBlockIndex, contentBlocks.size);
+      const block = contentBlocks.get(index) || {};
+      if (isObject(event.contentBlockStart.start)) mergeObject(block, event.contentBlockStart.start);
+      contentBlocks.set(index, block);
+    }
+    if (isObject(event.contentBlockDelta)) {
+      const index = numberOrDefault(event.contentBlockDelta.contentBlockIndex, contentBlocks.size);
+      const block = contentBlocks.get(index) || {};
+      if (isObject(event.contentBlockDelta.delta)) mergeBedrockContentDelta(block, event.contentBlockDelta.delta);
+      contentBlocks.set(index, block);
+    }
+    if (isObject(event.messageStop)) {
+      if (event.messageStop.stopReason !== undefined) out.stopReason = event.messageStop.stopReason;
+      if (event.messageStop.additionalModelResponseFields !== undefined) out.additionalModelResponseFields = event.messageStop.additionalModelResponseFields;
+    }
+    if (isObject(event.metadata) && event.metadata.usage !== undefined) out.usage = event.metadata.usage;
+    if (isObject(event.output)) mergeObject(out, pick(event, ['output','stopReason','usage','error']));
+    if (event.error !== undefined) out.error = event.error;
+  }
+  if (contentBlocks.size) {
+    message.content = Array.from(contentBlocks.entries()).sort(([a], [b]) => a - b).map(([, block]) => block);
+  }
+  if (Object.keys(message).length && out.output === undefined) out.output = { message };
+  return pick(out, ['output','stopReason','usage','error']);
+}
+
+function aggregateCohereStream(events) {
+  const out = {};
+  const message = {};
+  const contentBlocks = new Map();
+  let generatedText = '';
+  for (const event of events) {
+    if (!isObject(event)) continue;
+    const type = stringValue(event.type) || stringValue(event.event_type) || stringValue(event.eventType) || '';
+    if (isObject(event.response)) mergeObject(out, pick(event.response, ['message','text','finish_reason','usage','error']));
+    const delta = isObject(event.delta) ? event.delta : undefined;
+    if (delta && isObject(delta.message)) mergeCohereMessageDelta(message, contentBlocks, delta.message);
+    if (type === 'text-generation' && typeof event.text === 'string') generatedText += event.text;
+    if (type === 'message-end' && delta) {
+      if (delta.finish_reason !== undefined) {
+        out.finish_reason = delta.finish_reason;
+        message.finish_reason = delta.finish_reason;
+      }
+      if (delta.usage !== undefined) out.usage = delta.usage;
+    }
+    if (event.finish_reason !== undefined) {
+      out.finish_reason = event.finish_reason;
+      message.finish_reason = event.finish_reason;
+    }
+    if (event.error !== undefined) out.error = event.error;
+  }
+  if (contentBlocks.size) {
+    message.content = Array.from(contentBlocks.entries()).sort(([a], [b]) => a - b).map(([, block]) => block);
+  } else if (generatedText) {
+    message.content = [{ type:'text', text:generatedText }];
+    out.text = generatedText;
+  }
+  if (Object.keys(message).length && out.message === undefined) out.message = message;
+  return pick(out, ['message','text','finish_reason','usage','error']);
+}
+
+function geminiModelFromPath(path) {
+  if (!path) return undefined;
+  const parts = pathNoQuery(path).split('/');
+  const modelIdx = parts.indexOf('models');
+  if (modelIdx < 0 || modelIdx + 1 >= parts.length) return undefined;
+  return (parts[modelIdx + 1] || '').split(':')[0] || undefined;
+}
+
+function bedrockModelIdFromPath(path) {
+  if (!path) return undefined;
+  const parts = pathNoQuery(path).split('/');
+  const modelIdx = parts.indexOf('model');
+  if (modelIdx < 0 || modelIdx + 2 >= parts.length) return undefined;
+  const operation = String(parts[modelIdx + 2] || '').toLowerCase();
+  if (operation !== 'converse' && operation !== 'converse-stream') return undefined;
+  return parts[modelIdx + 1] || undefined;
+}
+
+function fieldView(protocol, side, body, upstreamPath) {
+  const parsed = parseJsonOrSse(body);
+  const isStream = Array.isArray(parsed);
+  if (protocol === 'openai.chat_completions') {
+    if (side === 'request') return pick(parsed, ['model','messages']);
+    return isStream ? aggregateOpenAIChatStream(parsed) : pick(parsed, ['model','choices','usage','error']);
+  }
+  if (protocol === 'openai.responses') {
+    if (side === 'request') return pick(parsed, ['model','input']);
+    return isStream ? aggregateOpenAIResponsesStream(parsed) : pick(parsed, ['model','status','output','output_text','usage','error']);
+  }
+  if (protocol === 'anthropic.messages') {
+    if (side === 'request') return pick(parsed, ['model','messages','system']);
+    return isStream ? aggregateAnthropicStream(parsed) : pick(parsed, ['type','role','model','content','stop_reason','usage','error']);
+  }
+  if (protocol === 'google.gemini.generate_content') {
+    if (side === 'request') {
+      const view = pick(parsed, ['model','contents','systemInstruction']);
+      if (isObject(view) && view.model === undefined) {
+        const model = geminiModelFromPath(upstreamPath);
+        if (model) view.model = model;
+      }
+      return view;
+    }
+    return isStream ? aggregateGeminiStream(parsed) : pick(parsed, ['candidates','promptFeedback','usageMetadata','error','modelVersion']);
+  }
+  if (protocol === 'alibaba.dashscope.generation') {
+    if (side === 'request') return pick(parsed, ['model','input','system','messages']);
+    return isStream ? aggregateDashscopeStream(parsed) : pick(parsed, ['output','usage','request_id','code','message']);
+  }
+  if (protocol === 'aws.bedrock.converse') {
+    if (side === 'request') {
+      const view = pick(parsed, ['modelId','messages','system']);
+      if (isObject(view) && view.modelId === undefined) {
+        const modelId = bedrockModelIdFromPath(upstreamPath);
+        if (modelId) view.modelId = modelId;
+      }
+      return view;
+    }
+    return isStream ? aggregateBedrockStream(parsed) : pick(parsed, ['output','stopReason','usage','error']);
+  }
+  if (protocol === 'cohere.chat') {
+    if (side === 'request') return pick(parsed, ['model','messages','message']);
+    return isStream ? aggregateCohereStream(parsed) : pick(parsed, ['message','text','finish_reason','usage','error']);
+  }
+  return parsed;
+}
+
+async function fieldHash(body, side, protocol, upstreamPath) {
+  if (!SUPPORTED_PROTOCOLS.includes(protocol)) return null;
+  return sha256Hex(bytes(canonicalJson(fieldView(protocol, side, body, upstreamPath))));
+}
+
+async function verifyMaterial(material, opts) {
+  const proof = material.proof;
+  const checks = [];
+  const requestBytes = opts.requestBody.trim() ? bytes(opts.requestBody) : undefined;
+  const expectedHost = opts.host.trim();
+  const expectedPath = opts.path.trim();
+  const wireCheck = proofWireEnvelopeCheck(proof);
+  checks.push(wireCheck);
+  if (wireCheck.state === 'bad') return { ok:false, warned:false, checks, platform:'unknown' };
+  const trustInput = parseTrustInput(opts.trustConfig);
+  const platform = detectPlatform(proof, trustInput);
+  const trust = parseTrustConfig(opts.trustConfig, platform, opts);
+  const expectedProfile = normalizeProfileName(trust.profile || evidenceProfile(platform));
+
+  const profileConflicts = [];
+  for (const source of declaredPlatformSources(proof, trustInput)) {
+    if (source.platform !== platform) {
+      profileConflicts.push(`${source.field}=${String(source.value)}(${source.platform})`);
+    }
+  }
+  if (profileConflicts.length) {
+    checks.push({ name:'profile 配置', state:'bad', detail:`${profileConflicts.join('、')} 与识别的平台 ${platform}/${expectedProfile} 冲突` });
+    return { ok:false, warned:false, checks, platform };
+  } else {
+    checks.push({ name:'profile 配置', state:'ok', detail:`profile=${expectedProfile || '<unknown>'}` });
+  }
+
+  if (platform === 'aws') {
+    try {
+      const att = await verifyAwsAttestation(proof.attestation, trustVerificationTime(trust));
+      const chainOk = att.sigOk && att.chainOk && att.rootSelf && att.rootPinned && att.timeValid;
+      checks.push({ name:'AWS attestation', state: chainOk ? 'ok' : 'bad', detail: chainOk ? `COSE/P-384 链到 AWS Nitro 根；叶证书 notAfter=${att.leafNotAfter}` : `链/签名/根 pin/有效期失败: sig=${att.sigOk} chain=${att.chainOk} rootPinned=${att.rootPinned} time=${att.timeValid}` });
+      const expectedPcr0 = normalizeHex(trust.expectedPcr0 || opts.pcr0);
+      const measureOk = !!expectedPcr0 && att.pcr0 === expectedPcr0;
+      checks.push({ name:'PCR0 / measurement', state: measureOk ? 'ok' : 'bad', detail: expectedPcr0 ? `reported=${short(att.pcr0)} trusted=${short(expectedPcr0)}` : `缺少可信 PCR0；reported=${short(att.pcr0)}` });
+      checks.push({ name:'公钥绑定', state: att.publicKey === proof.public_key ? 'ok' : 'bad', detail: att.publicKey === proof.public_key ? 'proof.public_key 由 attestation 背书' : 'proof.public_key 与 attestation public_key 不一致' });
+      checks.push({ name:'nonce 绑定', state: att.nonce === proof.nonce ? 'ok' : 'bad', detail: att.nonce === proof.nonce ? 'proof.nonce 与 attestation nonce 一致' : 'proof.nonce 与 attestation nonce 不一致' });
+      material.attestation = att;
+    } catch (err) {
+      checks.push({ name:'AWS attestation', state:'bad', detail:'attestation 解析/验证异常: ' + err.message });
+    }
+  } else if (platform === 'aliyun') {
+    const evidence = await verifyAliyunEvidence(proof, trust);
+    checks.push(...evidence.checks.map(checkFromEvidence));
+    material.attestation = evidence;
+  } else if (platform === 'huawei') {
+    const evidence = await verifyQingTianEvidence(proof, trust);
+    checks.push(...evidence.checks.map(checkFromEvidence));
+    material.attestation = evidence;
+  } else {
+    checks.push({
+      name: '平台 evidence',
+      state: 'bad',
+      detail: '无法从 proof.profile / tee_profile / evidence.profile 识别平台',
+    });
+  }
+
+  if (expectedHost) {
+    const ok = String(proof.upstream_host || '').toLowerCase() === expectedHost.toLowerCase();
+    checks.push({ name:'上游 host', state: ok ? 'ok' : 'bad', detail: ok ? `签名覆盖 host == ${expectedHost}` : `签名覆盖 host=${proof.upstream_host}，期望=${expectedHost}` });
+  } else {
+    checks.push({ name:'上游 host', state:'warn', detail:`未填期望 host；proof 声明 host=${proof.upstream_host}` });
+  }
+  if (expectedPath) {
+    const signedPath = pathNoQuery(proof.upstream_path);
+    const wantedPath = pathNoQuery(expectedPath);
+    const ok = signedPath === wantedPath;
+    checks.push({ name:'上游 path', state: ok ? 'ok' : 'bad', detail: ok ? `签名覆盖 path == ${wantedPath}` : `签名覆盖 path=${signedPath}，期望=${wantedPath}` });
+  } else {
+    checks.push({ name:'上游 path', state:'warn', detail:`未填期望 path；proof 声明 path=${proof.upstream_path}` });
+  }
+
+  const statement = await buildV2Statement(proof);
+  let sigOk = false;
+  try {
+    sigOk = await verifyEd25519(proof.public_key, proof.signature, statement);
+  } catch (err) {
+    checks.push({ name:'Ed25519 声明签名', state:'bad', detail:'验签异常: ' + err.message });
+  }
+  if (sigOk) checks.push({ name:'Ed25519 声明签名', state:'ok', detail:'签名覆盖 nonce、host/path、status、body hash' + (proof.field_claims ? '、field_claims hash' : '') });
+  else if (!checks.some((c) => c.name === 'Ed25519 声明签名')) checks.push({ name:'Ed25519 声明签名', state:'bad', detail:'声明验签失败' });
+
+  if (material.body.length > 0) {
+    const responseHash = await sha256Hex(material.body);
+    const ok = responseHash === String(proof.response_body_sha256 || '').toLowerCase();
+    checks.push({
+      name:'响应 body hash',
+      state: ok ? 'ok' : (proof.field_claims ? 'warn' : 'bad'),
+      detail: ok ? `local=${short(responseHash)} 与签名值一致` : `local=${short(responseHash)} signed=${short(proof.response_body_sha256)}${proof.field_claims ? '；字段级模式下仅提示' : ''}`,
+    });
+  } else {
+    checks.push({ name:'响应 body hash', state:'warn', detail:'未提供响应正文，只能验证 proof 自身，不能重算响应 body hash' });
+  }
+
+  if (requestBytes) {
+    const requestHash = await sha256Hex(requestBytes);
+    const ok = requestHash === String(proof.request_body_sha256 || '').toLowerCase();
+    checks.push({
+      name:'请求 body hash',
+      state: ok ? 'ok' : (proof.field_claims ? 'warn' : 'bad'),
+      detail: ok ? `local=${short(requestHash)} 与签名值一致` : `local=${short(requestHash)} signed=${short(proof.request_body_sha256)}${proof.field_claims ? '；字段级模式下仅提示' : ''}`,
+    });
+  }
+
+  if (proof.field_claims) {
+    const claims = proof.field_claims;
+    const protocol = claims.protocol_family;
+    if (!SUPPORTED_PROTOCOLS.includes(protocol)) {
+      checks.push({ name:'字段级 proof', state:'bad', detail:`不支持的 protocol_family=${protocol}` });
+    } else {
+      const signedClaimsHash = await fieldClaimsHash(claims);
+      const statementText = text(statement);
+      const expectedPolicy = expectedFieldPolicyId(protocol);
+      checks.push({
+        name:'field_claims 签名覆盖',
+        state: statementText.includes('field-claims-sha256=' + signedClaimsHash + '\n') ? 'ok' : 'bad',
+        detail:`field_claims canonical hash=${short(signedClaimsHash)}`,
+      });
+      const envelopeOk = claims.proof_type === 'field-proof'
+        && claims.verification_mode === 'field_claims'
+        && claims.assurance_level === 'strong'
+        && claims.cross_protocol === false
+        && claims.semantic_equivalence_not_proven === false
+        && claims.body_hash_policy === 'advisory'
+        && claims.request_body_sha256_severity === 'advisory'
+        && claims.response_body_sha256_severity === 'advisory'
+        && claims.request_schema_version === `${protocol}.v1`
+        && claims.response_schema_version === `${protocol}.v1`
+        && claims.field_policy_id === expectedPolicy
+        && claims.nonce === proof.nonce
+        && claims.upstream_host === String(proof.upstream_host || '').toLowerCase()
+        && claims.upstream_path === pathNoQuery(proof.upstream_path)
+        && claims.http_method === String(proof.http_method || '').toUpperCase()
+        && claims.http_status === proof.http_status;
+      checks.push({
+        name:'字段级 envelope',
+        state: envelopeOk ? 'ok' : 'bad',
+        detail: envelopeOk
+          ? `policy=${expectedPolicy}，nonce/host/path/method/status 与 proof 顶层一致`
+          : `field_claims 外壳不匹配；期望 policy=${expectedPolicy}`,
+      });
+      if (material.body.length > 0) {
+        const resFieldHash = await fieldHash(material.body, 'response', protocol, proof.upstream_path);
+        const ok = resFieldHash === claims.upstream_response_fields_sha256;
+        checks.push({ name:'响应字段绑定', state: ok ? 'ok' : 'bad', detail: ok ? `字段视图 hash=${short(resFieldHash)}` : `local=${short(resFieldHash)} signed=${short(claims.upstream_response_fields_sha256)}` });
+      }
+      if (requestBytes) {
+        const reqFieldHash = await fieldHash(requestBytes, 'request', protocol, proof.upstream_path);
+        const ok = reqFieldHash === claims.upstream_request_fields_sha256;
+        checks.push({ name:'请求字段绑定', state: ok ? 'ok' : 'bad', detail: ok ? `字段视图 hash=${short(reqFieldHash)}` : `local=${short(reqFieldHash)} signed=${short(claims.upstream_request_fields_sha256)}` });
+      } else {
+        checks.push({ name:'请求字段绑定', state:'warn', detail:'未提供请求体，跳过本地请求字段比对' });
+      }
+    }
+  } else {
+    checks.push({ name:'字段级 proof', state:'bad', detail:'proof 缺少 field_claims；新版生产 proof 应包含字段级声明' });
+  }
+
+  const hardFailed = checks.some((c) => c.state === 'bad');
+  const warned = checks.some((c) => c.state === 'warn');
+  return { ok: !hardFailed, warned, checks, platform };
+}
+
+function renderSummary(material, result) {
+  const p = material?.proof;
+  $('summary').innerHTML = `
+    <div class="k">平台</div><div class="v">${esc(summaryPlatform(material, result))}</div>
+    <div class="k">模式</div><div class="v">${esc(material ? material.source : '未解析')}</div>
+    <div class="k">响应字节</div><div class="v">${material ? material.body.length : 0}</div>
+    <div class="k">信任锚</div><div class="v">${esc(summaryTrustAnchor(material, result))}</div>
+    <div class="k">上游</div><div class="v">${p ? esc((p.upstream_host || '') + (p.upstream_path || '')) : '未解析'}</div>
+  `;
+}
+
+function summaryPlatform(material, result) {
+  if (result?.platform) return result.platform;
+  const proof = material?.proof;
+  if (!proof) return '未解析';
+  try {
+    return detectPlatform(proof, parseTrustInput($('trustConfig').value));
+  } catch {
+    return detectPlatform(proof);
+  }
+}
+
+function summaryTrustAnchor(material, result) {
+  const platform = result?.platform || summaryPlatform(material, result);
+  if (!material) return '未解析';
+  if (platform === 'aws') return 'AWS Nitro root fingerprint 内置';
+  if (platform === 'huawei') return 'Huawei QingTian root fingerprint 内置';
+  if (platform === 'aliyun') return 'Aliyun TPM root/EKMF fingerprints 内置';
+  return '未知';
+}
+
+function renderStatus(kind, title, detail) {
+  const el = $('status');
+  el.className = 'status show ' + kind;
+  el.innerHTML = `<div class="status-title">${esc(title)}</div><div>${detail}</div>`;
+}
+
+function renderChecks(checks) {
+  $('checks').innerHTML = checks.map((c) => `
+    <div class="check ${c.state}">
+      <div class="check-head">
+        <div class="check-name">${esc(c.name)}</div>
+        <div class="badge">${c.state === 'ok' ? 'PASS' : c.state === 'warn' ? 'WARN' : 'FAIL'}</div>
+      </div>
+      <div class="check-detail">${esc(c.detail)}</div>
+    </div>
+  `).join('');
+  $('resultPanel').classList.remove('hidden');
+}
+
+function renderProof(material) {
+  if (!material?.proof) return;
+  $('proofDump').textContent = JSON.stringify(material.proof, null, 2);
+  $('proofPanel').classList.remove('hidden');
+}
+
+function clearResultDisplays() {
+  $('checks').innerHTML = '';
+  $('proofDump').textContent = '';
+  $('resultPanel').classList.add('hidden');
+  $('proofPanel').classList.add('hidden');
+  renderSummary(null);
+}
+
+function clearVerificationChecks() {
+  $('checks').innerHTML = '';
+  $('resultPanel').classList.add('hidden');
+}
+
+async function loadFromText(value) {
+  parsedMaterial = await parseCapture(value);
+  clearVerificationChecks();
+  renderSummary(parsedMaterial);
+  renderProof(parsedMaterial);
+  $('parseMsg').textContent = `已解析：${parsedMaterial.source}${parsedMaterial.note ? '，' + parsedMaterial.note : ''}`;
+  return parsedMaterial;
+}
+
+async function doVerify() {
+  try {
+    const value = $('capture').value.trim();
+    if (!parsedMaterial || value) parsedMaterial = await parseCapture(value);
+    const result = await verifyMaterial(parsedMaterial, {
+      pcr0: $('measurement').value,
+      pcr8: $('pcr8').value,
+      pcr9: $('pcr9').value,
+      pcr11: $('pcr11').value,
+      host: $('host').value,
+      path: $('path').value,
+      requestBody: $('requestBody').value,
+      trustConfig: $('trustConfig').value,
+    });
+    renderSummary(parsedMaterial, result);
+    renderChecks(result.checks);
+    renderProof(parsedMaterial);
+    if (result.ok && result.warned) renderStatus('warn', '校验通过，但存在提示项', '硬性校验项通过；WARN 项通常表示未提供 host/path/request，或 body hash 在字段级模式下仅作提示。');
+    else if (result.ok) renderStatus('ok', '校验通过', 'proof 可信链路、签名、measurement 与字段级绑定均通过。');
+    else renderStatus('bad', '校验失败', '存在 FAIL 项。请展开校验项查看是 measurement、attestation、签名还是字段绑定失败。');
+  } catch (err) {
+    clearResultDisplays();
+    renderStatus('bad', '无法校验', esc(err.message || String(err)));
+  }
+}
+
+$('verifyBtn').addEventListener('click', doVerify);
+$('parseBtn').addEventListener('click', async () => {
+  try {
+    await loadFromText($('capture').value);
+    renderStatus('warn', '解析完成，尚未校验', '已识别 proof 和响应正文。点击“开始校验”执行密码学验证。');
+  } catch (err) {
+    parsedMaterial = null;
+    clearResultDisplays();
+    renderStatus('bad', '解析失败', esc(err.message || String(err)));
+  }
+});
+$('clearBtn').addEventListener('click', () => {
+  parsedMaterial = null;
+  $('capture').value = '';
+  $('requestBody').value = '';
+  $('measurement').value = '';
+  $('pcr8').value = '';
+  $('pcr9').value = '';
+  $('pcr11').value = '';
+  $('host').value = '';
+  $('path').value = '';
+  $('trustConfig').value = '';
+  $('parseMsg').textContent = '';
+  $('status').className = 'status';
+  clearResultDisplays();
+});
+
+const drop = $('drop');
+drop.addEventListener('click', () => $('file').click());
+drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('hot'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('hot'));
+drop.addEventListener('drop', (e) => {
+  e.preventDefault();
+  drop.classList.remove('hot');
+  if (e.dataTransfer.files?.[0]) readFile(e.dataTransfer.files[0]);
+});
+$('file').addEventListener('change', (e) => {
+  if (e.target.files?.[0]) readFile(e.target.files[0]);
+});
+
+function readFile(file) {
+  file.arrayBuffer().then(async (buf) => {
+    const data = new Uint8Array(buf);
+    $('capture').value = text(data);
+    parsedMaterial = await parseCapture(data);
+    clearVerificationChecks();
+    renderSummary(parsedMaterial);
+    renderProof(parsedMaterial);
+    renderStatus('warn', '文件已载入', `已解析 ${esc(file.name)}，来源格式：${esc(parsedMaterial.source)}。`);
+  }).catch((err) => {
+    parsedMaterial = null;
+    clearResultDisplays();
+    renderStatus('bad', '读取文件失败', esc(err.message || String(err)));
+  });
+}
+</script>
+</body>
+</html>

@@ -21,6 +21,7 @@ type GenerateInput struct {
 	ResponseContentType string
 	RequestBody         []byte
 	ResponseBody        []byte
+	FieldClaims         json.RawMessage
 }
 
 type GenerateHashedInput struct {
@@ -32,6 +33,7 @@ type GenerateHashedInput struct {
 	ResponseContentType   string
 	RequestBodySHA256Hex  string
 	ResponseBodySHA256Hex string
+	FieldClaims           json.RawMessage
 }
 
 type GenerateOptions struct {
@@ -49,6 +51,7 @@ func Generate(input GenerateInput, opts GenerateOptions) (TeeProof, error) {
 		ResponseContentType:   input.ResponseContentType,
 		RequestBodySHA256Hex:  SHA256Hex(input.RequestBody),
 		ResponseBodySHA256Hex: SHA256Hex(input.ResponseBody),
+		FieldClaims:           input.FieldClaims,
 	}, opts)
 }
 
@@ -77,6 +80,9 @@ func GenerateFromHashes(input GenerateHashedInput, opts GenerateOptions) (TeePro
 	}
 	responseHash, err := normalizeSHA256Hex(input.ResponseBodySHA256Hex, "response_body_sha256")
 	if err != nil {
+		return TeeProof{}, err
+	}
+	if _, err := FieldClaimsSHA256Hex(input.FieldClaims); err != nil {
 		return TeeProof{}, err
 	}
 
@@ -110,6 +116,7 @@ func GenerateFromHashes(input GenerateHashedInput, opts GenerateOptions) (TeePro
 		HTTPMethod:               input.HTTPMethod,
 		HTTPStatus:               input.HTTPStatus,
 		ResponseContentType:      input.ResponseContentType,
+		FieldClaims:              input.FieldClaims,
 	})
 	if err != nil {
 		return TeeProof{}, err
@@ -161,6 +168,7 @@ func GenerateFromHashes(input GenerateHashedInput, opts GenerateOptions) (TeePro
 		ResponseContentType:   input.ResponseContentType,
 		RequestBodySHA256Hex:  requestHash,
 		ResponseBodySHA256Hex: responseHash,
+		FieldClaims:           input.FieldClaims,
 	})
 	signature := ed25519.Sign(privateKey, statement)
 
@@ -177,6 +185,7 @@ func GenerateFromHashes(input GenerateHashedInput, opts GenerateOptions) (TeePro
 		ResponseType:      input.ResponseContentType,
 		RequestSHA256Hex:  requestHash,
 		ResponseSHA256Hex: responseHash,
+		FieldClaims:       input.FieldClaims,
 		Signature:         base64.StdEncoding.EncodeToString(signature),
 		Attestation:       base64.StdEncoding.EncodeToString(evidenceJSON),
 		Evidence:          evidence,

@@ -15,12 +15,15 @@ import {
   verifyTeeExchange,
   parseTeeProofCapture,
   parseTeeProofEvent,
+  parseTeeProofJsonEnvelope,
   parseTeeProofMultipartResponse,
   TEE_PROOF_EVENT,
+  WOKEY_SSE_TRANSPORT_KEEPALIVE_V1,
   type TeeProofWire,
   type AttestationVerifier,
 } from './tee-verify-core.ts';
 import type { EvidenceProfileVerifier } from './evidence-profile.ts';
+import { buildFieldClaims } from './field-proof.ts';
 import { computeV2SigningMaterial, sha256 } from './signing.ts';
 
 const NONCE = Buffer.from('a-fresh-16b-nonce').toString('base64');
@@ -111,6 +114,116 @@ describe('verifyTeeExchange v2 (full mode)', () => {
     expect(r.checks.find((c) => c.name === '请求绑定')?.ok).toBe(false);
   });
 
+  it('passes field-level proof when body bytes differ but covered fields match', () => {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const pubB64 = publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+    const upstreamPath = '/v1/chat/completions';
+    const upstreamRequest = Buffer.from('{"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"temperature":0.7}', 'utf8');
+    const upstreamResponse = Buffer.from('{"model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"total_tokens":2}}', 'utf8');
+    const localRequest = Buffer.from('{"messages":[{"content":"hi","role":"user"}],"temperature":0.7,"model":"gpt-test","relay_only":"ignored"}', 'utf8');
+    const localResponse = Buffer.from('{"id":"relay-wrapper","usage":{"total_tokens":2},"choices":[{"finish_reason":"stop","message":{"content":"ok","role":"assistant"},"index":0}],"model":"gpt-test"}', 'utf8');
+    const field = buildFieldClaims({
+      nonceB64: NONCE,
+      upstreamHost: HOST,
+      upstreamPath,
+      httpMethod: 'POST',
+      httpStatus: 200,
+      requestBody: upstreamRequest,
+      responseBody: upstreamResponse,
+    });
+    expect(field).toBeTruthy();
+    const { statement, digests } = computeV2SigningMaterial({
+      nonceB64: NONCE,
+      upstreamHost: HOST,
+      upstreamPath,
+      httpMethod: 'POST',
+      httpStatus: 200,
+      respContentType: 'application/json',
+      requestBody: upstreamRequest,
+      responseBody: upstreamResponse,
+      fieldClaims: field!.claims,
+    });
+    const proof: TeeProofWire = {
+      v: 2,
+      alg: 'ed25519',
+      public_key: pubB64,
+      nonce: NONCE,
+      upstream_host: HOST,
+      upstream_path: upstreamPath,
+      http_method: 'POST',
+      http_status: 200,
+      resp_content_type: 'application/json',
+      request_body_sha256: digests.requestBody.toString('hex'),
+      response_body_sha256: digests.responseBody.toString('hex'),
+      field_claims: field!.claims,
+      signature: edSign(null, statement, privateKey).toString('base64'),
+      attestation: 'AA==',
+      pcr0: PCR0,
+    };
+    const r = verifyTeeExchange(
+      { expectedPcr0: PCR0, expectedHost: HOST, requestBody: localRequest, responseBody: localResponse, proof },
+      { verifyAttestationDoc: stubAtt({ publicKey: pubB64 }) },
+    );
+    expect(r.ok, JSON.stringify(r.checks)).toBe(true);
+    expect(r.checks.find((c) => c.name === '请求字段绑定')?.ok).toBe(true);
+    expect(r.checks.find((c) => c.name === '响应字段绑定')?.ok).toBe(true);
+    expect(r.checks.find((c) => c.name === '请求 body hash(advisory)')?.detail).toContain('WARN');
+    expect(r.checks.find((c) => c.name === '响应 body hash(advisory)')?.detail).toContain('WARN');
+  });
+
+  it('fails field-level proof when field_claims metadata disagrees with proof envelope', () => {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const pubB64 = publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+    const upstreamPath = '/v1/chat/completions';
+    const upstreamRequest = Buffer.from('{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}', 'utf8');
+    const upstreamResponse = Buffer.from('{"model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}', 'utf8');
+    const field = buildFieldClaims({
+      nonceB64: NONCE,
+      upstreamHost: HOST,
+      upstreamPath,
+      httpMethod: 'POST',
+      httpStatus: 200,
+      requestBody: upstreamRequest,
+      responseBody: upstreamResponse,
+    });
+    expect(field).toBeTruthy();
+    field!.claims.upstream_path = '/v1/other';
+    const { statement, digests } = computeV2SigningMaterial({
+      nonceB64: NONCE,
+      upstreamHost: HOST,
+      upstreamPath,
+      httpMethod: 'POST',
+      httpStatus: 200,
+      respContentType: 'application/json',
+      requestBody: upstreamRequest,
+      responseBody: upstreamResponse,
+      fieldClaims: field!.claims,
+    });
+    const proof: TeeProofWire = {
+      v: 2,
+      alg: 'ed25519',
+      public_key: pubB64,
+      nonce: NONCE,
+      upstream_host: HOST,
+      upstream_path: upstreamPath,
+      http_method: 'POST',
+      http_status: 200,
+      resp_content_type: 'application/json',
+      request_body_sha256: digests.requestBody.toString('hex'),
+      response_body_sha256: digests.responseBody.toString('hex'),
+      field_claims: field!.claims,
+      signature: edSign(null, statement, privateKey).toString('base64'),
+      attestation: 'AA==',
+      pcr0: PCR0,
+    };
+    const r = verifyTeeExchange(
+      { expectedPcr0: PCR0, expectedHost: HOST, requestBody: upstreamRequest, responseBody: upstreamResponse, proof },
+      { verifyAttestationDoc: stubAtt({ publicKey: pubB64 }) },
+    );
+    expect(r.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === '字段级 proof')?.detail ?? '').toContain('upstream_path');
+  });
+
   it('fails host binding when expectedHost differs', () => {
     const { proof, pubB64, requestBody, responseBody } = makeSigned();
     const r = verifyTeeExchange(
@@ -137,6 +250,61 @@ describe('verifyTeeExchange v2 (response-only mode)', () => {
     const hostCheck = r.checks.find((c) => c.name === '上游 host');
     expect(hostCheck?.ok).toBe(true);
     expect(hostCheck?.detail).toContain(HOST);
+  });
+
+  it('marks request field binding as skipped for response-only field-level proof', () => {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const pubB64 = publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+    const upstreamPath = '/v1/chat/completions';
+    const upstreamRequest = Buffer.from('{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}', 'utf8');
+    const upstreamResponse = Buffer.from('{"model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}', 'utf8');
+    const field = buildFieldClaims({
+      nonceB64: NONCE,
+      upstreamHost: HOST,
+      upstreamPath,
+      httpMethod: 'POST',
+      httpStatus: 200,
+      requestBody: upstreamRequest,
+      responseBody: upstreamResponse,
+    });
+    expect(field).toBeTruthy();
+    const { statement, digests } = computeV2SigningMaterial({
+      nonceB64: NONCE,
+      upstreamHost: HOST,
+      upstreamPath,
+      httpMethod: 'POST',
+      httpStatus: 200,
+      respContentType: 'application/json',
+      requestBody: upstreamRequest,
+      responseBody: upstreamResponse,
+      fieldClaims: field!.claims,
+    });
+    const proof: TeeProofWire = {
+      v: 2,
+      alg: 'ed25519',
+      public_key: pubB64,
+      nonce: NONCE,
+      upstream_host: HOST,
+      upstream_path: upstreamPath,
+      http_method: 'POST',
+      http_status: 200,
+      resp_content_type: 'application/json',
+      request_body_sha256: digests.requestBody.toString('hex'),
+      response_body_sha256: digests.responseBody.toString('hex'),
+      field_claims: field!.claims,
+      signature: edSign(null, statement, privateKey).toString('base64'),
+      attestation: 'AA==',
+      pcr0: PCR0,
+    };
+    const r = verifyTeeExchange(
+      { expectedPcr0: PCR0, expectedHost: HOST, responseBody: upstreamResponse, proof },
+      { verifyAttestationDoc: stubAtt({ publicKey: pubB64 }) },
+    );
+    const requestCheck = r.checks.find((c) => c.name === '请求字段绑定');
+    expect(r.ok, JSON.stringify(r.checks)).toBe(true);
+    expect(requestCheck?.ok).toBe(true);
+    expect(requestCheck?.skipped).toBe(true);
+    expect(requestCheck?.detail).toContain('未检查');
   });
 
   it('rejects unsupported proof wire versions', () => {
@@ -255,14 +423,15 @@ describe('verifyTeeExchange v2 (response-only mode)', () => {
     expect(r.checks.find((c) => c.name === '远程证明')?.ok).toBe(false);
   });
 
-  it('requires explicit trust config for non-Nitro profiles', () => {
+  it('auto-routes proof-declared non-Nitro profiles and then verifies evidence', () => {
     const { proof, responseBody } = makeSigned();
     proof.profile = 'qingtian';
     const r = verifyTeeExchange({ responseBody, proof });
 
     expect(r.ok).toBe(false);
     expect(r.attestation.profile).toBe('qingtian');
-    expect(r.checks.find((c) => c.name === 'Evidence profile')?.detail).toContain('必须由本地 trust.profile 显式选择');
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.ok).toBe(true);
+    expect(r.checks.find((c) => c.name === 'QingTian evidence 格式')?.ok).toBe(false);
   });
 
   it('fails closed when proof profile and trust profile differ', () => {
@@ -278,7 +447,7 @@ describe('verifyTeeExchange v2 (response-only mode)', () => {
     expect(r.checks.find((c) => c.name === 'Evidence profile')?.detail).toContain('不一致');
   });
 
-  it('fails closed when a non-Nitro trust profile is used without an explicit proof profile', () => {
+  it('uses a non-Nitro trust profile even when proof.profile is omitted', () => {
     const { proof, responseBody } = makeSigned();
     const r = verifyTeeExchange({
       responseBody,
@@ -292,7 +461,8 @@ describe('verifyTeeExchange v2 (response-only mode)', () => {
 
     expect(r.ok).toBe(false);
     expect(r.attestation.profile).toBe('qingtian');
-    expect(r.checks.find((c) => c.name === 'Evidence profile')?.detail).toContain('proof 未声明同一 profile');
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.ok).toBe(true);
+    expect(r.checks.find((c) => c.name === 'QingTian evidence 格式')?.ok).toBe(false);
   });
 
   it('fails closed for a trusted but unsupported evidence profile', () => {
@@ -519,7 +689,7 @@ describe('verifyTeeExchange aliyun-vtpm profile (experimental local quote mode)'
     expect(r.checks.find((c) => c.name === '平台证明链')?.ok).toBe(false);
   });
 
-  it('does not let proof.profile select aliyun-vtpm without local trust.profile', () => {
+  it('auto-routes proof.profile to aliyun-vtpm while still requiring PCR allowlists', () => {
     const { proof, responseBody } = makeAliyunSigned();
     const r = verifyTeeExchange({
       responseBody,
@@ -527,7 +697,8 @@ describe('verifyTeeExchange aliyun-vtpm profile (experimental local quote mode)'
     });
 
     expect(r.ok).toBe(false);
-    expect(r.checks.find((c) => c.name === 'Evidence profile')?.ok).toBe(false);
+    expect(r.checks.find((c) => c.name === 'Evidence profile')?.ok).toBe(true);
+    expect(r.checks.find((c) => c.name === 'PCR allowlist')?.ok).toBe(false);
   });
 
   it('fails closed when trust.profile and proof.profile disagree', () => {
@@ -706,6 +877,121 @@ describe('parseTeeProofEvent', () => {
     expect(parsed?.proof?.response_body_sha256).toBe(proof.response_body_sha256);
   });
 
+  it('parses non-streaming JSON envelopes with a top-level proof field', () => {
+    const response = { id: 'chatcmpl_1', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const wrapped = Buffer.from(JSON.stringify({ ...response, proof }), 'utf8');
+
+    const parsed = parseTeeProofJsonEnvelope(wrapped, 'application/json; charset=utf-8');
+
+    expect(parsed?.body).toEqual(rawBody);
+    expect(parsed?.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+    expect(parsed?.bodyContentType).toBe('application/json; charset=utf-8');
+  });
+
+  it('strips full HTTP response headers before parsing a JSON envelope proof', () => {
+    const response = { id: 'chatcmpl_1', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const wrapped = Buffer.from(JSON.stringify({ ...response, proof }), 'utf8');
+    const capture = Buffer.concat([
+      Buffer.from([
+        'HTTP/1.1 200 OK',
+        'Content-Type: application/json',
+        `Content-Length: ${wrapped.byteLength}`,
+        '',
+        '',
+      ].join('\r\n'), 'utf8'),
+      wrapped,
+    ]);
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+    expect(parsed.bodyContentType).toBe('application/json');
+  });
+
+  it('skips pasted command text before parsing a JSON envelope proof', () => {
+    const response = { id: 'chatcmpl_1', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const wrapped = Buffer.from(JSON.stringify({ ...response, proof }), 'utf8');
+    const capture = Buffer.concat([
+      Buffer.from('curl -X POST https://api.example.com/v1/chat/completions\n', 'utf8'),
+      wrapped,
+    ]);
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+  });
+
+  it('parses a JSON envelope proof even when the pasted command prefix shares the same line', () => {
+    const response = { id: 'chatcmpl_2', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const capture = Buffer.from(`curl -X POST https://api.example.com/v1/chat/completions ${JSON.stringify({ ...response, proof })}`, 'utf8');
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+  });
+
+  it('parses a JSON envelope proof even when the same line has trailing text after the JSON object', () => {
+    const response = { id: 'chatcmpl_3', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const capture = Buffer.from(`curl -X POST https://api.example.com/v1/chat/completions ${JSON.stringify({ ...response, proof })} trailing prompt`, 'utf8');
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+  });
+
+  it('parses a JSON envelope proof after an unmatched brace in pasted prefix text', () => {
+    const response = { id: 'chatcmpl_4', choices: [{ message: { role: 'assistant', content: 'ok' } }] };
+    const rawBody = Buffer.from(JSON.stringify(response), 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const capture = Buffer.from(`shell prompt { unfinished prefix ${JSON.stringify({ ...response, proof })}`, 'utf8');
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+  });
+
+  it('does not treat a nested proof field as a JSON envelope proof', () => {
+    const response = {
+      id: 'chatcmpl_5',
+      choices: [{ message: { role: 'assistant', content: 'ok' } }],
+      debug: { proof: makeSigned().proof },
+    };
+    const capture = Buffer.from(JSON.stringify(response), 'utf8');
+
+    const parsed = parseTeeProofCapture(capture, 'application/json');
+
+    expect(parsed.body).toEqual(capture);
+    expect(parsed.proof).toBeUndefined();
+  });
+
+  it('rejects ambiguous captures with multiple top-level JSON proof envelopes', () => {
+    const response1 = { id: 'chatcmpl_6', choices: [{ message: { role: 'assistant', content: 'first' } }] };
+    const response2 = { id: 'chatcmpl_7', choices: [{ message: { role: 'assistant', content: 'second' } }] };
+    const { proof: proof1 } = makeSigned({ responseBody: Buffer.from(JSON.stringify(response1), 'utf8') });
+    const { proof: proof2 } = makeSigned({ responseBody: Buffer.from(JSON.stringify(response2), 'utf8') });
+    const capture = Buffer.from(`${JSON.stringify({ ...response1, proof: proof1 })}\n${JSON.stringify({ ...response2, proof: proof2 })}`, 'utf8');
+
+    const parsed = parseTeeProofCapture(capture, 'application/json');
+
+    expect(parsed.body).toEqual(capture);
+    expect(parsed.proof).toBeUndefined();
+  });
+
   it('parses multipart captures by boundary when response Content-Length is stale', () => {
     const originalBody = Buffer.from('{"id":"msg_1","content":[{"type":"text","text":"ok"}]}\n', 'utf8');
     const mutatedBody = Buffer.from('{"id":"msg_1","content":[{"type":"text","text":"xok"}]}\n', 'utf8');
@@ -739,6 +1025,34 @@ describe('parseTeeProofEvent', () => {
 
     expect(parsed.body).toEqual(rawBody);
     expect(parsed.proof?.public_key).toBe(proof.public_key);
+  });
+
+  it('strips full HTTP response headers before parsing a multipart capture', () => {
+    const rawBody = Buffer.from('{"id":"msg_1","content":[{"type":"text","text":"ok"}]}\n', 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const multipart = formatMultipart({
+      rawBody,
+      rawContentType: 'application/json; charset=utf-8',
+      proof,
+      boundary: 'proof-observation-http-response',
+    });
+    const capture = Buffer.concat([
+      Buffer.from([
+        'HTTP/1.1 200 OK',
+        `Content-Type: ${multipart.contentType}`,
+        `Content-Length: ${multipart.body.byteLength}`,
+        'Date: Tue, 14 Jul 2026 00:00:00 GMT',
+        '',
+        '',
+      ].join('\r\n'), 'utf8'),
+      multipart.body,
+    ]);
+
+    const parsed = parseTeeProofCapture(capture);
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.bodyContentType).toBe('application/json; charset=utf-8');
+    expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
   });
 
   it('skips command text before a full multipart capture', () => {
@@ -790,6 +1104,31 @@ describe('parseTeeProofEvent', () => {
     expect(parsed.body).toEqual(rawBody);
     expect(parsed.ignoredLeadingBlankBytes).toBe(2);
     expect(parsed.proof?.response_body_sha256).toBe(proof.response_body_sha256);
+  });
+
+  it('strips relay transport keepalive comments only when the signed response hash proves it', () => {
+    const rawBody = Buffer.from('event: message_stop\ndata: {}\n\n', 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const keepalive = Buffer.from(WOKEY_SSE_TRANSPORT_KEEPALIVE_V1.repeat(2), 'utf8');
+    const suffix = Buffer.from(`event: ${TEE_PROOF_EVENT}\ndata: ${JSON.stringify(proof)}\n\n`, 'utf8');
+
+    const parsed = parseTeeProofCapture(Buffer.concat([keepalive, rawBody, suffix]));
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.ignoredTransportKeepaliveCount).toBe(2);
+    expect(parsed.ignoredTransportKeepaliveBytes).toBe(keepalive.byteLength);
+  });
+
+  it('keeps an upstream leading comment when that exact body was signed', () => {
+    const rawBody = Buffer.from(`${WOKEY_SSE_TRANSPORT_KEEPALIVE_V1}event: message_stop\ndata: {}\n\n`, 'utf8');
+    const { proof } = makeSigned({ responseBody: rawBody });
+    const suffix = Buffer.from(`event: ${TEE_PROOF_EVENT}\ndata: ${JSON.stringify(proof)}\n\n`, 'utf8');
+
+    const parsed = parseTeeProofCapture(Buffer.concat([rawBody, suffix]));
+
+    expect(parsed.body).toEqual(rawBody);
+    expect(parsed.ignoredTransportKeepaliveCount).toBeUndefined();
+    expect(parsed.ignoredTransportKeepaliveBytes).toBeUndefined();
   });
 
   it('returns the raw multipart response body when the proof part says unavailable', () => {
